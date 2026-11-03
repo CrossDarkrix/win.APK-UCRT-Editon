@@ -20,6 +20,39 @@ public final class MediaExtractor {
     // quarter-gigabyte-plus "audio" region to disk.
     private static final long MAX_SRC_BYTES = 256L << 20;
 
+
+    // AudioToolbox's URL opener can use the filename extension as a format hint.
+    // FD sources have no path, so preserve a useful suffix on the spool file.
+    private static String sniffAudioSuffix(java.nio.channels.FileChannel ch, long offset)
+            throws java.io.IOException {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(64);
+        int n = ch.read(b, offset);
+        if (n <= 0) return ".bin";
+        byte[] h = b.array();
+        if (n >= 12 && h[4] == 'f' && h[5] == 't' && h[6] == 'y' && h[7] == 'p')
+            return ".m4a";
+        if (n >= 3 && h[0] == 'I' && h[1] == 'D' && h[2] == '3')
+            return ".mp3";
+        if (n >= 2 && (h[0] & 0xff) == 0xff && ((h[1] & 0xe0) == 0xe0)) {
+            // ADTS has layer bits 00; MPEG audio has a non-reserved layer.
+            return ((h[1] & 0x06) == 0) ? ".aac" : ".mp3";
+        }
+        if (n >= 4 && h[0] == 'f' && h[1] == 'L' && h[2] == 'a' && h[3] == 'C')
+            return ".flac";
+        if (n >= 4 && h[0] == 'O' && h[1] == 'g' && h[2] == 'g' && h[3] == 'S')
+            return ".ogg";
+        if (n >= 12 && h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F'
+                && h[8] == 'W' && h[9] == 'A' && h[10] == 'V' && h[11] == 'E')
+            return ".wav";
+        if (n >= 12 && h[0] == 'F' && h[1] == 'O' && h[2] == 'R' && h[3] == 'M'
+                && h[8] == 'A' && h[9] == 'I' && h[10] == 'F'
+                && (h[11] == 'F' || h[11] == 'C'))
+            return ".aiff";
+        if (n >= 4 && h[0] == 'c' && h[1] == 'a' && h[2] == 'f' && h[3] == 'f')
+            return ".caf";
+        return ".bin";
+    }
+
     public MediaExtractor() {}
 
     public void setDataSource(String path) throws java.io.IOException {
@@ -67,7 +100,8 @@ public final class MediaExtractor {
             throw new java.io.IOException("MediaExtractor: unusable fd range off="
                     + offset + " len=" + length);
 
-        java.io.File tmp = java.io.File.createTempFile("macapk_mediaextractor", ".tmp");
+        String suffix = sniffAudioSuffix(ch, offset);
+        java.io.File tmp = java.io.File.createTempFile("macapk_mediaextractor", suffix);
         tmp.deleteOnExit();
         boolean copied = false;
         try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
@@ -102,8 +136,20 @@ public final class MediaExtractor {
     public void setDataSource(MediaDataSource source) {}
     public void setDataSource(android.content.Context context, android.net.Uri uri,
                               Map<String, String> headers) throws java.io.IOException {
-        if (uri != null && ("file".equals(uri.getScheme()) || uri.getScheme() == null))
+        if (context == null) throw new IllegalArgumentException("context == null");
+        if (uri == null) throw new IllegalArgumentException("uri == null");
+        if ("file".equals(uri.getScheme()) || uri.getScheme() == null) {
             setDataSource(uri.getPath());
+            return;
+        }
+        android.content.res.AssetFileDescriptor afd =
+                context.getContentResolver().openAssetFileDescriptor(uri, "r");
+        if (afd == null) throw new java.io.IOException("MediaExtractor: cannot open " + uri);
+        try {
+            setDataSource(afd);
+        } finally {
+            try { afd.close(); } catch (Throwable ignored) { }
+        }
     }
     // AOSP: a declared length below 0 means "the whole file", so it drops the
     // slice bounds entirely rather than passing a negative length down.

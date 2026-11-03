@@ -2187,40 +2187,8 @@ static int RescueAppDataFromCodeDir(const fs::path& code_dir, const fs::path& da
     return failed;
 }
 
-// The stub's single-instance lock must die with THIS process, not with our
-// children (owner, 2026-10-19: "apps are launching in the background again").
-// launcher/AppStubMain.swift step 5 opens run/<dirName>.pid WITHOUT O_CLOEXEC on
-// purpose, so the flock survives its execv into us. But every process we then
-// posix_spawn/exec inherits that fd too -- the background DEX conversion that
-// outlives a cold boot, a guest's fork+execve helpers (yt-dlp, ffmpeg through
-// macapk-elfexec), CocoaExitProcess's relaunch /bin/sh and the `open` it execs.
-// flock belongs to the open file description, so any such survivor keeps the
-// app "running" after we quit: the next Dock or drawer launch finds the lock
-// held, activates the dead pid written in the file, and exits, and the app
-// never comes up. Marking it close-on-exec here keeps our own hold (this
-// process never execs) while no exec'd child can carry it. Recognised by path,
-// so it works with every stub generation; a plain fork() child that never
-// execs still shares it, and the app-group kill on exit is what reaps those.
-static void MacApkRunLockCloexec() {
-    const char* home = std::getenv("HOME");
-    if (!home || !home[0]) return;
-    const std::string run_dir = std::string(home) + "/Library/Application Support/Mac.apk/run/";
-    for (int fd = 3; fd < 256; ++fd) {
-        int flags = fcntl(fd, F_GETFD);
-        if (flags < 0 || (flags & FD_CLOEXEC)) continue;
-        char path[PATH_MAX];
-        if (fcntl(fd, F_GETPATH, path) != 0) continue;
-        const size_t n = std::strlen(path);
-        if (n < 4 || std::strcmp(path + n - 4, ".pid") != 0) continue;
-        if (std::strncmp(path, run_dir.c_str(), run_dir.size()) != 0) continue;
-        if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0)
-            std::fprintf(stderr, "[macapk] run lock fd %d (%s) is now close-on-exec\n", fd, path);
-    }
-}
-
 int main(int argc, char** argv) {
     const long long main_entry_ms = NowEpochMs();   // BOOTSPEED clock: stub + dyld cost
-    MacApkRunLockCloexec();
     CliArgs cli = ParseArgs(argc, argv);
     // Engine-gate the pairip frontier surfaces: detect the native-VM pairip
     // marker ONCE here (pre-JVM, BEFORE the bionic shim is dlopen'd) and publish
@@ -3310,22 +3278,6 @@ int main(int argc, char** argv) {
         // parent chain is <root>/.macapk/code, so a non-split or degraded
         // install pays nothing. Non-fatal by the same convention as the rest
         // of this block -- an install must never fail over an icon.
-        // v1.0.2239: the app's anydpi (adaptive/vector) icon won, so
-        // WriteAppMetadata kept its density raster aside rather than as
-        // icon.png. Promote it only when the rasterizer above produced nothing
-        // (a degenerate render is refused by Boot.writeLauncherIcon), so an icon
-        // our Drawable pipeline cannot paint still shows the app's own legacy
-        // raster instead of the generic placeholder.
-        {
-            std::error_code fb_ec;
-            const fs::path fb = fs::path(app.app_dir) / macapk::kIconRasterFallback;
-            if (!fs::exists(icon_png_path, fb_ec) && fs::exists(fb, fb_ec)) {
-                fs::copy_file(fb, icon_png_path, fs::copy_options::overwrite_existing, fb_ec);
-                std::fprintf(stderr,
-                    "[macapk] no rendered launcher icon; using the app's density raster "
-                    "(%s)\n", fb_ec ? "copy FAILED" : "fallback");
-            }
-        }
         macapk::MirrorInstallMetadata(app.app_dir);
         // Finished-stage marker for InstallCore.extract()'s sub-stage
         // progress (see `stage merged` in apk_unpacker.cpp). Covers the

@@ -236,7 +236,7 @@ public class Activity extends ContextThemeWrapper
 
     public final Application getApplication() { return application; }
     public Intent getIntent()                 { return intent; }
-    public void setIntent(Intent i)           { this.intent = i; }
+    public void setIntent(Intent i)           { this.intent = i; }  // not final, as in AOSP: apps override it
     // AOSP: Activity does NOT override getContentResolver -- it inherits
     // ContextWrapper.getContentResolver(), which delegates to the base
     // ContextImpl and always returns a non-null ContentResolver. Our old
@@ -327,7 +327,18 @@ public class Activity extends ContextThemeWrapper
     /** AOSP android14 Activity.onCreate (:1698-1740) ends its fragment work
      *  with "mFragments.dispatchCreate();" (:1719), which moves the platform
      *  FragmentManager to CREATED. See macapkDispatchFragmentCreate. */
-    protected void onCreate(Bundle savedInstanceState) { macapkDispatchFragmentCreate(); }
+    protected void onCreate(Bundle savedInstanceState) {
+        // AOSP Activity.onCreate: getApplication().dispatchActivityCreated(this, ...).
+        // See Application.CREATED_ORDER; ActivityHost sends it itself when an
+        // override never calls super.
+        if (Application.CREATED_ORDER && application != null && !macapkCreatedDispatched) {
+            macapkCreatedDispatched = true;
+            application.dispatchActivityCreatedOnly(this, savedInstanceState);
+        }
+        macapkDispatchFragmentCreate();
+    }
+    /** Set once onActivityCreated has gone out for this activity (Application.CREATED_ORDER). */
+    public boolean macapkCreatedDispatched;
     protected void onStart()          {}
     protected void onResume()         {}
     protected void onPostResume()     {}
@@ -442,28 +453,7 @@ public class Activity extends ContextThemeWrapper
     }
     public void onConfigurationChanged(Configuration newConfig) {}
     public void onWindowFocusChanged(boolean hasFocus) {}
-    /** AOSP Activity.onCreateOptionsMenu: `if (mParent != null) return
-     *  mParent.onCreateOptionsMenu(menu); return true;` (android14-release
-     *  Activity.java:4622). We hosted no parent activities, so the answer is
-     *  true. It was false, which told AppCompat's ToolbarActionBar that an
-     *  activity without its own onCreateOptionsMenu has no options panel; see
-     *  MACAPK_ACTIVITY_MENU_AOSP below for what that broke. */
-    public boolean onCreateOptionsMenu(android.view.Menu menu) { return MACAPK_ACTIVITY_MENU_AOSP; }
-    /** BISECT GATE (2026-10-20, default ON): the base Activity's options-panel
-     *  answers are AOSP's -- onCreateOptionsMenu true, onPreparePanel returns
-     *  onPrepareOptionsMenu's answer (no "has visible items" test; AOSP has none
-     *  there, android14 Activity.java:4478). AppCompat's
-     *  ToolbarActionBar.populateOptionsMenu calls onCreatePanelMenu &&
-     *  onPreparePanel, and only a TRUE onPreparePanel reaches
-     *  ToolbarCallbackWrapper's mDecorToolbar.setMenuPrepared(); until then
-     *  ToolbarWidgetWrapper's navigation-button listener returns without calling
-     *  onMenuItemSelected(home). So on any AppCompat activity with a support
-     *  Toolbar and no menu items of its own, the Up / drawer button did nothing:
-     *  Rangskat's hamburger never reached onSupportNavigateUp and the drawer
-     *  never opened. MACAPK_ACTIVITY_MENU_AOSP=0 restores the old false / the
-     *  hasVisibleItems() test. */
-    static final boolean MACAPK_ACTIVITY_MENU_AOSP =
-        !"0".equals(System.getenv("MACAPK_ACTIVITY_MENU_AOSP"));
+    public boolean onCreateOptionsMenu(android.view.Menu menu) { return false; }
     public boolean onOptionsItemSelected(MenuItem item) { return false; }
     public boolean onPrepareOptionsMenu(android.view.Menu menu) { return true; }
     /** AOSP Activity.invalidateOptionsMenu() forces a re-create on
@@ -654,9 +644,8 @@ public class Activity extends ContextThemeWrapper
     // AppCompatWindowCallback which (via WindowCallbackWrapper) forwards to
     // the wrapped callback -- this Activity. So these route the toolbar
     // menu through the app's onCreateOptionsMenu/onPrepareOptionsMenu, the
-    // same as on a real device. The menu is kept iff BOTH return true, and a
-    // true onPreparePanel is also what marks the support Toolbar's menu as
-    // prepared, which its navigation button needs (MACAPK_ACTIVITY_MENU_AOSP).
+    // same as on a real device. The menu is kept iff BOTH return true, so
+    // onPreparePanel must report menu.hasVisibleItems() once inflated.
     private static final boolean sMenuTrace = System.getenv("MACAPK_MENU_TRACE") != null;
     @Override
     public boolean onCreatePanelMenu(int featureId, android.view.Menu menu) {
@@ -684,12 +673,7 @@ public class Activity extends ContextThemeWrapper
     public boolean onPreparePanel(int featureId, View view, android.view.Menu menu) {
         if (featureId == Window.FEATURE_OPTIONS_PANEL && menu != null) {
             boolean goforit = onPrepareOptionsMenu(menu);
-            // AOSP also ORs in mFragments.dispatchPrepareOptionsMenu (and
-            // onCreatePanelMenu mFragments.dispatchCreateOptionsMenu); our
-            // platform FragmentManagerImpl has no options-menu dispatch yet, so
-            // android.app.Fragment menus are not merged here. androidx
-            // fragments are dispatched by FragmentActivity itself.
-            return MACAPK_ACTIVITY_MENU_AOSP ? goforit : (goforit && menu.hasVisibleItems());
+            return goforit && menu.hasVisibleItems();
         }
         return true;
     }
@@ -1635,10 +1619,12 @@ public class Activity extends ContextThemeWrapper
 
         /** The @android:id/content frame when the installed root is the decor
          *  ensureDecor BUILT and it is still this window's decor (the empty
-         *  window ActivityHost.addEmptyWindowIfNeeded installs), else null. An
-         *  AppCompat sub-decor replaces `decor`, so it never matches. */
+         *  window ActivityHost.addEmptyWindowIfNeeded installs), else null. Not
+         *  once AppCompat's sub-decor sits in it: AppCompat moves the id to its
+         *  own content frame, which findViewById then finds in the tree. */
         android.view.View macapkOwnDecorContentFor(android.view.View installedRoot) {
-            return (installedRoot != null && installedRoot == builtDecor && decor == builtDecor)
+            return (installedRoot != null && installedRoot == builtDecor && decor == builtDecor
+                    && content != null && content.getId() == ID_CONTENT)
                     ? content : null;
         }
 
@@ -2069,10 +2055,38 @@ public class Activity extends ContextThemeWrapper
                 activity.macapkInstallContentDirect(view);
                 return;
             }
-            // AppCompat's `mWindow.setContentView(subDecor)` happens at
-            // the end of createSubDecor after it has already done the
-            // id-aliasing on subDecor. We make this view the new "decor"
-            // so applyFixedSizeWindow's `mSubDecor.findViewById(16908290)`
+            // AOSP PhoneWindow.setContentView(View) (:486-506) puts the view
+            // INTO the content frame, MATCH x MATCH, and the decor stays the
+            // window's root. AppCompat's createSubDecor ends in
+            // `mWindow.setContentView(subDecor)`, and we used to make the
+            // sub-decor itself the decor and the render root -- a vertical
+            // LinearLayout. A view an app adds to getDecorView() to float
+            // over everything then landed below the content, 0 px tall:
+            // Spotify's bottom sheets did, and the screen stopped answering
+            // touches under a sheet nobody could see. The decor is the root
+            // now, with the sub-decor in its content frame; findViewById
+            // still reaches the sub-decor's android.R.id.content (AppCompat
+            // took the id off ours). A view carrying a native surface keeps
+            // the bare install, as the screen_title decor does.
+            if (view != null && view != builtDecor && decor == builtDecor
+                    && findNativeHandle(view) == 0) {
+                try {
+                    android.view.ViewGroup frame = (android.view.ViewGroup) content;
+                    if (view.getParent() != frame) {
+                        frame.removeAllViews();
+                        frame.addView(view, new android.view.ViewGroup.LayoutParams(
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+                    }
+                    activity.macapkInstallContentDirect(builtDecor);
+                    return;
+                } catch (Throwable t) {
+                    com.macapk.loader.NativeLog.w("Mac.apk.Activity",
+                            "content install into the decor failed, installing the view bare: " + t);
+                }
+            }
+            // The bare install: this view becomes the "decor", so
+            // applyFixedSizeWindow's `mSubDecor.findViewById(16908290)`
             // routes through this view's tree.
             decor = view;
             // Route the view to native rendering DIRECTLY -- NOT through
@@ -2101,8 +2115,20 @@ public class Activity extends ContextThemeWrapper
                 mMacapkWindowTitle = title;
                 if (mTitleView != null) mTitleView.setText(title);
             }
-            activity.setTitle(title);
+            // PhoneWindow.setTitle never calls back into the Activity: the
+            // Activity drives the Window (setTitle -> onTitleChanged ->
+            // win.setTitle), not the other way round. Re-entering here ran the
+            // APP's setTitle override from inside our own onPostCreate, and an
+            // app that forbids direct setTitle calls (Spotify's activities throw
+            // AssertionError "Don't call setTitle() directly") aborted there.
+            // The host caption does not depend on it (activeWindowTitle reads
+            // MACAPK_APP_LABEL, then getTitle()). MACAPK_WINDOW_TITLE_NO_REENTRY=0
+            // restores the call.
+            if (!MACAPK_WINDOW_TITLE_NO_REENTRY) activity.setTitle(title);
         }
+        /** MACAPK_WINDOW_TITLE_NO_REENTRY (default ON): see setTitle. */
+        static final boolean MACAPK_WINDOW_TITLE_NO_REENTRY =
+                !"0".equals(System.getenv("MACAPK_WINDOW_TITLE_NO_REENTRY"));
         /** PhoneWindow.setTitleColor (android14 :618-625): the title view's
          *  colour, remembered for a decor installed later. Window's base is an
          *  empty body (no title view). */
@@ -2780,7 +2806,12 @@ public class Activity extends ContextThemeWrapper
                 View own = (w instanceof ActivityWindow aw) ? aw.macapkOwnDecorContentFor(contentView) : null;
                 if (own != null) return own;
             }
-            if (contentView != null) return contentView;
+            if (contentView != null) {
+                // The window's decor is the root with a sub-decor in it: the id
+                // is on the sub-decor's content frame (PhoneWindow.findViewById).
+                View inTree = contentView.findViewById(id);
+                return inTree != null ? inTree : contentView;
+            }
             View dc = getWindow().getDecorView();   // ensureDecor() -> content FrameLayout
             return dc != null ? dc.findViewById(id) : null;
         }
@@ -2900,12 +2931,13 @@ public class Activity extends ContextThemeWrapper
         if (win != null) win.setTitle(title);
     }
     /** Re-entrancy guard around onTitleChanged. AOSP's PhoneWindow keeps its
-     *  own title and never calls back into the Activity; OUR ActivityWindow
-     *  .setTitle routes Window.setTitle back into Activity.setTitle (so the
-     *  macOS titlebar tracks the activity title), which would otherwise make
-     *  setTitle -> onTitleChanged -> win.setTitle -> setTitle recurse forever.
-     *  Suppressing the nested dispatch keeps the observable contract (exactly
-     *  one onTitleChanged per app-initiated title change). */
+     *  own title and never calls back into the Activity, and neither does
+     *  ActivityWindow.setTitle since MACAPK_WINDOW_TITLE_NO_REENTRY; with that
+     *  gate at "0" it routes Window.setTitle back into Activity.setTitle, which
+     *  would otherwise make setTitle -> onTitleChanged -> win.setTitle ->
+     *  setTitle recurse forever. Suppressing the nested dispatch keeps the
+     *  observable contract (exactly one onTitleChanged per app-initiated title
+     *  change) either way. */
     private void macapkDispatchTitleChanged(CharSequence title, int color) {
         if (mDispatchingTitleChange) return;
         mDispatchingTitleChange = true;
@@ -4472,19 +4504,7 @@ public class Activity extends ContextThemeWrapper
         // through Window.superDispatchGenericMotionEvent -> decor would miss it
         // and the focused view in it.
         View cv = contentView;
-        if (cv != null) {
-            // A pointer event (a mouse wheel's ACTION_SCROLL) is in window
-            // coordinates and the content root is entered in its own, exactly as
-            // dispatchTouchEvent above offsets a touch.
-            final boolean pointer = ev.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER);
-            final float dx = pointer ? -cv.getLeft() : 0f;
-            final float dy = pointer ? -cv.getTop() : 0f;
-            ev.offsetLocation(dx, dy);
-            boolean handled;
-            try { handled = cv.dispatchGenericMotionEvent(ev); }
-            finally { ev.offsetLocation(-dx, -dy); }
-            if (handled) return true;
-        }
+        if (cv != null && cv.dispatchGenericMotionEvent(ev)) return true;
         return onGenericMotionEvent(ev);
     }
     public boolean onGenericMotionEvent(android.view.MotionEvent event) { return false; }

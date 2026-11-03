@@ -349,7 +349,6 @@ struct Comp {
     std::string name, target;
     bool enabled = true;
     bool launcher = false;
-    bool leanback_launcher = false;   // MAIN + LEANBACK_LAUNCHER in one filter
     ComponentTraits traits;
 };
 
@@ -401,7 +400,7 @@ WindowTraits ParseWindowTraits(const std::string& d, const std::string& arsc) {
     std::vector<Comp> comps;
     Comp cur;
     bool in_comp = false;
-    bool filter_main = false, filter_launcher = false, filter_leanback = false;
+    bool filter_main = false, filter_launcher = false;
     bool comp_any_main = false, comp_any_launcher = false;   // mutant 10 only
 
     size_t off = u16(2);
@@ -544,7 +543,7 @@ WindowTraits ParseWindowTraits(const std::string& d, const std::string& arsc) {
                 }
             } else if (tag == "intent-filter" && in_comp && stack.size() >= 2
                        && (parent == "activity" || parent == "activity-alias")) {
-                filter_main = filter_launcher = filter_leanback = false;
+                filter_main = filter_launcher = false;
             } else if ((tag == "action" || tag == "category") && parent == "intent-filter" && in_comp) {
                 for (const Attr& a : attrs) {
                     if (!is(a, "name", 0x01010003) || a.type != kTypeString) continue;
@@ -553,9 +552,6 @@ WindowTraits ParseWindowTraits(const std::string& d, const std::string& arsc) {
                     }
                     if (tag == "category" && a.str == "android.intent.category.LAUNCHER") {
                         filter_launcher = true; comp_any_launcher = true;
-                    }
-                    if (tag == "category" && a.str == "android.intent.category.LEANBACK_LAUNCHER") {
-                        filter_leanback = true;
                     }
                 }
             } else if ((tag == "meta-data" || tag == "property")
@@ -604,7 +600,6 @@ WindowTraits ParseWindowTraits(const std::string& d, const std::string& arsc) {
                 && (parent == "activity" || parent == "activity-alias")) {
                 // MAIN + LAUNCHER in the SAME filter (Manifest.findLaunchable).
                 if (filter_main && filter_launcher) cur.launcher = true;
-                if (filter_main && filter_leanback) cur.leanback_launcher = true;
             } else if ((tag == "activity" || tag == "activity-alias") && parent == "application" && in_comp) {
                 if (WP_MUTANT(10) && comp_any_main && comp_any_launcher) cur.launcher = true;
                 comps.push_back(cur);
@@ -617,15 +612,12 @@ WindowTraits ParseWindowTraits(const std::string& d, const std::string& arsc) {
     // Launcher: Manifest.findLaunchable over <activity> first, then
     // <activity-alias>, document order, enabled != false.
     const Comp* chosen = nullptr;
-    // Passes 2-3: the TV-only fallback (Manifest.java's launchableCategory):
-    // with no LAUNCHER entry anywhere, the MAIN + LEANBACK_LAUNCHER component
-    // is the one that starts, in the same activity-then-alias order.
-    for (int pass = 0; pass < 4 && !chosen; ++pass) {
+    for (int pass = 0; pass < 2 && !chosen; ++pass) {
         for (const Comp& c : comps) {
-            if (c.is_alias != (pass % 2 == 1)) continue;
+            if (c.is_alias != (pass == 1)) continue;
             if (!c.enabled && !WP_MUTANT(9)) continue;
             if ((c.is_alias ? c.target : c.name).empty()) continue;
-            if (pass < 2 ? c.launcher : c.leanback_launcher) { chosen = &c; break; }
+            if (c.launcher) { chosen = &c; break; }
         }
     }
     if (chosen) {

@@ -148,12 +148,6 @@ bool CocoaOpenHostUrl(const char* url);
 // delivered through kAEGetURL since the last call into `out` (oldest first)
 // and clear the queue. See cocoa_bridge.mm "Host URL intake".
 void CocoaTakeHostUrls(std::vector<std::string>& out);
-// Queue a URL for the app exactly as a kAEGetURL Apple Event would
-// (HostUrlIntake drains it). Used by the App Link sign-in window.
-void CocoaQueueHostUrl(const char* url);
-// The App Link sign-in window (applink_window.mm): show `url`; a navigation to
-// `return_prefix` is cancelled and queued with CocoaQueueHostUrl.
-bool CocoaOpenAppLinkWindow(const char* url, const char* return_prefix);
 
 // Host URL intake: the applications LaunchServices already lists as handlers of
 // `scheme` (bundle paths). false = the query is unavailable (unknown), which is

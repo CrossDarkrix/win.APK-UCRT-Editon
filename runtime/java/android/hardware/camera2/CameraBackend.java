@@ -260,21 +260,6 @@ final class CameraBackend {
                 new int[] { CameraMetadata.CONTROL_AE_MODE_ON });
         p.put(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES, fmt.fpsRanges);
 
-        // Exposure compensation: not under app control either. AOSP says both
-        // keys are "available on all devices" and spells "not supported" as the
-        // range [0,0]; a LEGACY device's step comes from Camera1's
-        // getExposureCompensationStep(), which is 0 there, and
-        // ParamsUtils.createRational(0f) is Rational.ZERO
-        // (LegacyMetadataMapper.mapControlAe). Absent, CameraX's
-        // ExposureState.getExposureCompensationRange() handed back null and
-        // react-native-vision-camera's device list threw an NPE on getLower()
-        // while the Xbox app's native modules initialised (GitHub #7).
-        // GATE-MUTANT(camaecomp:keys) begin
-        p.put(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE,
-                new android.util.Range<>(Integer.valueOf(0), Integer.valueOf(0)));
-        p.put(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP, android.util.Rational.ZERO);
-        // GATE-MUTANT(camaecomp:keys) end
-
         // SENSOR_INFO_ACTIVE_ARRAY_SIZE is the coordinate space apps map crop
         // and metering rectangles into, and it is also what many use to derive
         // the sensor aspect ratio. The largest format the device advertises is

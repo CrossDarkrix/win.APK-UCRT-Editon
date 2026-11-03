@@ -2252,7 +2252,10 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
         for (File f : children) {
             String name = f.getName();
             if (name.startsWith(".")) continue;
-            if (Files.isSymbolicLink(f.toPath())) {
+            // Win.apk: the Windows host's mapping links are directory junctions,
+            // which Java reports as plain directories; they get the same rules.
+            if (Files.isSymbolicLink(f.toPath())
+                    || com.macapk.loader.SharedStorage.isJunction(f.toPath())) {
                 // A root-level link is followed as a mount ONLY when it is one
                 // of SharedStorage's own mapping links, by name AND target.
                 // Nothing refuses a JAVA-created symlink here (android.system.Os
@@ -2286,6 +2289,14 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
         }
     }
 
+    /** The most files one Windows-mapped folder adds to the index (see
+     *  SharedStorage.walkHostFolder): the top of a Downloads holding source
+     *  trees, not all of it. A Mac folder is walked whole, as before. */
+    static final long HOST_FOLDER_SCAN_LIMIT = 10_000;
+
+    /** Folders already reported as cut short: once per process, not per query. */
+    private static final Set<String> sCappedLogged = new HashSet<>();
+
     @SuppressWarnings("unchecked")
     private static List<File> walkMapped(File top, File root) {
         String key = top.getAbsolutePath();
@@ -2299,7 +2310,18 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
         }
         List<File> files = new ArrayList<>();
         long t0 = System.currentTimeMillis();
-        walk(top, root, files);
+        if (com.macapk.loader.SharedStorage.isHostFolderMapping(top)) {
+            long n = com.macapk.loader.SharedStorage.walkHostFolder(top.toPath(), HOST_FOLDER_SCAN_LIMIT,
+                    d -> !isDirectoryHidden(d.toFile(), root), (p, attrs) -> files.add(p.toFile()));
+            boolean first;
+            synchronized (sCappedLogged) { first = sCappedLogged.add(key); }
+            if (n >= HOST_FOLDER_SCAN_LIMIT && first) {
+                com.macapk.loader.NativeLog.i(TAG, top + ": indexed its first " + n
+                        + " files, breadth first; deeper ones are not in MediaStore");
+            }
+        } else {
+            walk(top, root, files);
+        }
         long t1 = System.currentTimeMillis();
         synchronized (sMappedWalks) {
             sMappedWalks.put(key, new Object[]{t1, t1 - t0, files});
@@ -2450,6 +2472,9 @@ public final class MediaStoreProvider extends android.content.ContentProvider {
             if (name.startsWith(".")) continue;
             if (host && Files.isSymbolicLink(f.toPath())) continue;   // AOSP: no FOLLOW_LINKS
             if (f.isDirectory()) {
+                // ...nor a Windows junction, which Java calls a directory.
+                if (host && com.macapk.loader.SharedStorage.isJunction(f.toPath())
+                        && com.macapk.loader.SharedStorage.isLink(f.toPath(), null)) continue;
                 if (host && isHostPackage(name, f)) continue;
                 if (isDirectoryHidden(f, root)) continue;
                 walk(f, root, out);

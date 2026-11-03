@@ -407,31 +407,29 @@ public final class ClassFileRewriter {
                 }
             }
 
-            // ---- Pattern L -- libcore private-field names on HotSpot ----
-            // Apps reflect libcore's private fields by NAME; the host JDK names
-            // some of them differently (java.io.FileDescriptor: libcore
-            // `descriptor`, OpenJDK `fd`). Route the app's own
-            // Class.getDeclaredField(String) call sites through
-            // LibcoreFields.getDeclaredField(Class, String), which answers the
-            // libcore name with the host field and passes everything else
-            // through. invokevirtual -> invokestatic, both 3 bytes with the same
-            // stack effect (Class, String -> Field), so no PC / branch /
-            // StackMapTable shift. Rationale and the name table:
-            // LibcoreFields.java. Gate MACAPK_LIBCORE_FIELD_NAMES.
-            if (LIBCORE_FIELD_NAMES && containsNeedle(raw, NEEDLE_GET_DECLARED_FIELD)
-                    && containsNeedle(raw, NEEDLE_LIBCORE_FIELD)) {
-                int patchedL = 0;
-                for (MethodEntry m : cf.methods) {
-                    CodeAttr code = m.code;
-                    if (code == null) continue;
-                    patchedL += patternLLibcoreFieldNames(cf, code, className);
-                }
-                if (patchedL > 0) {
+            // ---- Pattern S -- Android's file separator in guest code ----
+            // See ANDROID_FILE_SEPARATOR below. Windows hosts only.
+            if (ANDROID_FILE_SEPARATOR) {
+                int patchedS = patternSAndroidFileSeparator(cf, className);
+                if (patchedS > 0) {
                     if (DEBUG) {
-                        System.err.println("[rewriter] " + className + ": Pattern-L routed "
-                            + patchedL + " getDeclaredField call site(s) through LibcoreFields");
+                        System.err.println("[rewriter] " + className
+                            + ": Pattern-S made " + patchedS + " File.separator(Char) read(s) '/'");
                     }
-                    hits += patchedL;
+                    hits += patchedS;
+                }
+            }
+
+            // ---- Pattern N -- Android's native-library names and loads ----
+            // See ONDEMAND_NATIVE below. Windows hosts only.
+            if (ONDEMAND_NATIVE) {
+                int patchedN = patternNNativeLibraries(cf, className);
+                if (patchedN > 0) {
+                    if (DEBUG) {
+                        System.err.println("[rewriter] " + className
+                            + ": Pattern-N routed " + patchedN + " mapLibraryName/load call(s)");
+                    }
+                    hits += patchedN;
                 }
             }
 
@@ -612,10 +610,20 @@ public final class ClassFileRewriter {
                 || containsNeedle(raw, FROM_BYTES_G)) {
                 return true;
             }
-            // Pattern L: a getDeclaredField call AND a libcore field name
-            // literal in the same class (an over-match costs one parse).
-            if (LIBCORE_FIELD_NAMES && containsNeedle(raw, NEEDLE_GET_DECLARED_FIELD)
-                    && containsNeedle(raw, NEEDLE_LIBCORE_FIELD)) {
+            // Pattern S: a Fieldref to java/io/File.separator(Char) needs both
+            // UTF8 entries ("separatorChar" contains "separator").
+            if (ANDROID_FILE_SEPARATOR
+                && containsNeedle(raw, NEEDLE_SEPARATOR)
+                && containsNeedle(raw, NEEDLE_JAVA_IO_FILE)) {
+                return true;
+            }
+            // Pattern N: a Methodref to System.mapLibraryName, or to a method
+            // named exactly "load" (a length-4 UTF8 entry) of System or Runtime.
+            if (ONDEMAND_NATIVE
+                && (containsNeedle(raw, NEEDLE_MAP_LIBRARY_NAME)
+                    || (containsNeedle(raw, NEEDLE_LOAD_NAME)
+                        && (containsNeedle(raw, NEEDLE_JAVA_LANG_SYSTEM)
+                            || containsNeedle(raw, NEEDLE_JAVA_LANG_RUNTIME))))) {
                 return true;
             }
             if (containsNeedle(raw, NEEDLE_CLINIT)
@@ -1003,51 +1011,6 @@ public final class ClassFileRewriter {
     }
 
     // -----------------------------------------------------------------
-    // Pattern L -- libcore private-field names (see LibcoreFields)
-    // -----------------------------------------------------------------
-
-    /** Gate for Pattern L (default ON); MACAPK_LIBCORE_FIELD_NAMES=0 leaves
-     *  every getDeclaredField call site alone. */
-    static final boolean LIBCORE_FIELD_NAMES =
-        !"0".equals(System.getenv("MACAPK_LIBCORE_FIELD_NAMES"));
-    private static final byte[] NEEDLE_GET_DECLARED_FIELD =
-        "getDeclaredField".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-    /** The libcore field names LibcoreFields maps; any one is enough to parse. */
-    private static final byte[] NEEDLE_LIBCORE_FIELD =
-        "descriptor".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-
-    /** Rewrite every `invokevirtual java/lang/Class.getDeclaredField:
-     *  (Ljava/lang/String;)Ljava/lang/reflect/Field;` in one method into
-     *  `invokestatic com/macapk/loader/LibcoreFields.getDeclaredField:
-     *  (Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;`. */
-    private static int patternLLibcoreFieldNames(ClassFile cf, CodeAttr code, String className) {
-        int routed = 0;
-        int target = -1;
-        byte[] bc = code.code;
-        int codeEnd = code.codeOffset + code.codeLen;
-        int pc = code.codeOffset;
-        while (pc < codeEnd) {
-            int op = bc[pc] & 0xFF;
-            int len = instructionLength(op, bc, pc);
-            if (len <= 0) break;
-            if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(bc, pc + 1), "java/lang/Class",
-                    "getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;")) {
-                if (target < 0) {
-                    int cls = cf.findOrAddClass("com/macapk/loader/LibcoreFields");
-                    int nt = cf.findOrAddNameAndType("getDeclaredField",
-                        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;");
-                    target = cf.findOrAddMethodref(cls, nt);
-                }
-                bc[pc] = (byte) OP_INVOKESTATIC;
-                writeU2(bc, pc + 1, target);
-                routed++;
-            }
-            pc += len;
-        }
-        return routed;
-    }
-
-    // -----------------------------------------------------------------
     // Pattern F -- neutralize invokestatic System.runFinalizersOnExit
     // -----------------------------------------------------------------
 
@@ -1157,6 +1120,280 @@ public final class ClassFileRewriter {
         if (ntIdx < 0) return false;
         return "runFinalizersOnExit".equals(cf.utf8(cf.nameAndTypeName(ntIdx)))
             && "(Z)V".equals(cf.utf8(cf.nameAndTypeDescriptor(ntIdx)));
+    }
+
+    // -----------------------------------------------------------------
+    // Pattern S -- Android's file separator in guest code (Windows host)
+    // -----------------------------------------------------------------
+    //
+    // Android's java.io.File.separatorChar is '/' and File.separator "/";
+    // on the Windows JVM they are '\' and "\". App code is written for '/':
+    // it builds regexes, zip entry names and asset paths out of them.
+    // WITNESSED (Maccabi, com.ideomobile.maccabi): ReLinker's
+    // ApkLibraryInstaller compiles
+    //   "lib" + separatorChar + "([^\\" + separatorChar + "]*)" + separatorChar + name
+    // to match APK entries ("lib/arm64-v8a/libx.so"). With '\' the pattern
+    // is "lib\([^\\]*)\x.dll" -- an escaped '(' and an unmatched ')' --
+    // and its fallback died with PatternSyntaxException instead of the
+    // MissingLibraryException the app handles.
+    //
+    // MECHANISM: in GUEST classes only (this rewriter runs for classes the
+    // app's class loader defines; the framework and the JDK never pass
+    // through it), each read of the two fields becomes the Android value,
+    // in place and at the same length:
+    //   getstatic java/io/File.separatorChar:C                  -> bipush 47; nop
+    //   getstatic java/io/File.separator:Ljava/lang/String;     -> ldc_w "/"
+    // Both push the same verification type (int, java/lang/String) as the
+    // read they replace, so no StackMapTable or branch offset changes. The
+    // "/" String constant is reused when the class has one, else appended.
+    //
+    // File access keeps working: the JDK's WinNTFileSystem takes '/' in
+    // paths and normalizes it. What changes is code that takes paths the
+    // JDK returns (File.getPath() gives '\' on Windows) apart with the
+    // separator, e.g. path.lastIndexOf(File.separatorChar): on Windows such
+    // a path has no '/'. That code was right only on Windows before; the
+    // regex/zip-entry code above was wrong on Windows and is now right, as
+    // it is on Android.
+    //
+    // Left alone on purpose: File.pathSeparator (Android's ':' would clash
+    // with drive letters) and the file.separator system property.
+    // System.mapLibraryName is Pattern N's (below).
+    //
+    // Only on a Windows host (System.mapLibraryName gives ".dll"); macOS
+    // already has '/'. MACAPK_ANDROID_FILE_SEPARATOR=0 turns it off.
+    static final boolean ANDROID_FILE_SEPARATOR = androidFileSeparatorEnabled();
+
+    private static boolean androidFileSeparatorEnabled() {
+        try {
+            if ("0".equals(System.getenv("MACAPK_ANDROID_FILE_SEPARATOR"))) return false;
+            return System.mapLibraryName("x").endsWith(".dll") && java.io.File.separatorChar != '/';
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static final byte[] NEEDLE_SEPARATOR =
+        "separator".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    private static final byte[] NEEDLE_JAVA_IO_FILE =
+        "java/io/File".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+    private static final int OP_BIPUSH = 0x10;
+    private static final int OP_LDC_W  = 0x13;
+
+    /** Rewrites every getstatic of java/io/File.separatorChar / .separator
+     *  in the class's methods. Returns the number of reads rewritten. */
+    private static int patternSAndroidFileSeparator(ClassFile cf, String className) {
+        int charRef = -1, stringRef = -1;
+        for (int i = 1; i < cf.cpEntries.size(); i++) {
+            CpEntry e = cf.cpEntries.get(i);
+            if (e == null || e.added || e.tag != CP_FIELDREF) continue;
+            if (!"java/io/File".equals(cf.classNameOf(cf.fieldrefClass(i)))) continue;
+            int nt = cf.fieldrefNameAndType(i);
+            String name = cf.utf8(cf.nameAndTypeName(nt));
+            String desc = cf.utf8(cf.nameAndTypeDescriptor(nt));
+            if ("separatorChar".equals(name) && "C".equals(desc)) charRef = i;
+            else if ("separator".equals(name) && "Ljava/lang/String;".equals(desc)) stringRef = i;
+        }
+        if (charRef < 0 && stringRef < 0) return 0;
+        int slash = -1;  // CP index of the String "/", made on first use
+        int rewritten = 0;
+        byte[] bc = cf.raw;
+        for (int methodOff : cf.methodOffsets) {
+            final CodeAttr code = codeOf(cf, methodOff);
+            if (code == null) continue;
+            int end = code.codeOffset + code.codeLen;
+            int pc = code.codeOffset;
+            while (pc < end) {
+                int op = bc[pc] & 0xFF;
+                int len = exactInstructionLength(op, bc, pc, code.codeOffset);
+                if (len <= 0 || pc + len > end) break;
+                if (op == OP_GETSTATIC) {
+                    int ref = u2(bc, pc + 1);
+                    if (ref == charRef) {
+                        bc[pc] = (byte) OP_BIPUSH;
+                        bc[pc + 1] = (byte) '/';
+                        bc[pc + 2] = (byte) OP_NOP;
+                        rewritten++;
+                    } else if (ref == stringRef) {
+                        if (slash < 0) slash = cf.findOrAddString("/");
+                        if (slash < 0) { pc += len; continue; }  // constant pool full
+                        bc[pc] = (byte) OP_LDC_W;
+                        writeU2(bc, pc + 1, slash);
+                        rewritten++;
+                    }
+                }
+                pc += len;
+            }
+        }
+        return rewritten;
+    }
+
+    /** The method's attribute named Code (parseMethod's MethodEntry.code is
+     *  only its first attribute), or null when it has none. */
+    private static CodeAttr codeOf(ClassFile cf, int methodOff) {
+        byte[] bc = cf.raw;
+        int off = methodOff + 6;
+        int attrs = u2(bc, off);
+        off += 2;
+        for (int a = 0; a < attrs; a++) {
+            int nameIdx = u2(bc, off);
+            int alen = u4(bc, off + 2);
+            if (alen >= 8 && "Code".equals(cf.utf8(nameIdx))) {
+                int codeLen = u4(bc, off + 6 + 4);
+                return codeLen > 0 ? new CodeAttr(bc, off + 6 + 8, codeLen, 0) : null;
+            }
+            off += 6 + alen;
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------
+    // Pattern N -- Android's native-library names and loads (Windows host)
+    // -----------------------------------------------------------------
+    //
+    // Android's System.mapLibraryName("x") is "libx.so", and its System.load
+    // takes the path of an ELF. On the Windows JVM the first gives "x.dll" and
+    // the second takes only a host DLL, so an app that unpacks its own
+    // libraries and loads them by path failed on its FIRST run. WITNESSED
+    // (WhatsApp 2.26.42.71): SoLoader looked for "whatsappmerged.dll" in the
+    // superpack dir WhatsApp had just decompressed, found only
+    // libwhatsappmerged.so, threw SoLoaderDSONotFoundError, and WhatsApp
+    // showed CorruptInstallationActivity. Only the second launch worked,
+    // because by then the startup exposure (AppClassLoader.prepareDirectDlopenLibs)
+    // had found the files. ReLinker builds its names the same way: its APK
+    // fallback looked for lib/<abi>/flutter.dll, not libflutter.so.
+    //
+    // MECHANISM: in GUEST classes only, each call becomes a call of
+    // com.macapk.loader.NativeLoadBridge, in place and at the same length:
+    //   invokestatic  java/lang/System.mapLibraryName:(Ljava/lang/String;)Ljava/lang/String;
+    //                    -> invokestatic NativeLoadBridge.mapLibraryName, same descriptor
+    //   invokestatic  java/lang/System.load:(Ljava/lang/String;)V
+    //                    -> invokestatic NativeLoadBridge.load, same descriptor
+    //   invokevirtual java/lang/Runtime.load:(Ljava/lang/String;)V
+    //                    -> invokestatic NativeLoadBridge.load:(Ljava/lang/Runtime;Ljava/lang/String;)V
+    // Each consumes and pushes the same verification types as the call it
+    // replaces (the Runtime receiver becomes the first argument), so no
+    // StackMapTable entry, branch offset or max_stack changes. The bridge makes
+    // the stub an ELF needs on the spot (AppClassLoader.loadNativeOnDemand) and
+    // loads it in the CALLER's class loader, where System.load binds a
+    // library's natives. Reflective and method-handle calls of these methods
+    // are not call sites and stay the JDK's.
+    //
+    // Only on a Windows host (System.mapLibraryName gives ".dll"); macOS needs
+    // its translator's dylibs under the JVM's names. MACAPK_ONDEMAND_NATIVE=0
+    // turns it off and restores the old behaviour, the startup exposure alone.
+    static final boolean ONDEMAND_NATIVE = onDemandNativeEnabled();
+
+    private static boolean onDemandNativeEnabled() {
+        try {
+            if ("0".equals(System.getenv("MACAPK_ONDEMAND_NATIVE"))) return false;
+            return System.mapLibraryName("x").endsWith(".dll");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static final byte[] NEEDLE_MAP_LIBRARY_NAME =
+        "mapLibraryName".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    /** A CONSTANT_Utf8 "load": its u2 length 4, then the bytes. */
+    private static final byte[] NEEDLE_LOAD_NAME = {0, 4, 'l', 'o', 'a', 'd'};
+    private static final byte[] NEEDLE_JAVA_LANG_SYSTEM =
+        "java/lang/System".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    private static final byte[] NEEDLE_JAVA_LANG_RUNTIME =
+        "java/lang/Runtime".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    private static final String NATIVE_LOAD_BRIDGE = "com/macapk/loader/NativeLoadBridge";
+    private static final int N_MAP = 1, N_SYSTEM_LOAD = 2, N_RUNTIME_LOAD = 3;
+
+    /** Rewrites every call of System.mapLibraryName, System.load and
+     *  Runtime.load in the class's methods. Returns the number rewritten. */
+    private static int patternNNativeLibraries(ClassFile cf, String className) {
+        int[] kind = null;   // CP index -> N_*, for the class's own Methodrefs
+        for (int i = 1; i < cf.cpEntries.size(); i++) {
+            CpEntry e = cf.cpEntries.get(i);
+            if (e == null || e.added || e.tag != CP_METHODREF) continue;
+            int k = 0;
+            if (isMethodref(cf, i, "java/lang/System", "mapLibraryName",
+                            "(Ljava/lang/String;)Ljava/lang/String;")) k = N_MAP;
+            else if (isMethodref(cf, i, "java/lang/System", "load", "(Ljava/lang/String;)V")) k = N_SYSTEM_LOAD;
+            else if (isMethodref(cf, i, "java/lang/Runtime", "load", "(Ljava/lang/String;)V")) k = N_RUNTIME_LOAD;
+            if (k == 0) continue;
+            if (kind == null) kind = new int[cf.cpEntries.size()];
+            kind[i] = k;
+        }
+        if (kind == null) return 0;
+        // At most 12 new entries (the Class and its Utf8, 4 more Utf8, 3
+        // NameAndType, 3 Methodref); a pool that close to full stays as it is.
+        if (cf.cpEntries.size() + 12 > 0xFFFF) return 0;
+        int[] target = new int[4];   // N_* -> the bridge Methodref, made on first use
+        int bridge = 0;              // its Class entry, likewise
+        int rewritten = 0;
+        byte[] bc = cf.raw;
+        for (int methodOff : cf.methodOffsets) {
+            final CodeAttr code = codeOf(cf, methodOff);
+            if (code == null) continue;
+            int end = code.codeOffset + code.codeLen;
+            int pc = code.codeOffset;
+            while (pc < end) {
+                int op = bc[pc] & 0xFF;
+                int len = exactInstructionLength(op, bc, pc, code.codeOffset);
+                if (len <= 0 || pc + len > end) break;
+                if (op == OP_INVOKESTATIC || op == OP_INVOKEVIRTUAL) {
+                    int ref = u2(bc, pc + 1);
+                    int k = ref < kind.length ? kind[ref] : 0;
+                    boolean match = op == OP_INVOKEVIRTUAL ? k == N_RUNTIME_LOAD
+                                                           : k == N_MAP || k == N_SYSTEM_LOAD;
+                    if (match) {
+                        if (target[k] == 0) {
+                            if (bridge == 0) bridge = cf.findOrAddClass(NATIVE_LOAD_BRIDGE);
+                            int nt = k == N_MAP
+                                ? cf.findOrAddNameAndType("mapLibraryName", "(Ljava/lang/String;)Ljava/lang/String;")
+                                : k == N_SYSTEM_LOAD
+                                ? cf.findOrAddNameAndType("load", "(Ljava/lang/String;)V")
+                                : cf.findOrAddNameAndType("load", "(Ljava/lang/Runtime;Ljava/lang/String;)V");
+                            target[k] = cf.findOrAddMethodref(bridge, nt);
+                        }
+                        bc[pc] = (byte) OP_INVOKESTATIC;
+                        writeU2(bc, pc + 1, target[k]);
+                        rewritten++;
+                    }
+                }
+                pc += len;
+            }
+        }
+        return rewritten;
+    }
+
+    /** The exact length of the instruction at pc, wide and the two
+     *  switches included (instructionLength above gives up on those), so a
+     *  scan of a whole method never lands inside an operand. codeStart is
+     *  the offset of the method's first instruction (switch padding counts
+     *  from it). -1 on an opcode that cannot appear. */
+    private static int exactInstructionLength(int op, byte[] bc, int pc, int codeStart) {
+        switch (op) {
+            case 0xC4: {                                                  // wide
+                int next = bc[pc + 1] & 0xFF;
+                return next == 0x84 ? 6 : 4;                              // wide iinc / wide load-store-ret
+            }
+            case 0xAA: {                                                  // tableswitch
+                int p = pc + 1 + ((4 - ((pc + 1 - codeStart) & 3)) & 3);
+                int low = u4(bc, p + 4), high = u4(bc, p + 8);
+                long n = (long) high - low + 1;
+                if (n < 0 || n > 65535) return -1;
+                return (p - pc) + 12 + (int) n * 4;
+            }
+            case 0xAB: {                                                  // lookupswitch
+                int p = pc + 1 + ((4 - ((pc + 1 - codeStart) & 3)) & 3);
+                int pairs = u4(bc, p + 4);
+                if (pairs < 0 || pairs > 65535) return -1;
+                return (p - pc) + 8 + pairs * 8;
+            }
+            case 0x11:                                                    // sipush
+                return 3;
+            default:
+                if (op > 0xC9) return -1;                                 // reserved, or not in class files
+                return instructionLength(op, bc, pc);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1559,6 +1796,7 @@ public final class ClassFileRewriter {
         final int    classAccessFlags;
         final List<Integer> interfaces = new ArrayList<>();  // CP indices
         final List<MethodEntry> methods = new ArrayList<>();
+        final List<Integer> methodOffsets = new ArrayList<>();  // each method_info's offset in raw
 
         ClassFile(byte[] r) {
             this.raw = r;
@@ -1613,6 +1851,7 @@ public final class ClassFileRewriter {
             }
             int methodsCount = u2(r, off); off += 2;
             for (int m = 0; m < methodsCount; ++m) {
+                methodOffsets.add(off);
                 methods.add(parseMethod(r, off));
                 off = skipFieldOrMethod(r, off);
             }
@@ -1670,56 +1909,6 @@ public final class ClassFileRewriter {
             return new String(raw, e.offset + 3, len, java.nio.charset.StandardCharsets.UTF_8);
         }
 
-        /** Find a CONSTANT_Utf8 equal to `v` (original or added) or append one. */
-        int findOrAddUtf8(String v) {
-            for (int i = 1; i < cpEntries.size(); ++i) {
-                CpEntry e = cpEntries.get(i);
-                if (e == null || e.tag != CP_UTF8) continue;
-                if (e.added ? v.equals(e.addedText) : v.equals(utf8(i))) return i;
-            }
-            byte[] b = v.getBytes(java.nio.charset.StandardCharsets.UTF_8);  // ASCII names only
-            byte[] entry = new byte[3 + b.length];
-            entry[0] = (byte) CP_UTF8;
-            writeU2(entry, 1, b.length);
-            System.arraycopy(b, 0, entry, 3, b.length);
-            CpEntry e = new CpEntry(CP_UTF8, -1, entry.length);
-            e.added = true; e.addedBytes = entry; e.addedText = v;
-            return append(e);
-        }
-        /** Find a CONSTANT_Class naming `internalName` or append one. */
-        int findOrAddClass(String internalName) {
-            for (int i = 1; i < cpEntries.size(); ++i) {
-                CpEntry e = cpEntries.get(i);
-                if (e == null || e.tag != CP_CLASS || e.added) continue;
-                if (internalName.equals(classNameOf(i))) return i;
-            }
-            int name = findOrAddUtf8(internalName);
-            byte[] entry = { (byte) CP_CLASS, (byte) (name >> 8), (byte) name };
-            CpEntry e = new CpEntry(CP_CLASS, -1, 3);
-            e.added = true; e.addedBytes = entry;
-            return append(e);
-        }
-        /** Append a CONSTANT_NameAndType for (name, descriptor). */
-        int findOrAddNameAndType(String name, String desc) {
-            int n = findOrAddUtf8(name), d = findOrAddUtf8(desc);
-            for (int i = 1; i < cpEntries.size(); ++i) {
-                CpEntry e = cpEntries.get(i);
-                if (e == null || e.tag != CP_NAMEANDTYPE || e.added) continue;
-                if (nameAndTypeName(i) == n && nameAndTypeDescriptor(i) == d) return i;
-            }
-            byte[] entry = { (byte) CP_NAMEANDTYPE, (byte) (n >> 8), (byte) n, (byte) (d >> 8), (byte) d };
-            CpEntry e = new CpEntry(CP_NAMEANDTYPE, -1, 5);
-            e.added = true; e.addedBytes = entry;
-            return append(e);
-        }
-        private int append(CpEntry e) {
-            int idx = cpEntries.size();
-            cpEntries.add(e);
-            cpAdded.add(e);
-            cpCount++;
-            return idx;
-        }
-
         /** Look up an existing Methodref with the given (class_idx,
          *  name_and_type_idx). If absent, append one. Returns the CP
          *  index of the (possibly newly-added) entry. */
@@ -1741,6 +1930,83 @@ public final class ClassFileRewriter {
             e.added = true;
             e.addedClassIdx = classIdx;
             e.addedNtIdx    = ntIdx;
+            cpEntries.add(e);
+            cpAdded.add(e);
+            cpCount++;
+            return newIdx;
+        }
+
+        /** The CP index of a CONSTANT_String holding `value` (ASCII, at most
+         *  127 chars): an existing one, else a new String entry (with a new
+         *  UTF8 entry unless one exists). -1 when the constant pool is full. */
+        int findOrAddString(String value) {
+            int utf = -1;
+            for (int i = 1; i < cpEntries.size(); ++i) {
+                CpEntry e = cpEntries.get(i);
+                if (e == null || e.added) continue;
+                if (e.tag == CP_STRING && value.equals(utf8(u2(raw, e.offset + 1)))) return i;
+                if (e.tag == CP_UTF8 && utf < 0 && value.equals(utf8(i))) utf = i;
+            }
+            if (cpEntries.size() + 2 > 0xFFFF) return -1;
+            if (utf < 0) {
+                byte[] b = value.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+                byte[] entry = new byte[3 + b.length];
+                entry[0] = (byte) CP_UTF8;
+                writeU2(entry, 1, b.length);
+                System.arraycopy(b, 0, entry, 3, b.length);
+                utf = appendRaw(CP_UTF8, entry);
+            }
+            byte[] str = new byte[3];
+            str[0] = (byte) CP_STRING;
+            writeU2(str, 1, utf);
+            return appendRaw(CP_STRING, str);
+        }
+
+        /** The CP index of a CONSTANT_Utf8 holding `value` (ASCII): an
+         *  existing one, original or added, else a new one. */
+        int findOrAddUtf8(String value) {
+            byte[] b = value.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            byte[] entry = new byte[3 + b.length];
+            entry[0] = (byte) CP_UTF8;
+            writeU2(entry, 1, b.length);
+            System.arraycopy(b, 0, entry, 3, b.length);
+            return findOrAppendRaw(CP_UTF8, entry);
+        }
+
+        /** The CP index of a CONSTANT_Class naming `internalName`. */
+        int findOrAddClass(String internalName) {
+            int name = findOrAddUtf8(internalName);
+            return findOrAppendRaw(CP_CLASS, new byte[] {
+                (byte) CP_CLASS, (byte) (name >> 8), (byte) name });
+        }
+
+        /** The CP index of a CONSTANT_NameAndType for (name, descriptor). */
+        int findOrAddNameAndType(String name, String desc) {
+            int n = findOrAddUtf8(name), d = findOrAddUtf8(desc);
+            return findOrAppendRaw(CP_NAMEANDTYPE, new byte[] {
+                (byte) CP_NAMEANDTYPE, (byte) (n >> 8), (byte) n, (byte) (d >> 8), (byte) d });
+        }
+
+        /** An entry with exactly these bytes (tag included), original or
+         *  added, else a new one. */
+        private int findOrAppendRaw(int tag, byte[] bytes) {
+            for (int i = 1; i < cpEntries.size(); ++i) {
+                CpEntry e = cpEntries.get(i);
+                if (e == null || e.tag != tag || e.size != bytes.length) continue;
+                if (e.added) {
+                    if (java.util.Arrays.equals(e.addedRaw, bytes)) return i;
+                } else if (java.util.Arrays.equals(raw, e.offset, e.offset + e.size, bytes, 0, bytes.length)) {
+                    return i;
+                }
+            }
+            return appendRaw(tag, bytes);
+        }
+
+        private int appendRaw(int tag, byte[] bytes) {
+            int newIdx = cpEntries.size();
+            CpEntry e = new CpEntry(tag, -1, bytes.length);
+            e.added = true;
+            e.addedRaw = bytes;
             cpEntries.add(e);
             cpAdded.add(e);
             cpCount++;
@@ -1771,9 +2037,9 @@ public final class ClassFileRewriter {
             dst += cpEndOriginal - cpStart;
             // Added CP entries.
             for (CpEntry e : cpAdded) {
-                if (e.addedBytes != null) {
-                    System.arraycopy(e.addedBytes, 0, out, dst, e.addedBytes.length);
-                    dst += e.addedBytes.length;
+                if (e.addedRaw != null) {
+                    System.arraycopy(e.addedRaw, 0, out, dst, e.addedRaw.length);
+                    dst += e.addedRaw.length;
                     continue;
                 }
                 out[dst++] = (byte) e.tag;
@@ -1793,9 +2059,7 @@ public final class ClassFileRewriter {
         boolean added;
         int addedClassIdx;
         int addedNtIdx;
-        /** For added Utf8 / Class / NameAndType entries: the whole entry. */
-        byte[] addedBytes;
-        String addedText;
+        byte[] addedRaw;   // an added entry's whole bytes (UTF8, String); null for a Methodref
         CpEntry(int tag, int offset, int size) {
             this.tag = tag; this.offset = offset; this.size = size;
         }

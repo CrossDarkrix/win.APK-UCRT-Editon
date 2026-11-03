@@ -169,7 +169,17 @@ public class Application extends ContextWrapper
         @Override public Resources getResourcesDirect()     { return app.resources; }
         @Override public AssetManager getAssets()           { return app.assets; }
         @Override public Context getApplicationContext()    { return app; }
+        /** AOSP ContextImpl.mClassLoader, by that name: Chromium's
+         *  BundleUtils.replaceClassLoader unwraps every ContextWrapper to the
+         *  innermost base Context and sets this field reflectively (isolated
+         *  splits), so without it Chrome's Application.onCreate threw
+         *  NoSuchFieldException. MACAPK_CONTEXT_MCLASSLOADER=0 keeps the field
+         *  but ignores it, as before. */
+        private ClassLoader mClassLoader;
+        private static final boolean HONOR_MCLASSLOADER =
+            !"0".equals(System.getenv("MACAPK_CONTEXT_MCLASSLOADER"));
         @Override public ClassLoader getClassLoader() {
+            if (HONOR_MCLASSLOADER && mClassLoader != null) return mClassLoader;
             return app.classLoader != null ? app.classLoader
                                            : Thread.currentThread().getContextClassLoader();
         }
@@ -197,12 +207,15 @@ public class Application extends ContextWrapper
         // through to when the base is null (the pre-terminator behavior), so this
         // preserves exactly what unmapped services resolved to before.
         @Override public Object getSystemService(String name) { return super.getSystemService(name); }
-        // Reach the canonical builders without virtual dispatch: an Application
-        // subclass may override these getters and delegate back to its base.
-        // Calling app.getXxx() here would re-enter that override and recurse.
-        // Public Application getters remain overridable for app-facing calls.
-        @Override public android.content.pm.ApplicationInfo getApplicationInfo() { return app.macapkApplicationInfoReal(); }
-        @Override public PackageManager getPackageManager() { return app.macapkPackageManagerReal(); }
+        // Builder getters below forward to methods Application OVERRIDES, so each
+        // one terminates in the Application's own field-backed builder rather than
+        // coming back here. That is the whole reason they are safe, and it is a
+        // per-method property, not a general one: forwarding to a method the
+        // Application does NOT override sends the call straight back to
+        // ContextWrapper, which asks its baseContext -- this object -- again.
+        // See getContentResolver() below for the one that got that wrong.
+        @Override public android.content.pm.ApplicationInfo getApplicationInfo() { return app.getApplicationInfo(); }
+        @Override public PackageManager getPackageManager() { return app.getPackageManager(); }
         // Serve from the REAL provider, NOT app.getSharedPreferences: an app that
         // overrides getSharedPreferences and delegates back to its base context
         // (Instagram) would cycle base -> app -> base and StackOverflow. Same
@@ -590,6 +603,33 @@ public class Application extends ContextWrapper
         android.util.Log.w("Mac.apk.AppLifecycle",
             "ActivityLifecycleCallbacks." + phase + " threw in "
             + (cb == null ? "null" : cb.getClass().getName()) + ": " + t);
+    }
+    /** MACAPK_LIFECYCLE_CREATED_ORDER (default ON): the AOSP order of the
+     *  create-phase callbacks. Activity.performCreate dispatches
+     *  onActivityPreCreated BEFORE the app's onCreate; Activity.onCreate (the
+     *  app's super.onCreate) dispatches onActivityCreated; onActivityPostCreated
+     *  follows once onCreate returns. They were all sent after onCreate returned,
+     *  and not at all for an activity that finish()es in onCreate, so a callback
+     *  that indexes activities from onActivityCreated (Chromium ApplicationStatus)
+     *  had no entry while the activity's own onCreate ran, and NPE'd later on
+     *  onActivityPaused/Stopped/Destroyed. =0: everything after onCreate, as before. */
+    public static final boolean CREATED_ORDER =
+        !"0".equals(System.getenv("MACAPK_LIFECYCLE_CREATED_ORDER"));
+    public void dispatchActivityPreCreated(Activity a, Bundle b) {
+        ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();
+        if (cbs == null) return;
+        for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityPreCreated(a, b); } catch (Throwable t) { lcThrew("onActivityPreCreated", cb, t); } }
+    }
+    public void dispatchActivityCreatedOnly(Activity a, Bundle b) {
+        ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();
+        lcTrace("created", cbs);
+        if (cbs == null) return;
+        for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityCreated(a, b); } catch (Throwable t) { lcThrew("onActivityCreated", cb, t); } }
+    }
+    public void dispatchActivityPostCreated(Activity a, Bundle b) {
+        ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();
+        if (cbs == null) return;
+        for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityPostCreated(a, b); } catch (Throwable t) { lcThrew("onActivityPostCreated", cb, t); } }
     }
     public void dispatchActivityCreated(Activity a, Bundle b) {
         ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();

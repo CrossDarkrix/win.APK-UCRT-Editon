@@ -437,6 +437,11 @@ public final class ActivityHost {
         !"0".equals(System.getenv("MACAPK_ONE_MAIN_THREAD"));
     /** See onActivityFinished: a finish() from a worker thread tears the activity down on
      *  the main thread. Default ON; =0 is the pre-2026-10-12 inline teardown. */
+    /** The activity whose onCreate performLaunch is running (main thread). */
+    private static Activity sCreating;
+    /** An activity that finished during its onCreate, torn down after it. */
+    private static Activity sTeardownAfterCreate;
+
     static final boolean FINISH_ON_MAIN =
         !"0".equals(System.getenv("MACAPK_FINISH_ON_MAIN"));
 
@@ -483,6 +488,15 @@ public final class ActivityHost {
             ownerHandler().post(new Runnable() {
                 @Override public void run() { onActivityFinished(a); }
             });
+            return;
+        }
+        // finish() inside the activity's own onCreate: AOSP's teardown is a
+        // later main-thread transaction, so the rest of onCreate still runs on
+        // a live activity (a live FragmentManager above all). Tearing down
+        // here destroyed it under the app's feet: Retro Music finishes and
+        // then keeps inflating fragments. performLaunch runs it after onCreate.
+        if (a == sCreating) {
+            sTeardownAfterCreate = a;
             return;
         }
         boolean wasTop = !stack.isEmpty() && stack.peek() == a;
@@ -2296,7 +2310,7 @@ public final class ActivityHost {
         String target = (act.kind == HostAction.Kind.SHARE_TEXT)
                       ? shareTextUrl(real) : act.url;
         if (target == null) return false;
-        return openHost(target, real.getAction());
+        return openHost(target, real.getAction(), real);
     }
 
     /**
@@ -2674,15 +2688,27 @@ public final class ActivityHost {
         return s_externalUrlsOff;
     }
 
+    /** MACAPK_HOST_URL_DRY_RUN=1 (test hook, default off): openHost logs the
+     *  URL it would hand the host (NSWorkspace / ShellExecute) and reports it
+     *  opened, instead of opening it, so an unattended run never pops the
+     *  user's browser. Checked on the Java side, before the native call. */
+    private static final boolean HOST_URL_DRY_RUN =
+            "1".equals(System.getenv("MACAPK_HOST_URL_DRY_RUN"));
+    static boolean hostUrlDryRun() { return HOST_URL_DRY_RUN; }
+
     /** v1.0.849: the ONE policy choke point for handing a URL to the host.
      *  Everything that can open the macOS browser must come through here --
      *  ActivityHost's implicit-intent resolution and URLSpan.onClick both do.
      *  Package-visible so framework shims reach it via this loader class. */
     public static boolean openHostUrlGated(String uri, String why) {
-        return openHost(uri, why);
+        return openHost(uri, why, null);
     }
 
-    private static boolean openHost(String uri, String action) {
+    /** `intent`: the intent being performed, when there is one (a URLSpan tap
+     *  has none). A Custom Tab or TWA launch of a web URL opens in the
+     *  runtime's own browser tab where the host has one (HostBrowserTab),
+     *  after the same two policy gates; everything else goes to the host. */
+    private static boolean openHost(String uri, String action, Intent intent) {
         if (uri == null) return false;
         // v1.0.822 (revised v1.0.849, see hostUrlGraceMs above): a host-URL
         // open must be USER-INITIATED. Original motivation stands: Simon
@@ -2726,11 +2752,29 @@ public final class ActivityHost {
                 return false;
             }
         }
+        // The runtime's own browser tab: not a host open, so neither the dry
+        // run below nor a redirect-scheme claim applies (the tab returns the
+        // redirect to this app itself).
+        if (intent != null && HostBrowserTab.handles(uri, intent) && HostBrowserTab.open(uri, intent)) {
+            NativeLog.i(TAG, "implicit intent " + action + " (Custom Tab) -> browser tab("
+                    + HostUrlIntake.redact(uri) + ")");
+            return true;
+        }
+        return openHostNow(uri, action, claim);
+    }
+
+    /** The host open itself, past the policy gates. */
+    static boolean openHostNow(String uri, String action, boolean claim) {
+        if (hostUrlDryRun()) {
+            // Test hook: everything up to the host call ran (resolution, both
+            // policy gates), and the open is reported as done so the app goes
+            // on as it would after a browser opened -- but no browser opens and
+            // no redirect scheme is claimed.
+            NativeLog.i(TAG, "MACAPK_HOST_URL_DRY_RUN: implicit intent " + action
+                    + " -> host open(" + uri + ") NOT performed (dry run)");
+            return true;
+        }
         if (claim) HostUrlIntake.claimRedirectSchemes(uri);
-        // A sign-in whose redirect_uri is one of this app's VERIFIED App Links
-        // opens in the Mac.apk sign-in window, which hands that redirect back
-        // the way a device browser does; Safari would load it as a page.
-        if (AppLinks.maybeOpenSignInWindow(uri)) return true;
         try {
             boolean ok = NativeCocoa.openHostUrl(uri);
             NativeLog.i(TAG, "implicit intent " + action + " -> host open("
@@ -2773,15 +2817,6 @@ public final class ActivityHost {
         if (cn != null) {
             final String pkg = cn.getPackageName();
             if (own == null || own.equals(pkg)) return intent;
-            // The platform package installer, pinned by the caller (a store
-            // picks InstallStart out of queryIntentActivities and setClassName()s
-            // it): performed by the installer surface, as the implicit start is.
-            if (MacApkPackageManager.macapkInstallerComponent()
-                    && MacApkPackageManager.macapkIsInstallerPackage(pkg)
-                    && InstallIntentHandler.isInstallIntent(intent)
-                    && resolveImplicitToHost(intent)) {
-                return null;
-            }
             // Stage 3a: a component of ANOTHER installed Mac.apk app is handed to
             // that app (resolveForStart: not narrowed by package visibility).
             if (CrossAppLauncher.XAPP_START && macapkCrossAppStart(own, intent, null)) return null;
@@ -2793,9 +2828,7 @@ public final class ActivityHost {
         try {
             android.content.pm.PackageManager pm = app != null ? app.getPackageManager() : null;
             if (pm != null) {
-                // resolveForStart: registry rows are not narrowed by package
-                // visibility (MacApkPackageManager stage 4).
-                rows = MacApkPackageManager.macapkQueryForStart(pm, intent,
+                rows = pm.queryIntentActivities(intent,
                         android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
             }
         } catch (Throwable t) {
@@ -2909,12 +2942,6 @@ public final class ActivityHost {
     }
 
     /** AOSP Intent.isWebIntent: ACTION_VIEW with an http/https data URI. */
-    /** AOSP Intent.isWebIntent (ACTION_VIEW of an http/https URI), for the PM's
-     *  stage-4 registry scan. */
-    static boolean macapkWebIntent(Intent intent) {
-        return intent != null && macapkIsWebIntent(intent);
-    }
-
     private static boolean macapkIsWebIntent(Intent intent) {
         if (!Intent.ACTION_VIEW.equals(intent.getAction())) return false;
         android.net.Uri d = intent.getData();
@@ -3574,8 +3601,30 @@ public final class ActivityHost {
         // cold launch and non-null for a relaunch, and an app distinguishes
         // "first run" from "recreated" purely by this argument.
         Bundle launchState = sRelaunchState;
-        runTolerant(activity, "onCreate", new Class<?>[]{Bundle.class},
-                new Object[]{launchState});
+        // AOSP Activity.performCreate: dispatchActivityPreCreated, onCreate (whose
+        // super dispatches onActivityCreated), dispatchActivityPostCreated -- all
+        // before a finish() in onCreate tears the activity down (Application.CREATED_ORDER).
+        if (Application.CREATED_ORDER && app != null) app.dispatchActivityPreCreated(activity, launchState);
+        sCreating = activity;
+        try {
+            runTolerant(activity, "onCreate", new Class<?>[]{Bundle.class},
+                    new Object[]{launchState});
+        } finally {
+            sCreating = null;
+        }
+        if (Application.CREATED_ORDER && app != null) {
+            if (!activity.macapkCreatedDispatched) {
+                activity.macapkCreatedDispatched = true;
+                app.dispatchActivityCreatedOnly(activity, launchState);
+            }
+            app.dispatchActivityPostCreated(activity, launchState);
+        }
+        // A finish() during onCreate only marked the activity (see sCreating);
+        // its teardown runs now that onCreate has returned, as on AOSP.
+        if (activity.isFinishing() && sTeardownAfterCreate == activity) {
+            sTeardownAfterCreate = null;
+            onActivityFinished(activity);
+        }
         // AOSP: AN ACTIVITY THAT CALLED finish() DURING onCreate IS NEVER STARTED
         // OR RESUMED. Both halves of the burst are explicitly guarded in
         // ActivityThread (android13-release core/java/android/app/ActivityThread.java):
@@ -3618,7 +3667,7 @@ public final class ActivityHost {
             NativeLog.i(TAG, className + " called finish() during onCreate --"
                 + " skipping onStart/onResume (AOSP ActivityThread.handleStartActivity"
                 + " + performResumeActivity both return early for a finished activity)."
-                + " Its teardown already ran in finish().");
+                + " Its teardown ran when onCreate returned.");
             return;
         }
         // onPostCreate comes AFTER the finished-check, and (on AOSP) after
@@ -3692,7 +3741,7 @@ public final class ActivityHost {
         // activity's own registry). Without this, ProcessLifecycleOwner stays below
         // STARTED and foreground-gated SDKs (Play Games AutomaticGamesAuthenticator)
         // never trigger -> the game bootstrap hangs before LoadScene.
-        if (app != null) app.dispatchActivityCreated(activity, null);
+        if (app != null && !Application.CREATED_ORDER) app.dispatchActivityCreated(activity, null);
         // Report each phase to the activity's fragment manager (AOSP
         // Activity.performStart/performResume call mFragments.dispatchX
         // the same way; ActivityHost is our ActivityThread analogue).
@@ -4672,16 +4721,11 @@ public final class ActivityHost {
                     if (tagVal == null) continue;
                     // The ViewTreeLifecycleOwner tag value is a LifecycleOwner;
                     // it may BE a registry, or HOLD one in a field.
-                    if (isLifecycleRegistryShaped(tagVal.getClass(), eventCls, stateCls)
-                        && drivenRegs.put(tagVal, Boolean.TRUE) == null
-                        && sRegistriesDrivenToResumed.put(tagVal, Boolean.TRUE) == null) {
-                        driveRegistryToResumed(tagVal, eventCls, events);
+                    if (isLifecycleRegistryShaped(tagVal.getClass(), eventCls, stateCls)) {
+                        driveViewTreeRegistry(tagVal, eventCls, stateCls, events, drivenRegs);
                     }
                     for (Object reg : findLifecycleRegistries(tagVal, eventCls, stateCls)) {
-                        if (drivenRegs.put(reg, Boolean.TRUE) == null
-                            && sRegistriesDrivenToResumed.put(reg, Boolean.TRUE) == null) {
-                            driveRegistryToResumed(reg, eventCls, events);
-                        }
+                        driveViewTreeRegistry(reg, eventCls, stateCls, events, drivenRegs);
                     }
                 }
                 if (v instanceof android.view.ViewGroup) {
@@ -4705,6 +4749,58 @@ public final class ActivityHost {
         // except for the views that were waiting on an owner.
         try { android.view.View.macapkRetryComposeAttaches(); }
         catch (Throwable t) { NativeLog.w(TAG, "compose-attach retry: " + t); }
+    }
+
+    /** One view-tree registry: finish the move to RESUMED of an owner that has
+     *  started its lifecycle, once. An owner still at INITIALIZED has not
+     *  created it yet, and nothing outside the owner moves it on a device: it is
+     *  holding its lifecycle back on purpose. Spotify's main activity tags its
+     *  root view with the lifecycle of the fragment manager it attaches only
+     *  once the signed-in session is up; driving that one to RESUMED here ran
+     *  the manager's dispatchCreate with no host attached (NPE in the app's
+     *  FragmentController) and routed the launch intent before the session
+     *  existed. Such a registry is left alone and looked at again on the next
+     *  drive. A state that cannot be read keeps the old behaviour. */
+    private static void driveViewTreeRegistry(Object reg, Class<?> eventCls, Class<?> stateCls,
+                                              Object[] events,
+                                              java.util.IdentityHashMap<Object,Boolean> drivenRegs) {
+        if (drivenRegs.put(reg, Boolean.TRUE) != null) return;
+        int state = registryStateOrdinal(reg, stateCls);
+        if (state >= 0 && state <= STATE_INITIALIZED) {
+            if (LC_TRACE) NativeLog.i(TAG, "view-tree lifecycle: " + reg.getClass().getName()
+                + " not started by its owner (state " + state + "); left alone");
+            return;
+        }
+        if (sRegistriesDrivenToResumed.put(reg, Boolean.TRUE) == null) {
+            driveRegistryToResumed(reg, eventCls, events);
+        }
+    }
+
+    /** Lifecycle.State's AOSP declaration order: DESTROYED, INITIALIZED, CREATED, STARTED, RESUMED. */
+    private static final int STATE_INITIALIZED = 1;
+
+    /** A registry's current Lifecycle.State ordinal, or -1. Read through its
+     *  no-arg method returning the State class (getCurrentState(), renamed by
+     *  R8), else its State-typed field. Side-effect free. */
+    private static int registryStateOrdinal(Object reg, Class<?> stateCls) {
+        try {
+            for (Method m : reg.getClass().getMethods()) {
+                if (m.getParameterCount() != 0 || m.getReturnType() != stateCls
+                    || java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                m.setAccessible(true);
+                Object s = m.invoke(reg);
+                if (s instanceof Enum) return ((Enum<?>) s).ordinal();
+            }
+            for (Class<?> c = reg.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (f.getType() != stateCls || java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    f.setAccessible(true);
+                    Object s = f.get(reg);
+                    if (s instanceof Enum) return ((Enum<?>) s).ordinal();
+                }
+            }
+        } catch (Throwable ignored) { }
+        return -1;
     }
 
     /** The post-onCreate window slot of the launch burst. AOSP has no window
@@ -4890,18 +4986,45 @@ public final class ActivityHost {
         }
     }
 
+    /** MACAPK_LIFECYCLE_SKIP_UNLINKABLE (default ON). getDeclaredMethod
+     *  resolves EVERY signature the class declares, so one method naming a
+     *  framework type we lack (a newer-API override, e.g. Chrome 155's
+     *  onHandoffActivityDataRequested(HandoffActivityDataRequestInfo))
+     *  threw NoClassDefFoundError and the callback never ran. Skip such a
+     *  class and take the method from a superclass instead: Method.invoke of
+     *  a non-private method dispatches virtually, so the app's override still
+     *  runs. =0 lets the LinkageError fail the callback, as before. */
+    private static final boolean SKIP_UNLINKABLE =
+        !"0".equals(System.getenv("MACAPK_LIFECYCLE_SKIP_UNLINKABLE"));
+
     private static void invokeLifecycle(Object target, String name,
                                         Class<?>[] sig, Object[] args) throws Exception {
         Class<?> c = target.getClass();
+        boolean skipped = false;
         while (c != null) {
+            Method m;
             try {
-                Method m = c.getDeclaredMethod(name, sig);
-                m.setAccessible(true);
-                m.invoke(target, args);
-                return;
+                m = c.getDeclaredMethod(name, sig);
             } catch (NoSuchMethodException ignored) {
                 c = c.getSuperclass();
+                continue;
+            } catch (LinkageError e) {
+                if (!SKIP_UNLINKABLE || c.getSuperclass() == null) throw e;
+                NativeLog.w(TAG, name + ": cannot introspect " + c.getName() + " (" + e
+                          + "), using a superclass declaration");
+                c = c.getSuperclass();
+                skipped = true;
+                continue;
             }
+            if (skipped && java.lang.reflect.Modifier.isPrivate(m.getModifiers())) {
+                // A private method does not dispatch virtually, so after skipping
+                // an unlinkable subclass it is not the override to run.
+                c = c.getSuperclass();
+                continue;
+            }
+            m.setAccessible(true);
+            m.invoke(target, args);
+            return;
         }
     }
 }

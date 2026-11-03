@@ -1,7 +1,7 @@
 package org.apache.http.params;
 import java.util.HashMap;
 import java.util.Map;
-public class BasicHttpParams extends AbstractHttpParams {
+public class BasicHttpParams implements HttpParams {
     private final Map<String, Object> map = new HashMap<>();
     public BasicHttpParams() {}
     @Override public Object getParameter(String name) { return map.get(name); }

@@ -1,6 +1,7 @@
-// android.net.wifi.WifiManager -- Wi-Fi service. Apps reach for it
-// to read the connection MAC for analytics. We claim "always on" and
-// return the same WifiInfo every time.
+// android.net.wifi.WifiManager -- Wi-Fi service. The state, the connection and
+// the scan results come from the host's radio when the host reports one
+// (com.macapk.loader.HostRadios); controls that would change the host's Wi-Fi
+// (enable, connect, add networks) answer "not possible".
 package android.net.wifi;
 
 import android.net.DhcpInfo;
@@ -45,17 +46,100 @@ public class WifiManager {
 
     public WifiManager() {}
 
-    public boolean isWifiEnabled()           { return true; }
-    public int     getWifiState()            { return WIFI_STATE_ENABLED; }
+    // ---- the host's radio (com.macapk.loader.HostRadios) -------------------
+    //
+    // A host that reports its Wi-Fi (Win.apk) answers with the real state,
+    // connection and scan results; one that does not (HostRadios.wifiState()
+    // < 0) keeps the stub answers: "on", a nameless connection, no networks.
+
+    public boolean isWifiEnabled() {
+        int s = com.macapk.loader.HostRadios.wifiState();
+        return s < 0 || s == WIFI_STATE_ENABLED;
+    }
+
+    public int getWifiState() {
+        int s = com.macapk.loader.HostRadios.wifiState();
+        return s < 0 ? WIFI_STATE_ENABLED : s;
+    }
+
     public boolean setWifiEnabled(boolean on) { return false; }
 
-    public WifiInfo getConnectionInfo()       { return info; }
+    public WifiInfo getConnectionInfo() {
+        String[] c = com.macapk.loader.HostRadios.wifiConnection();
+        if (c == null) {
+            if (com.macapk.loader.HostRadios.wifiState() < 0) return info;
+            return new WifiInfo(null, "02:00:00:00:00:00", WifiInfo.INVALID_RSSI, -1,
+                    WifiInfo.LINK_SPEED_UNKNOWN, 0, SupplicantState.DISCONNECTED);
+        }
+        String ssid = c[0].isEmpty() ? null : c[0];
+        String bssid = c[1].isEmpty() ? "02:00:00:00:00:00" : c[1];
+        return new WifiInfo(ssid, bssid, parse(c[2], WifiInfo.INVALID_RSSI), parse(c[3], -1),
+                parse(c[4], WifiInfo.LINK_SPEED_UNKNOWN), hostIpv4(), SupplicantState.COMPLETED);
+    }
+
+    private static int parse(String s, int fallback) {
+        try { return s.isEmpty() ? fallback : Integer.parseInt(s); }
+        catch (NumberFormatException e) { return fallback; }
+    }
+
+    /** The host's IPv4 address on its default route, as AOSP's little-endian
+     *  int. Connecting a UDP socket sends nothing; it only picks the route. */
+    private static int hostIpv4() {
+        try (java.net.DatagramSocket s = new java.net.DatagramSocket()) {
+            s.connect(java.net.InetAddress.getByName("192.0.2.1"), 9);
+            byte[] a = s.getLocalAddress().getAddress();
+            if (a.length != 4) return 0;
+            return (a[0] & 0xff) | (a[1] & 0xff) << 8 | (a[2] & 0xff) << 16 | (a[3] & 0xff) << 24;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
     // AOSP: getDhcpInfo returns the current DHCP-supplied connection
     // info as a DhcpInfo (all fields are zero on macOS since we don't
     // expose underlying DHCP state).
     public DhcpInfo getDhcpInfo()             { return dhcp; }
-    public List<?>  getScanResults()          { return Collections.emptyList(); }
-    public boolean  startScan()               { return false; }
+
+    public List<ScanResult> getScanResults() {
+        String[] r = com.macapk.loader.HostRadios.wifiScanResults();
+        if (r == null) return Collections.emptyList();
+        List<ScanResult> out = new java.util.ArrayList<>();
+        long now = android.os.SystemClock.elapsedRealtime() * 1000L;
+        for (int i = 0; i + 4 < r.length; i += 5) {
+            ScanResult s = new ScanResult();
+            s.SSID = r[i];
+            s.BSSID = r[i + 1];
+            s.capabilities = r[i + 2];
+            s.level = parse(r[i + 3], -100);
+            s.frequency = parse(r[i + 4], 0);
+            s.timestamp = now;
+            out.add(s);
+        }
+        return out;
+    }
+
+    /** AOSP: the results arrive later, announced by SCAN_RESULTS_AVAILABLE_ACTION
+     *  (EXTRA_RESULTS_UPDATED). Windows finishes a scan within about four
+     *  seconds, so the broadcast follows then. */
+    public boolean startScan() {
+        if (!com.macapk.loader.HostRadios.wifiStartScan()) return false;
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(4000L);
+                android.content.Context ctx = android.app.ActivityThread.currentApplication();
+                if (ctx == null) return;
+                android.content.Intent i = new android.content.Intent(SCAN_RESULTS_AVAILABLE_ACTION);
+                i.putExtra(EXTRA_RESULTS_UPDATED, true);
+                ctx.sendBroadcast(i);
+            } catch (Throwable ignored) {
+            }
+        }, "wifi-scan-results");
+        t.setDaemon(true);
+        t.start();
+        return true;
+    }
+
+    public static final String EXTRA_RESULTS_UPDATED = "resultsUpdated";
     public boolean  reconnect()               { return false; }
     public boolean  reassociate()             { return false; }
     public boolean  disconnect()              { return false; }

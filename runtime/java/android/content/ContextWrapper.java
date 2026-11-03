@@ -16,6 +16,10 @@ public class ContextWrapper extends Context {
     public ContextWrapper(Context base) { this.baseContext = base; }
     protected void attachBaseContext(Context base) { this.baseContext = base; }
     public Context getBaseContext() { return baseContext; }
+    /** The base Context itself, past any getBaseContext() override: WhatsApp's
+     *  AppShell returns null there until its own attachBaseContext has run, and
+     *  Boot must still dispatch that attachBaseContext (com.macapk.loader.Boot). */
+    public final Context macapkRawBaseContext() { return baseContext; }
 
     @Override public String getPackageName() {
         if (baseContext != null) {

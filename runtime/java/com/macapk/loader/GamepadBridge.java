@@ -265,23 +265,6 @@ public final class GamepadBridge {
      *  arrives; the joystick motion is emitted at the SYN_REPORT). */
     static void onState(long handle, int buttons, float lx, float ly, float rx, float ry,
                         float lt, float rt, float hatX, float hatY) {
-        onState(handle, buttons, lx, ly, rx, ry, lt, rt, hatX, hatY, true);
-    }
-
-    /** MACAPK_GAMEPAD_REAL_INPUT (default ON; =0 = the old path, where a button
-     *  never counted): a button press on a PHYSICAL controller is user input,
-     *  so it opens ActivityHost's real-input window that a cross-app or host
-     *  hand-off needs (macapkLaunchAllowed), as a click or a host key does. On a
-     *  device a gamepad key is an InputDispatcher event like any other, and the
-     *  background-activity-launch rules treat the focused app as in use. A
-     *  frontend driven only by a controller (iiSU, ES-DE on a handheld) had
-     *  every emulator launch silently dropped. The test / virtual-pad entry
-     *  (macapkTestState) passes real = false: a harness press must not count. */
-    private static final boolean REAL_INPUT =
-        !"0".equals(System.getenv("MACAPK_GAMEPAD_REAL_INPUT"));
-
-    private static void onState(long handle, int buttons, float lx, float ly, float rx, float ry,
-                        float lt, float rt, float hatX, float hatY, boolean real) {
         final long now = android.os.SystemClock.uptimeMillis();
         final java.util.ArrayList<android.view.InputEvent> out = new java.util.ArrayList<>(4);
         boolean stickMoved = false;
@@ -297,7 +280,6 @@ public final class GamepadBridge {
                 if ((changed & bit) == 0) continue;
                 final boolean down = (buttons & bit) != 0;
                 if (down) pad.downTime[i] = now;
-                if (down && real && REAL_INPUT) TouchDispatcher.noteRealInputFromHostView();
                 KeyEvent ev = new KeyEvent(pad.downTime[i], now,
                         down ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP, BUTTONS[i][1], 0, 0,
                         pad.deviceId, BUTTONS[i][2], KeyEvent.FLAG_FROM_SYSTEM, SOURCE_KEYS);
@@ -750,8 +732,7 @@ public final class GamepadBridge {
         onConnected(handle, name, vendor, product, "", CAP_OPTIONS | CAP_HOME | CAP_THUMB_BUTTONS);
     }
     public static void macapkTestState(long handle, int buttons, float[] axes) {
-        onState(handle, buttons, axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6], axes[7],
-                false);
+        onState(handle, buttons, axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6], axes[7]);
     }
     public static void macapkTestDisconnect(long handle) { onDisconnected(handle); }
 

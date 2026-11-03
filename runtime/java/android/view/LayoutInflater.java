@@ -791,6 +791,7 @@ public class LayoutInflater {
                 dbf.setNamespaceAware(true);
                 DocumentBuilder db = dbf.newDocumentBuilder();
                 doc = db.parse(xmlStream);
+                macapkDropAttrIdRecords(doc.getDocumentElement());
             } else {
                 // AOSP's inflate(int,...) reads the layout through
                 // `res.getLayout(resource)`, NOT openRawResource. That matters for
@@ -829,6 +830,31 @@ public class LayoutInflater {
         }
     }
 
+    /** BinaryXmlParser's attr-id records (MACAPK_ATTRID_NS, written beside an
+     *  attribute whose name the resource table spells differently) exist for
+     *  DomXmlResourceParser.getAttributeNameResource. This inflater's own loops
+     *  match attributes by LOCAL name in any namespace, and a record's local
+     *  name is the attribute it describes while its value is an attr id, so it
+     *  would be applied over the real value. They are dropped from every layout
+     *  this class parses; the alias records stay, since TypedArray looks the
+     *  attribute up by its table name. */
+    private static void macapkDropAttrIdRecords(Element e) {
+        if (e == null) return;
+        NamedNodeMap attrs = e.getAttributes();
+        java.util.List<org.w3c.dom.Attr> drop = null;
+        for (int i = 0; attrs != null && i < attrs.getLength(); i++) {
+            Node a = attrs.item(i);
+            if (com.macapk.loader.BinaryXmlParser.MACAPK_ATTRID_NS.equals(a.getNamespaceURI())) {
+                if (drop == null) drop = new java.util.ArrayList<>();
+                drop.add((org.w3c.dom.Attr) a);
+            }
+        }
+        if (drop != null) for (org.w3c.dom.Attr a : drop) e.removeAttributeNode(a);
+        for (Node c = e.getFirstChild(); c != null; c = c.getNextSibling()) {
+            if (c instanceof Element ce) macapkDropAttrIdRecords(ce);
+        }
+    }
+
     /** Everything inflate(int, ...) did once it held the layout's DOM, moved
      *  here unchanged (2026-09-26, lane platlayouts) so the platform-layout
      *  branch and inflate(XmlPullParser, ...) share it. Throws whatever the
@@ -839,7 +865,22 @@ public class LayoutInflater {
         if (rootElem == null) {
             return new android.widget.FrameLayout(context);
         }
-        View inflated = inflateElement(rootElem, root);
+        View inflated;
+        if (root == null && "merge".equals(rootElem.getTagName())) {
+            // A <merge> layout with no parent to merge into. AOSP throws here,
+            // but Activity.setContentView never gets that far there: PhoneWindow
+            // inflates into the window's content FrameLayout, and the merged
+            // children become its children. Inflating without a parent used to
+            // build every child and drop it, handing back an empty FrameLayout,
+            // so an activity whose layout is a <merge> showed nothing and each
+            // findViewById in its onCreate returned null. Merge into a
+            // FrameLayout instead, which is what the content frame is.
+            android.widget.FrameLayout frame = new android.widget.FrameLayout(context);
+            inflateElement(rootElem, frame);
+            inflated = frame;
+        } else {
+            inflated = inflateElement(rootElem, root);
+        }
         if (inflated == null) inflated = new android.widget.FrameLayout(context);
         // MACAPK_TRACE_LAYOUTREQ=1: dump each inflated view's
         // isLayoutRequested() + childCount at the END of inflate.
@@ -1090,6 +1131,7 @@ public class LayoutInflater {
                     dbf.setNamespaceAware(true);
                     DocumentBuilder db = dbf.newDocumentBuilder();
                     try { doc = db.parse(s); } finally { try { s.close(); } catch (Throwable ignored) {} }
+                    macapkDropAttrIdRecords(doc.getDocumentElement());
                 }
                 Element rootElem = doc.getDocumentElement();
                 if (rootElem != null) {
@@ -1417,8 +1459,6 @@ public class LayoutInflater {
      *  ConstraintLayout constraints that reference the include
      *  site's id can't resolve (the inflated view has the included
      *  file's root-element id, not the include site's). */
-    static final boolean INCLUDE_SITE_STYLE_LP =
-        !"0".equals(System.getenv("MACAPK_INCLUDE_SITE_STYLE_LP"));
     private void applyIncludeOverrides(View inflated, Element includeElem, ViewGroup parent) {
         try {
             org.w3c.dom.NamedNodeMap attrs = includeElem.getAttributes();
@@ -1482,22 +1522,6 @@ public class LayoutInflater {
                 if ("layout_width".equals(n))  siteHasW = true;
                 else if ("layout_height".equals(n)) siteHasH = true;
             }
-            // The site's width/height may come from its style= rather than
-            // attributes: AOSP's generateLayoutParams(attrs) reads through
-            // obtainStyledAttributes, which honours the AttributeSet's style.
-            // Measured: AdGuard 4.14's fragment_home has
-            //   <include android:id="@id/stub" style="@style/LayoutFullWidth"
-            //            app:layout_constraintBottom_toBottomOf="parent" .../>
-            // and, read as "no size", kept the included root's constraint-less
-            // LP: the stub sat at the top, the card barrier followed it there,
-            // and the cards covered the main protection switch (issue #5,
-            // 2026-10-19). MACAPK_INCLUDE_SITE_STYLE_LP=0 restores attrs-only.
-            java.util.Map<String, String> siteStyle = java.util.Collections.emptyMap();
-            if (INCLUDE_SITE_STYLE_LP && parent != null && !(siteHasW && siteHasH)) {
-                siteStyle = new DomBackedAttributeSet(includeElem, macapkLpContext(parent)).macapkStyleItems();
-                if (siteStyle.containsKey("layout_width"))  siteHasW = true;
-                if (siteStyle.containsKey("layout_height")) siteHasH = true;
-            }
             if (parent != null && siteHasW && siteHasH) {
                 try {
                     android.util.AttributeSet siteAttrs = new DomBackedAttributeSet(includeElem, macapkLpContext(parent));
@@ -1510,16 +1534,6 @@ public class LayoutInflater {
                 }
             }
             java.util.Map<String, String> incMargins = new java.util.HashMap<>();
-            // Style-supplied layout_* first, the site's own attributes then
-            // overwrite (the same precedence the element path applies).
-            if (lp != null) {
-                for (java.util.Map.Entry<String, String> en : siteStyle.entrySet()) {
-                    String name = en.getKey();
-                    if (!name.startsWith("layout_")) continue;
-                    if (LAYOUT_AOSP_1643 && MARGIN_ATTRS.contains(name)) incMargins.put(name, en.getValue());
-                    else applyLayoutAttribute(lp, name, en.getValue());
-                }
-            }
             for (int i = 0; i < attrs.getLength(); i++) {
                 Node a = attrs.item(i);
                 String name = a.getLocalName();
@@ -1821,6 +1835,13 @@ public class LayoutInflater {
             // DEFAULT_MARGIN_RESOLVED (0), even over marginRight/Horizontal.
             mlp.leftMargin = (st != null) ? st : 0;
             mlp.rightMargin = (en != null) ? en : 0;
+            // Keep them RELATIVE too, as AOSP's MarginLayoutParams does, so
+            // resolveLayoutDirection can mirror them once the view resolves RTL.
+            // Resolving to left/right here alone baked in LTR: an RTL toolbar
+            // button with marginEnd kept its gap on the right, slid to the left
+            // edge, and covered the overflow menu.
+            mlp.startMargin = (st != null) ? st : 0;
+            mlp.endMargin = (en != null) ? en : 0;
         }
     }
 
@@ -1954,17 +1975,61 @@ public class LayoutInflater {
             if ("layout_weight".equals(attr)) {
                 if (lp instanceof android.widget.LinearLayout.LayoutParams llp) {
                     try { llp.weight = Float.parseFloat(value.trim()); }
-                    catch (NumberFormatException ignored) {}
+                    catch (NumberFormatException nfe) {
+                        // A reference ("@integer/x", resolved per configuration:
+                        // WhatsApp's home pane is @integer = 1, 40 on sw600dp).
+                        // parseFloat threw on it, so the weight stayed 0 and the
+                        // whole home screen measured 0px wide.
+                        Float ref = macapkResolveNumberRef(value);
+                        if (ref != null) llp.weight = ref;
+                    }
                 }
                 return;
             }
         } catch (Throwable ignored) {}
     }
 
+    /** The number a resource reference ("@integer/x", "@dimen/x", apktool's
+     *  "@integer/APKTOOL_RENAMED_0x7f0c003d") stands for, or null. */
+    private Float macapkResolveNumberRef(String v) {
+        if (v == null) return null;
+        v = v.trim();
+        if (!v.startsWith("@")) return null;
+        try {
+            android.content.res.Resources r = (context != null) ? context.getResources() : null;
+            if (r == null) return null;
+            int id = 0;
+            int k = v.indexOf("APKTOOL_RENAMED_0x");
+            if (k >= 0) {
+                id = (int) Long.parseLong(v.substring(k + 18), 16);
+            } else {
+                String body = v.substring(1);
+                int slash = body.indexOf('/');
+                if (slash > 0) {
+                    String type = body.substring(0, slash), name = body.substring(slash + 1);
+                    String pkg = context.getPackageName();
+                    if (type.startsWith("android:")) { type = type.substring(8); pkg = "android"; }
+                    id = r.getIdentifier(name, type, pkg);
+                }
+            }
+            if (id == 0) return null;
+            try { return (float) r.getInteger(id); } catch (Throwable ignored) {}
+            android.util.TypedValue tv = new android.util.TypedValue();
+            r.getValue(id, tv, true);
+            if (tv.type == android.util.TypedValue.TYPE_FLOAT) return tv.getFloat();
+            if (tv.type >= android.util.TypedValue.TYPE_FIRST_INT
+                    && tv.type <= android.util.TypedValue.TYPE_LAST_INT) return (float) tv.data;
+            if (tv.string != null) return Float.parseFloat(tv.string.toString().trim());
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
     /** Apply a RelativeLayout-specific `layout_*` attribute. The
      *  AOSP rule index constants (RelativeLayout.ALIGN_PARENT_BOTTOM
      *  etc.) are stable; using them keeps the rule mapping uniform
      *  with whatever addRule() the app code might call directly. */
+    static final boolean MACAPK_RL_RELATIVE_VERBS =
+        !"0".equals(System.getenv("MACAPK_RL_RELATIVE_VERBS"));
     private void applyRelativeLayoutAttribute(android.widget.RelativeLayout.LayoutParams rlp,
                                                 String attr, String value) {
         // Diagnostic: confirm we're seeing layout_* attrs.
@@ -1982,13 +2047,30 @@ public class LayoutInflater {
             case "layout_alignParentBottom":
                 if (isTrue) rlp.addRule(android.widget.RelativeLayout.ALIGN_PARENT_BOTTOM);
                 return;
+            // AOSP RelativeLayout.LayoutParams(Context, AttributeSet) keeps the
+            // RELATIVE verbs as written (rules[ALIGN_PARENT_START] etc.) and
+            // resolveRules maps them by layout direction at measure time (our
+            // RelativeLayout.LayoutParams.resolveLayoutDirection does too). This
+            // inflater folded every Start/End attribute into its Left/Right verb
+            // up front, so under an RTL locale lignParentStart, 	oStartOf and
+            // lignStart all landed on the LEFT: androidx Preference rows kept
+            // their summary pinned to the title's left edge (pf-notes Settings,
+            // Hebrew). MACAPK_RL_RELATIVE_VERBS=0 restores the fold.
             case "layout_alignParentLeft":
-            case "layout_alignParentStart":
                 if (isTrue) rlp.addRule(android.widget.RelativeLayout.ALIGN_PARENT_LEFT);
                 return;
+            case "layout_alignParentStart":
+                if (isTrue) rlp.addRule(MACAPK_RL_RELATIVE_VERBS
+                        ? android.widget.RelativeLayout.ALIGN_PARENT_START
+                        : android.widget.RelativeLayout.ALIGN_PARENT_LEFT);
+                return;
             case "layout_alignParentRight":
-            case "layout_alignParentEnd":
                 if (isTrue) rlp.addRule(android.widget.RelativeLayout.ALIGN_PARENT_RIGHT);
+                return;
+            case "layout_alignParentEnd":
+                if (isTrue) rlp.addRule(MACAPK_RL_RELATIVE_VERBS
+                        ? android.widget.RelativeLayout.ALIGN_PARENT_END
+                        : android.widget.RelativeLayout.ALIGN_PARENT_RIGHT);
                 return;
             case "layout_centerInParent":
                 if (isTrue) rlp.addRule(android.widget.RelativeLayout.CENTER_IN_PARENT);
@@ -2009,21 +2091,29 @@ public class LayoutInflater {
             case "layout_below":
                 rlp.addRule(android.widget.RelativeLayout.BELOW, subject); return;
             case "layout_toLeftOf":
-            case "layout_toStartOf":
                 rlp.addRule(android.widget.RelativeLayout.LEFT_OF, subject); return;
+            case "layout_toStartOf":
+                rlp.addRule(MACAPK_RL_RELATIVE_VERBS ? android.widget.RelativeLayout.START_OF
+                        : android.widget.RelativeLayout.LEFT_OF, subject); return;
             case "layout_toRightOf":
-            case "layout_toEndOf":
                 rlp.addRule(android.widget.RelativeLayout.RIGHT_OF, subject); return;
+            case "layout_toEndOf":
+                rlp.addRule(MACAPK_RL_RELATIVE_VERBS ? android.widget.RelativeLayout.END_OF
+                        : android.widget.RelativeLayout.RIGHT_OF, subject); return;
             case "layout_alignTop":
                 rlp.addRule(android.widget.RelativeLayout.ALIGN_TOP, subject); return;
             case "layout_alignBottom":
                 rlp.addRule(android.widget.RelativeLayout.ALIGN_BOTTOM, subject); return;
             case "layout_alignLeft":
-            case "layout_alignStart":
                 rlp.addRule(android.widget.RelativeLayout.ALIGN_LEFT, subject); return;
+            case "layout_alignStart":
+                rlp.addRule(MACAPK_RL_RELATIVE_VERBS ? android.widget.RelativeLayout.ALIGN_START
+                        : android.widget.RelativeLayout.ALIGN_LEFT, subject); return;
             case "layout_alignRight":
-            case "layout_alignEnd":
                 rlp.addRule(android.widget.RelativeLayout.ALIGN_RIGHT, subject); return;
+            case "layout_alignEnd":
+                rlp.addRule(MACAPK_RL_RELATIVE_VERBS ? android.widget.RelativeLayout.ALIGN_END
+                        : android.widget.RelativeLayout.ALIGN_RIGHT, subject); return;
             case "layout_alignBaseline":
                 rlp.addRule(android.widget.RelativeLayout.ALIGN_BASELINE, subject); return;
         }
@@ -2041,13 +2131,25 @@ public class LayoutInflater {
             return ViewGroup.LayoutParams.WRAP_CONTENT;  // -2
         }
         Float dim = parseDimensionPx(s);
-        if (dim != null) return (int) (float) dim;
+        if (dim != null) return macapkPixelSize(dim);
         try { return Integer.parseInt(s); } catch (NumberFormatException ignored) {}
         return ViewGroup.LayoutParams.WRAP_CONTENT;
     }
     private Integer parseDimensionPxInt(String s) {
         Float f = parseDimensionPx(s);
-        return f == null ? null : (int) (float) f;
+        return f == null ? null : macapkPixelSize(f);
+    }
+    /** AOSP TypedValue.complexToDimensionPixelSize: round to nearest, but a
+     *  non-zero size never collapses to 0 -- it becomes 1px (or -1). The
+     *  getLayoutDimension / getDimensionPixelSize readers behind layout_width,
+     *  padding and margins all go through it. Truncating instead turned a
+     *  0.3dp divider into 0 (MATCH_CONSTRAINT in a ConstraintLayout), which
+     *  stretched it over the screen and squeezed the list below it to nothing. */
+    private static int macapkPixelSize(float f) {
+        final int res = (int) (f >= 0 ? f + 0.5f : f - 0.5f);
+        if (res != 0) return res;
+        if (f == 0f) return 0;
+        return f > 0 ? 1 : -1;
     }
 
     /** BISECT GATE (2026-09-26, default ON; docs/fleet-newpipe-vlc-residual_2026-09-26.md).
@@ -2415,15 +2517,8 @@ public class LayoutInflater {
             // would re-apply the sp->px scale -> DOUBLE-sized text. Apply as PX.
             // (Bug: Calculator's DisplayLarge result rendered 228px == 57sp*2*2
             // instead of 57sp*2=114px; every style-textAppearance text was 2x.)
-            // Raw, as AOSP's constructor applies a textAppearance size
-            // (setRawTextSize), never through the overridable setTextSize.
-            if (px != null && px > 0) {
-                String v = sz.trim();
-                int unit = v.endsWith("sp") ? android.util.TypedValue.COMPLEX_UNIT_SP
-                    : (v.endsWith("dp") || v.endsWith("dip")) ? android.util.TypedValue.COMPLEX_UNIT_DIP
-                    : android.util.TypedValue.COMPLEX_UNIT_PX;
-                tv.macapkSetRawTextSize(px, unit);
-            }
+            if (px != null && px > 0)
+                tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, px);
         }
         String col = macapkStyleAttrRaw(styleName, "textColor");
         if (applyColor && col != null) {
@@ -2437,9 +2532,12 @@ public class LayoutInflater {
             // then makes the SAME static call (see its doc comment), so it can
             // only answer where the static path answered nothing or answered for
             // a theme the view is not actually using.
-            Integer c = MACAPK_INFLATE_TA_ATTR ? macapkResolveColorValue(col, viewTheme)
-                                               : macapkResolveColorValue(col);
-            if (c != null) tv.setTextColor(c);
+            android.content.res.ColorStateList csl = macapkResolveTextColorList(view, col, viewTheme);
+            Integer c = csl != null ? null
+                    : (MACAPK_INFLATE_TA_ATTR ? macapkResolveColorValue(col, viewTheme)
+                                              : macapkResolveColorValue(col));
+            if (csl != null) tv.setTextColor(csl);
+            else if (c != null) tv.setTextColor(c);
         }
         // v1.0.935: fontFamily travels with the appearance. Material 3's
         // typescale styles (TextAppearance.Material3.LabelLarge and friends)
@@ -2533,8 +2631,20 @@ public class LayoutInflater {
             case "Toolbar":
             case "ActionBar":
             case "ActionBarContainer":
+                minH = 112;
+                break;
             case "AppBarLayout":
             case "CollapsingToolbarLayout":
+                // Pure containers: AOSP measures a real one to its children
+                // (CollapsingToolbarLayout.onMeasure adopts its Toolbar's height
+                // as the minimum itself) and neither default style declares a
+                // minHeight -- the View ctor read above supplies one if an app
+                // style does. A floor on a REAL instance put a toolbar-tall empty
+                // band over whatever short content the app keeps there: Spotify's
+                // home CollapsingToolbarLayout holds only a 0dp spacer, so it
+                // measured 56dp and pushed the filter-chip header down by that
+                // much. Placeholders keep the floor.
+                if (!tintAllowed) break;
                 minH = 112;
                 break;
             case "TabLayout":
@@ -2581,6 +2691,23 @@ public class LayoutInflater {
                 break;
         }
         if (minH > 0) {
+            // The table above is in PIXELS AT 2x (56dp = 112px), the only
+            // density Mac.apk ran at when it was written. At any other density
+            // it is wrong by that ratio: Win.apk runs at 1x, where every real
+            // ActionBarContainer and wrap_content Toolbar was floored at 112dp,
+            // twice the bar, so each AppCompat screen showed an empty band as
+            // tall as the toolbar under it (NoNonsense Notes, every screen), and
+            // a real TabLayout / ProgressBar got twice its floor. Scaled by the
+            // view's own density, so 2x keeps exactly the old numbers.
+            float density = android.util.DisplayMetrics.macapkDeviceDensity();
+            try {
+                android.util.DisplayMetrics dm = placeholder.getResources() != null
+                    ? placeholder.getResources().getDisplayMetrics() : null;
+                if (dm != null && dm.density > 0f) density = dm.density;
+            } catch (Throwable ignored) {}
+            if (density > 0f && Math.abs(density - 2f) > 0.001f) {
+                minH = Math.max(1, Math.round(minH * density / 2f));
+            }
             // lane layout, 2026-08-01: NEVER LOWER an existing minimum. This
             // hint runs AFTER instantiation (inflateElement line ~513), and a
             // REAL widget's constructor may have just set the correct minimum
@@ -3300,21 +3427,26 @@ public class LayoutInflater {
         String st = dp.get("paddingStart"), en = dp.get("paddingEnd");
         boolean stDef = st != null && parseDimensionPxIntSafe(st) != null;
         boolean enDef = en != null && parseDimensionPxIntSafe(en) != null;
-        if (macapkRtlCompatibilityMode()) {
+        final boolean compat = macapkRtlCompatibilityMode();
+        if (compat) {
             // View ctor :6272-6287: start/end only where left/right was not
             // defined (padding, paddingHorizontal and paddingLeft/Right all
             // count as defined).
             if (stDef && l == null) l = st;
             if (enDef && r == null) r = en;
-        } else {
-            // resolvePadding (:21705), LTR: a defined start/end overrides.
-            if (stDef) l = st;
-            if (enDef) r = en;
         }
         if (l != null) applyAttribute(view, "paddingLeft", l);
         if (t != null) applyAttribute(view, "paddingTop", t);
         if (r != null) applyAttribute(view, "paddingRight", r);
         if (b != null) applyAttribute(view, "paddingBottom", b);
+        if (!compat && (stDef || enDef)) {
+            // resolvePadding (:21705): a defined start/end overrides the
+            // absolute edge it maps to FOR THE RESOLVED DIRECTION, so it stays
+            // relative on the view rather than being baked in as left/right.
+            view.macapkSetXmlRelativePadding(
+                stDef ? parseDimensionPxIntSafe(st) : Integer.MIN_VALUE,
+                enDef ? parseDimensionPxIntSafe(en) : Integer.MIN_VALUE);
+        }
     }
 
     private boolean nonNegPx(String v) {
@@ -3766,19 +3898,13 @@ public class LayoutInflater {
             //     framework table, deliberately -- see that table's note on why
             //     injecting colour here is a precedence hazard.
             final boolean editText = "editTextStyle".equals(defStyleAttr);
-            // "focusable" / "clickable": Widget.Button and Widget.CompoundButton
-            // declare both true (core/res styles.xml), and it is the STYLE that
-            // makes a platform button focusable on a device. Without them a
-            // Button could hold focus only if the app set it, so D-pad / Tab
-            // focus skipped every plain button.
             for (String attr : (compound
-                    ? new String[]{"button", "focusable", "clickable"}
+                    ? new String[]{"button"}
                     : editText
                     ? new String[]{"background", "textSize", "minHeight",
                                    "minWidth", "gravity", "textColor"}
                     : new String[]{"background", "minHeight", "minWidth",
-                                   "gravity", "textColor", "textAllCaps",
-                                   "focusable", "clickable"})) {
+                                   "gravity", "textColor", "textAllCaps"})) {
                 // `containsKey` is CORRECT here, and a v1.0.871 experiment that
                 // said otherwise was reverted. The reasoning that looked right:
                 // Material's `Widget.MaterialComponents.Button` declares
@@ -4714,6 +4840,70 @@ public class LayoutInflater {
                     }
                     return;
                 }
+                case "drawableLeft":
+                case "drawableStart":
+                case "drawableTop":
+                case "drawableRight":
+                case "drawableEnd":
+                case "drawableBottom": {
+                    // AOSP TextView's constructor reads all six with
+                    // a.getDrawable(...) and installs them with
+                    // setCompoundDrawablesWithIntrinsicBounds +
+                    // setRelativeDrawablesIfNeeded (TextView.java android14
+                    // :1243-1271, :1630-1643). Nothing here ever read them, so an
+                    // XML compound icon never appeared: no AlertDialog
+                    // single/multi-choice row had its radio or checkbox
+                    // (AppCompat's select_dialog_singlechoice_material puts
+                    // ?android:listChoiceIndicatorSingle in drawableStart -- every
+                    // ListPreference dialog), and no `android:drawableStart` icon
+                    // in any app layout showed. start/end go through the RELATIVE
+                    // setter, which resolves them against the layout direction,
+                    // and win over left/right as AOSP's setRelativeDrawablesIfNeeded
+                    // makes them.
+                    if (view instanceof android.widget.TextView tvcd) {
+                        android.graphics.drawable.Drawable dr = macapkResolveCompoundDrawable(view, value);
+                        if (dr == null) return;
+                        if ("drawableStart".equals(attr) || "drawableEnd".equals(attr)) {
+                            // AOSP Drawables.resolveWithLayoutDirection (JB-MR1+):
+                            // once start/end are defined (mOverride) they REPLACE
+                            // left/right on both sides -- an end that is not set
+                            // leaves its side empty, it does not inherit
+                            // drawableLeft. Starting from the mirrored absolute
+                            // pair put AppCompat's select_dialog_singlechoice
+                            // radio (drawableLeft AND drawableStart) on both sides
+                            // under RTL.
+                            android.graphics.drawable.Drawable[] rel = tvcd.getCompoundDrawablesRelative();
+                            if (!tvcd.macapkHasRelativeDrawables()) { rel[0] = null; rel[2] = null; }
+                            if ("drawableStart".equals(attr)) rel[0] = dr; else rel[2] = dr;
+                            tvcd.setCompoundDrawablesRelativeWithIntrinsicBounds(rel[0], rel[1], rel[2], rel[3]);
+                            return;
+                        }
+                        if ("drawableTop".equals(attr) || "drawableBottom".equals(attr)) {
+                            // Keep whichever start/end (or left/right) pair is
+                            // already set: the relative view of it re-resolves
+                            // to the same sides.
+                            if (!tvcd.macapkHasRelativeDrawables()) {
+                                // No start/end: stay ABSOLUTE, or a drawableLeft
+                                // would turn into a start icon and flip under RTL.
+                                android.graphics.drawable.Drawable[] abs = tvcd.getCompoundDrawables();
+                                if ("drawableTop".equals(attr)) abs[1] = dr; else abs[3] = dr;
+                                tvcd.setCompoundDrawablesWithIntrinsicBounds(abs[0], abs[1], abs[2], abs[3]);
+                                return;
+                            }
+                            android.graphics.drawable.Drawable[] rel = tvcd.getCompoundDrawablesRelative();
+                            if ("drawableTop".equals(attr)) rel[1] = dr; else rel[3] = dr;
+                            tvcd.setCompoundDrawablesRelativeWithIntrinsicBounds(rel[0], rel[1], rel[2], rel[3]);
+                            return;
+                        }
+                        // drawableLeft/Right after a drawableStart/End: the
+                        // relative pair already overrides both sides (above).
+                        if (tvcd.macapkHasRelativeDrawables()) return;
+                        android.graphics.drawable.Drawable[] cur = tvcd.getCompoundDrawables();
+                        if ("drawableLeft".equals(attr)) cur[0] = dr; else cur[2] = dr;
+                        tvcd.setCompoundDrawablesWithIntrinsicBounds(cur[0], cur[1], cur[2], cur[3]);
+                    }
+                    return;
+                }
                 case "drawablePadding": {
                     // AOSP TextView ctor (:1374-1376): a DIMENSION, fed to
                     // setCompoundDrawablePadding. It is load-bearing for layout,
@@ -4733,6 +4923,8 @@ public class LayoutInflater {
                         // android:textColor="@android:color/darker_gray"
                         // (F-Droid's text_last_update) fell through to the
                         // default black instead of grey.
+                        android.content.res.ColorStateList csl = macapkResolveTextColorList(view, value, null);
+                        if (csl != null) { tv.setTextColor(csl); return; }
                         Integer c = macapkResolveColorValue(value);
                         if (c != null) tv.setTextColor(c);
                     }
@@ -4742,16 +4934,8 @@ public class LayoutInflater {
                         Float sz = parseDimensionPx(value);
                         // parseDimensionPx already gave px; setTextSize(float) is
                         // the SP overload and would double-convert. Apply as PX.
-                        // AOSP sets the XML size inside the constructor through the
-                        // private setRawTextSize, never through the overridable
-                        // public setTextSize; see TextView.macapkSetRawTextSize.
-                        if (sz != null) {
-                            String v = value.trim();
-                            int unit = v.endsWith("sp") ? android.util.TypedValue.COMPLEX_UNIT_SP
-                                : (v.endsWith("dp") || v.endsWith("dip")) ? android.util.TypedValue.COMPLEX_UNIT_DIP
-                                : android.util.TypedValue.COMPLEX_UNIT_PX;
-                            tv.macapkSetRawTextSize(sz, unit);
-                        }
+                        if (sz != null)
+                            tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, sz);
                     }
                     return;
                 case "textStyle":
@@ -4862,26 +5046,6 @@ public class LayoutInflater {
                     // reads it from its own TypedArray; setting it again here is
                     // the same value.)
                     if (LAYOUT_AOSP_1643) setBooleanReflect(view, attr, "true".equals(value));
-                    return;
-                case "descendantFocusability":
-                    // AOSP ViewGroup's constructor: setDescendantFocusability(
-                    // DESCENDANT_FOCUSABILITY_FLAGS[a.getInt(attr, 0)]), the enum
-                    // beforeDescendants=0 / afterDescendants=1 / blocksDescendants=2
-                    // (attrs.xml). Never read, so every XML group stayed
-                    // BEFORE_DESCENDANTS: leanback's BrowseFrameLayout (focusable,
-                    // afterDescendants in lb_browse_fragment.xml) then kept focus
-                    // ITSELF instead of handing it to its rows, and a list row
-                    // that blocks descendants let its buttons steal focus.
-                    if (view instanceof ViewGroup vgDF && value != null) {
-                        int df;
-                        switch (value.trim()) {
-                            case "0": case "beforeDescendants": df = ViewGroup.FOCUS_BEFORE_DESCENDANTS; break;
-                            case "1": case "afterDescendants": df = ViewGroup.FOCUS_AFTER_DESCENDANTS; break;
-                            case "2": case "blocksDescendants": df = ViewGroup.FOCUS_BLOCK_DESCENDANTS; break;
-                            default: df = -1; break;
-                        }
-                        if (df != -1) vgDF.setDescendantFocusability(df);
-                    }
                     return;
                 case "focusable":
                 case "focusableInTouchMode":
@@ -5076,6 +5240,24 @@ public class LayoutInflater {
                     }
                     return;
                 }
+                case "layoutDirection": {
+                    // android:layoutDirection (ltr=0 rtl=1 inherit=2 locale=3) was
+                    // dropped, so a subtree an app pins LTR inside an RTL UI got
+                    // mirrored anyway -- WhatsApp's bottom bar (layoutDirection="ltr",
+                    // items already ordered for RTL by the app) came out reversed.
+                    int ld;
+                    switch (value) {
+                        case "ltr":     ld = View.LAYOUT_DIRECTION_LTR;     break;
+                        case "rtl":     ld = View.LAYOUT_DIRECTION_RTL;     break;
+                        case "inherit": ld = View.LAYOUT_DIRECTION_INHERIT; break;
+                        case "locale":  ld = View.LAYOUT_DIRECTION_LOCALE;  break;
+                        default:
+                            try { ld = Integer.decode(value.trim()); }
+                            catch (NumberFormatException e) { return; }
+                    }
+                    if (ld >= 0 && ld <= 3) view.setLayoutDirection(ld);
+                    return;
+                }
                 case "textAlignment": {
                     // android:textAlignment -- an aapt2 ENUM attr; apktool
                     // hands us the token string. AOSP token -> constant table:
@@ -5146,18 +5328,25 @@ public class LayoutInflater {
                     return;
                 }
                 case "paddingStart": {
-                    // LTR-only mapping (RTL not yet supported here).
+                    // Relative, resolved against the layout direction
+                    // (View.macapkSetXmlRelativePadding). Was LTR-only.
                     Integer px = parseDimensionPxInt(value);
-                    if (px != null) view.setPadding(px,
-                        view.getPaddingTop(), view.getPaddingRight(),
-                        view.getPaddingBottom());
+                    if (px != null) {
+                        if (macapkRtlCompatibilityMode()) view.setPadding(px,
+                            view.getPaddingTop(), view.getPaddingRight(),
+                            view.getPaddingBottom());
+                        else view.macapkSetXmlRelativePadding(px, Integer.MIN_VALUE);
+                    }
                     return;
                 }
                 case "paddingEnd": {
                     Integer px = parseDimensionPxInt(value);
-                    if (px != null) view.setPadding(view.getPaddingLeft(),
-                        view.getPaddingTop(), px,
-                        view.getPaddingBottom());
+                    if (px != null) {
+                        if (macapkRtlCompatibilityMode()) view.setPadding(view.getPaddingLeft(),
+                            view.getPaddingTop(), px,
+                            view.getPaddingBottom());
+                        else view.macapkSetXmlRelativePadding(Integer.MIN_VALUE, px);
+                    }
                     return;
                 }
                 default:
@@ -5482,6 +5671,42 @@ public class LayoutInflater {
                 }
             } catch (Throwable ignored) {}
             return s.substring("@string/".length());  // best-effort literal
+        }
+        // A PLATFORM string (`android:text="@android:string/cancel"`, compiled as
+        // @0x01040000): AOSP's TypedArray.getText resolves it from framework-res
+        // like any other. This returned the reference itself, so NoNonsense
+        // Notes' list dialog buttons read "@ANDROID:STRING/CANCEL" and
+        // "@ANDROID:STRING/OK" (textAllCaps). Resources.getString already
+        // serves 0x0104xxxx (ResourceIndex.stringForId); this only has to
+        // turn the name back into its id.
+        if (s.startsWith("@android:string/") && context != null) {
+            try {
+                android.content.res.Resources r = context.getResources();
+                final String fwName = s.substring(16);
+                int id = r != null ? r.getIdentifier(fwName, "string", "android") : 0;
+                if (id == 0) {
+                    // public-final.xml ids of the strings ResourceIndex's frozen
+                    // table serves when the platform table is gated off.
+                    switch (fwName) {
+                        case "cancel": id = 0x01040000; break;
+                        case "copy": id = 0x01040001; break;
+                        case "cut": id = 0x01040003; break;
+                        case "no": id = 0x01040009; break;
+                        case "ok": id = 0x0104000a; break;
+                        case "paste": id = 0x0104000b; break;
+                        case "search_go": id = 0x0104000c; break;
+                        case "selectAll": id = 0x0104000d; break;
+                        case "untitled": id = 0x0104000f; break;
+                        case "yes": id = 0x01040013; break;
+                        case "dialog_alert_title": id = 0x01040014; break;
+                        default: break;
+                    }
+                }
+                if (id != 0 && r != null) {
+                    CharSequence resolved = r.getText(id);
+                    if (resolved != null && resolved.length() > 0) return resolved.toString();
+                }
+            } catch (Throwable ignored) {}
         }
         return s;
     }
@@ -6051,6 +6276,133 @@ public class LayoutInflater {
             return rc == 1 ? null : rc;
         }
         return null;
+    }
+
+    /** A compound-drawable attribute value as TypedArray.getDrawable reads it:
+     *  a `?attr` chased through the view's theme (the applyBackground chase),
+     *  then a platform drawable (by name or compiled id), an app drawable / mipmap
+     *  / colour reference, or a colour literal. A platform drawable the table can
+     *  only answer with the empty stand-in (the Material radio / checkbox are
+     *  animated-selectors of animated vectors) falls back to the synthesized
+     *  indicator Resources keeps for exactly those two
+     *  (MacapkCompoundButtonDrawable). Null when nothing resolves. */
+    /** A TextView colour attribute as AOSP reads it: TypedArray.getColorStateList,
+     *  so a @color/ SELECTOR (directly, or reached through ?attr hops in the
+     *  view's theme) keeps its states. Both of our textColor paths (the direct
+     *  attribute and the textAppearance's) resolved to ONE int, which froze every
+     *  selector text colour on its default row: a disabled preference
+     *  (androidx's setEnabledStateOnViews -> setEnabled(false)) kept full-ink
+     *  text under Material 3's m3_default_color_primary_text, whose
+     *  state_enabled="false" row carries the 38% disabled alpha (pf-notes
+     *  Settings: "Autodelete timespan" while its dependency is off). Returns null
+     *  for anything that is not a STATEFUL list, so plain colours keep the int
+     *  path exactly. MACAPK_TEXTCOLOR_CSL=0 restores the int-only path. */
+    static final boolean MACAPK_TEXTCOLOR_CSL =
+        !"0".equals(System.getenv("MACAPK_TEXTCOLOR_CSL"));
+    private android.content.res.ColorStateList macapkResolveTextColorList(View view, String value,
+            android.content.res.Resources.Theme th) {
+        if (!MACAPK_TEXTCOLOR_CSL || value == null) return null;
+        String cur = value.trim();
+        if (cur.isEmpty() || cur.startsWith("#")) return null;
+        android.content.res.Resources r = view.getResources();
+        if (r == null) return null;
+        if (th == null) {
+            try { if (view.getContext() != null) th = view.getContext().getTheme(); }
+            catch (Throwable ignored) {}
+        }
+        if (cur.startsWith("?")) {
+            if (th == null) return null;
+            for (int hop = 0; hop < 4 && cur.startsWith("?"); hop++) {
+                String attr = cur.substring(1);
+                if (attr.startsWith("android:attr/")) attr = "android:" + attr.substring(13);
+                else if (attr.startsWith("attr/")) attr = attr.substring(5);
+                String raw;
+                try { raw = th.resolveAttrRaw(attr); } catch (Throwable t) { raw = null; }
+                if (raw == null) return null;
+                raw = raw.trim();
+                if (raw.isEmpty() || raw.equals(cur)) return null;
+                cur = raw;
+            }
+        }
+        if (!cur.startsWith("@") || cur.startsWith("@android:")) return null;
+        try {
+            int id;
+            if (cur.startsWith("@0x") || cur.startsWith("@0X")) id = (int) Long.parseLong(cur.substring(3), 16);
+            else id = parseResourceId(cur);
+            if (id == 0 || (id >>> 24) == 0x01) return null;
+            android.content.res.ColorStateList csl = r.getColorStateList(id, th);
+            return (csl != null && csl.isStateful()) ? csl : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private android.graphics.drawable.Drawable macapkResolveCompoundDrawable(View view, String value) {
+        if (value == null) return null;
+        value = value.trim();
+        if (value.isEmpty() || macapkIsNullBackground(value)) return null;
+        android.content.res.Resources r = view.getResources();
+        if (r == null) return null;
+        android.content.res.Resources.Theme th = null;
+        try { if (view.getContext() != null) th = view.getContext().getTheme(); }
+        catch (Throwable ignored) {}
+        String cur = value;
+        String lastAttr = null;
+        if (cur.startsWith("?") && th != null) {
+            for (int hop = 0; hop < 4 && cur.startsWith("?"); hop++) {
+                String attr = cur.substring(1);
+                if (attr.startsWith("android:attr/")) attr = "android:" + attr.substring(13);
+                else if (attr.startsWith("attr/")) attr = attr.substring(5);
+                lastAttr = attr;
+                String raw = th.resolveAttrRaw(attr);
+                if (raw == null) break;
+                raw = raw.trim();
+                if (raw.isEmpty() || raw.equals(cur)) break;
+                cur = raw;
+            }
+        }
+        if (cur.startsWith("?") || macapkIsNullBackground(cur)) return null;
+        android.graphics.drawable.Drawable dr = null;
+        try {
+            if (cur.startsWith("#")) {
+                Integer c = macapkResolveColorValue(cur, th);
+                if (c != null) dr = new android.graphics.drawable.ColorDrawable(c);
+            } else if (cur.startsWith("@android:drawable/")) {
+                String fw = cur.substring(18);
+                // Theme.Material's listChoiceIndicatorSingle/Multiple point at
+                // btn_radio_material_anim / btn_check_material_anim: animated
+                // selectors of animated vectors that the platform table loads
+                // but nothing here can paint, so the row reserved the room and
+                // drew no radio (pf-notes' ListPreference dialog, a Material 3
+                // theme whose overlay does not restate the attr). Use the
+                // synthesized Material indicator, as for an unresolved attr.
+                if ("btn_radio_material_anim".equals(fw)) fw = "btn_radio_material";
+                else if ("btn_check_material_anim".equals(fw)) fw = "btn_check_material";
+                dr = r.macapkFrameworkDrawableByName(fw, th);
+            } else if (cur.startsWith("@0x") || cur.startsWith("@0X")) {
+                int id = (int) Long.parseLong(cur.substring(3), 16);
+                if (id != 0) dr = r.getDrawable(id, th);
+            } else if (cur.startsWith("@")) {
+                int id = parseResourceId(cur);
+                if (id != 0) dr = r.getDrawable(id, th);
+            }
+        } catch (Throwable ignored) {
+            dr = null;
+        }
+        if (dr instanceof android.graphics.drawable.VectorDrawable vd
+                && (vd.macapkUnresolvedStub || vd.macapkPaintsNothing())) {
+            dr = null;
+        }
+        if (dr == null && lastAttr != null) {
+            String a = lastAttr.startsWith("android:") ? lastAttr.substring(8) : lastAttr;
+            String synth = a.startsWith("listChoiceIndicatorSingle") ? "btn_radio_material"
+                         : a.startsWith("listChoiceIndicatorMultiple") ? "btn_check_material"
+                         : null;
+            if (synth != null) {
+                try { dr = r.macapkFrameworkDrawableByName(synth, th); } catch (Throwable ignored) {}
+            }
+        }
+        return dr;
     }
 
     private void applyImageSrc(android.widget.ImageView iv, String value) {

@@ -2,12 +2,12 @@
 // session (transport controls, metadata, playback state). AOSP frameworks/base
 // media/java/android/media/session/MediaSession.java.
 //
-// Mac.apk has no system MediaSessionService, so a session is a local holder:
-// setMetadata/setPlaybackState store the latest values (readable via the paired
-// MediaController) and setActive/setCallback record state. Since v1.0.2243 the
-// media-button session is also mirrored into macOS Now Playing, and its
-// transport commands (Control Center, media keys, headsets) reach the Callback
-// on its Handler: see MacApkNowPlaying.
+// Mac.apk has no system MediaSessionService routing transport from a lockscreen/
+// notification, so a session is a local holder: setMetadata/setPlaybackState
+// store the latest values (readable via the paired MediaController), setActive/
+// setCallback record state, and no remote transport ever invokes the callback.
+// Apps that publish a session for the now-playing notification run without a
+// NoSuchMethodError; there is simply no external controller to drive it.
 package android.media.session;
 
 public final class MediaSession {
@@ -93,33 +93,14 @@ public final class MediaSession {
     android.os.Bundle getSessionInfo() { return mSessionInfo; }
     Callback getCallback() { return mCallback; }
 
-    /** AOSP: callbacks run on `handler`, or, without one, on the calling
-     *  thread's Looper (MediaSession.setCallback: "If null the callback will
-     *  be invoked on the thread of the current Looper"), falling back to the
-     *  main thread. Kept so a transport command from macOS Now Playing reaches
-     *  the app on the thread it chose (MacApkNowPlaying.onRemoteCommand). */
-    private android.os.Handler mCallbackHandler;
-    public void setCallback(Callback callback) { setCallback(callback, null); }
-    public void setCallback(Callback callback, android.os.Handler handler) {
-        mCallback = callback;
-        if (callback == null) { mCallbackHandler = null; return; }
-        if (handler == null) {
-            android.os.Looper l = android.os.Looper.myLooper();
-            handler = new android.os.Handler(l != null ? l : android.os.Looper.getMainLooper());
-        }
-        mCallbackHandler = handler;
-    }
-    android.os.Handler getCallbackHandler() { return mCallbackHandler; }
+    public void setCallback(Callback callback) { mCallback = callback; }
+    public void setCallback(Callback callback, android.os.Handler handler) { mCallback = callback; }
     /** AOSP: an active session is one the system may route media buttons to,
      *  and the most recently activated session wins that focus. */
     public void setActive(boolean active) {
         mActive = active;
         if (active) sMediaButtonSession = this;
         else if (sMediaButtonSession == this) sMediaButtonSession = null;
-        // The media-button session is what a device's system media controls
-        // show; on the Mac that is Now Playing.
-        if (active) MacApkNowPlaying.sessionChanged(this);
-        else MacApkNowPlaying.sessionGone(this);
     }
     public boolean isActive() { return mActive; }
     public void setPlaybackToLocal(android.media.AudioAttributes attributes) {}
@@ -158,7 +139,6 @@ public final class MediaSession {
     public android.app.PendingIntent getSessionActivity() { return mSessionActivity; }
     public void setMetadata(android.media.MediaMetadata metadata) {
         mMetadata = metadata;
-        MacApkNowPlaying.sessionChanged(this);
         for (MediaController.Callback cb : mControllerCallbacks) {
             try { cb.onMetadataChanged(metadata); } catch (Throwable ignore) {}
         }
@@ -166,7 +146,6 @@ public final class MediaSession {
     public android.media.MediaMetadata getMetadata() { return mMetadata; }
     public void setPlaybackState(PlaybackState state) {
         mPlaybackState = state;
-        MacApkNowPlaying.sessionChanged(this);
         for (MediaController.Callback cb : mControllerCallbacks) {
             try { cb.onPlaybackStateChanged(state); } catch (Throwable ignore) {}
         }
@@ -214,7 +193,6 @@ public final class MediaSession {
         mActive = false;
         sLiveSessions.remove(this);
         if (sMediaButtonSession == this) sMediaButtonSession = null;
-        MacApkNowPlaying.sessionGone(this);
         for (MediaController.Callback cb : mControllerCallbacks) {
             try { cb.onSessionDestroyed(); } catch (Throwable ignore) {}
         }

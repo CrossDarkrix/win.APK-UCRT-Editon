@@ -79,7 +79,28 @@ public class StorageStatsManager {
         java.io.File[] kids = f.listFiles();
         if (kids == null) return 0L;
         for (java.io.File k : kids) {
-            if (java.nio.file.Files.isSymbolicLink(k.toPath())) {
+            // Win.apk: the Windows host's mapping links are directory junctions,
+            // which Java reports as plain directories; any other junction is
+            // skipped like any other link.
+            boolean junction = com.macapk.loader.SharedStorage.isJunction(k.toPath());
+            if (java.nio.file.Files.isSymbolicLink(k.toPath()) || junction) {
+                if (atRoot && com.macapk.loader.SharedStorage.isHostFolderMapping(k)) {
+                    // Read with the listing's own attributes (one system call
+                    // per folder, not three per file), and at most 100,000
+                    // files, breadth first: a whole Downloads of source trees
+                    // (495,000 files) took 12 s, long enough for an app asking
+                    // on its main thread to stop responding. The total is then
+                    // a lower bound, which a storage screen can live with.
+                    long[] sum = {0};
+                    com.macapk.loader.SharedStorage.walkHostFolder(k.toPath(), 100_000, d -> true,
+                            (p, attrs) -> sum[0] += attrs.size());
+                    total += sum[0];
+                    continue;
+                }
+                if (junction && !com.macapk.loader.SharedStorage.isLink(k.toPath(), null)) {
+                    total += dirSize(k, false);   // a OneDrive placeholder: a real folder
+                    continue;
+                }
                 if (!atRoot || !com.macapk.loader.SharedStorage.isRecognizedFolderLink(k)) continue;
                 total += dirSize(k, false);
                 continue;

@@ -1048,9 +1048,43 @@ public class Resources {
                     .getMethod("integerArrayForId", int.class);
                 Object v = m.invoke(macapkResourceIndex, id);
                 if (v instanceof int[]) return (int[]) v;
+                // A typed <array> (not <integer-array>) is indexed with the
+                // string arrays, its items as written ("@color/dot"). AOSP's
+                // AssetManager.getResourceIntArray resolves each item and
+                // returns its data word, so a color reference answers the
+                // color and a literal answers its value.
+                java.lang.reflect.Method sm = macapkResourceIndex.getClass()
+                    .getMethod("stringArrayForId", int.class);
+                Object sv = sm.invoke(macapkResourceIndex, id);
+                if (sv instanceof String[] items) return macapkIntArrayOf(items);
             } catch (Throwable ignored) {}
         }
         return new int[0];
+    }
+
+    private int[] macapkIntArrayOf(String[] items) {
+        int[] out = new int[items.length];
+        for (int i = 0; i < items.length; i++) {
+            String it = items[i];
+            if (it == null || it.isEmpty()) continue;
+            try {
+                if (it.charAt(0) == '@') {
+                    int rid = macapkResRefToId(it);
+                    if (rid == 0) continue;
+                    android.util.TypedValue tv = new android.util.TypedValue();
+                    getValue(rid, tv, true);
+                    out[i] = tv.data;
+                } else if (it.charAt(0) == '#') {
+                    out[i] = android.graphics.Color.parseColor(it);
+                } else {
+                    out[i] = Integer.decode(it.trim());
+                }
+            } catch (Throwable ignored) {
+                // An item that does not resolve stays 0, as an unresolvable
+                // entry reads on a device.
+            }
+        }
+        return out;
     }
     /** AOSP `Resources.getStringArray(int)`. Returns the items of a
      *  `<string-array name="...">` from `res/values/arrays.xml`. Load-
@@ -1860,7 +1894,13 @@ public class Resources {
         catch (NumberFormatException nfe) { return null; }
         if (id == 0) return null;
         String[] tn = macapkTypeNameOf(id);
-        if (tn == null || tn.length < 2 || !"attr".equals(tn[0])
+        // "^attr-private" is a PRIVATE platform attribute (0x0112....): the
+        // platform themes bind it by name like any public one (ResourceIndex
+        // .macapkStyleItemKey), e.g. popup_background_material's
+        // ?attr/colorPopupBackground.
+        if (tn == null || tn.length < 2
+                || !("attr".equals(tn[0])
+                     || ((id >>> 24) == 0x01 && "^attr-private".equals(tn[0])))
                 || tn[1] == null || tn[1].isEmpty()) return null;
         return ((id >>> 24) == 0x01 ? "?android:" : "?") + tn[1];
     }
@@ -2939,6 +2979,8 @@ public class Resources {
     }
     /** Parse android:state_X="true|false" to the framework attr ids the View's
      *  getDrawableState emits (positive = must be present, negative = absent). */
+    static final boolean MACAPK_SELECTOR_APP_STATES =
+        !"0".equals(System.getenv("MACAPK_SELECTOR_APP_STATES"));
     private int[] macapkParseStateSet(org.w3c.dom.Element item) {
         // Delegate the name->id lookup to ColorStateList.stateAttrId, which
         // already carries all 22 public framework state attrs (verified against
@@ -2957,16 +2999,17 @@ public class Resources {
             org.w3c.dom.Node n = attrs.item(i);
             // Namespace-check preserves the old getAttributeNS-only semantics:
             // a same-named attr in an app namespace must not be picked up.
-            // An APP-namespace state (Material's app:state_with_icon,
-            // app:state_error, app:state_indeterminate) is a state too: AOSP
+            // Ported from Mac.apk main (902e6ff): an APP-namespace state
+            // (Material's app:state_indeterminate, app:state_error,
+            // app:state_with_icon) is a state too: AOSP
             // StateListDrawable.extractStateSet keeps every attribute by its id
             // whatever the namespace, and ColorStateList here already resolves
             // app states by name. Skipping it made the item UNCONDITIONAL --
-            // the promote-to-default failure described above. Measured:
-            // mtrl_switch_thumb's <item app:state_with_icon="true"
-            // drawable=mtrl_switch_thumb_checked> sorts before the unchecked item,
-            // so every OFF MaterialSwitch drew the big checked thumb (ytdlnis,
-            // issue #5, 2026-10-19). MACAPK_SELECTOR_APP_STATES=0 restores the skip.
+            // the promote-to-default failure described above. Measured here:
+            // mtrl_checkbox_button(_icon)'s <item app:state_indeterminate="true">
+            // sorts before the unchecked item, so every unchecked
+            // MaterialCheckBox drew the indeterminate dash (pf-notes checklist).
+            // MACAPK_SELECTOR_APP_STATES=0 restores the skip.
             boolean appNs = MACAPK_SELECTOR_APP_STATES
                 && "http://schemas.android.com/apk/res-auto".equals(n.getNamespaceURI());
             if (!MACAPK_ANDROID_NS.equals(n.getNamespaceURI()) && !appNs) continue;
@@ -3184,10 +3227,29 @@ public class Resources {
         private final android.graphics.Paint paint = new android.graphics.Paint();
         private int alpha = 255;
 
+        /** The theme the indicator was requested for (the VIEW's, e.g. a
+         *  dialog's overlay), or null for the application theme. AOSP tints
+         *  control_checkable_material with the view theme's ?colorControlNormal /
+         *  ?colorControlActivated; reading the APPLICATION theme instead drew the
+         *  unchecked ring in pf-notes' ListPreference dialog white on white
+         *  (AppTheme sets colorControlNormal=@color/white for its dark toolbar,
+         *  the dialog overlay sets it to the brand blue). */
+        private final Theme theme;
+
         MacapkCompoundButtonDrawable(float density, boolean radio) {
+            this(density, radio, null);
+        }
+        MacapkCompoundButtonDrawable(float density, boolean radio, Theme theme) {
             this.d = density;
             this.radio = radio;
+            this.theme = theme;
             paint.setAntiAlias(true);
+        }
+        private int macapkColor(String attr, int fallback) {
+            if (theme != null) {
+                try { return theme.resolveAttrColor(attr, fallback); } catch (Throwable ignored) {}
+            }
+            return Resources.macapkThemeColor(attr, fallback);
         }
 
         /** `state_enabled` ABSENT means disabled -- View.onCreateDrawableState
@@ -3225,8 +3287,8 @@ public class Resources {
          *  MacapkEditTextBar records). */
         private int tint() {
             final int c = checked()
-                ? Resources.macapkThemeColor("colorControlActivated", 0xFF6200EE)
-                : Resources.macapkThemeColor("colorControlNormal", 0x8A000000);
+                ? macapkColor("colorControlActivated", 0xFF6200EE)
+                : macapkColor("colorControlNormal", 0x8A000000);
             if (enabled()) return c;
             // ?attr/disabledAlpha; AOSP's material default is 0.5 (themes_material
             // .xml). Scale the alpha channel rather than blending toward a
@@ -3271,7 +3333,7 @@ public class Resources {
             // The tick, knocked out in the window background colour. APPROXIMATE
             // (see the class comment): AOSP carves it out of the filled square
             // with a vector path.
-            paint.setColor(Resources.macapkThemeColor("colorBackground", 0xFFFFFFFF));
+            paint.setColor(macapkColor("colorBackground", 0xFFFFFFFF));
             paint.setAlpha(alpha);
             paint.setStyle(android.graphics.Paint.Style.STROKE);
             paint.setStrokeWidth(2f * d);
@@ -3380,9 +3442,9 @@ public class Resources {
             // LayoutInflater's id==0 fallback, so an AppCompat app that bundles
             // the real abc_* asset is unaffected.
             case "btn_check_material":
-                return new MacapkCompoundButtonDrawable(d, false);
+                return new MacapkCompoundButtonDrawable(d, false, theme);
             case "btn_radio_material":
-                return new MacapkCompoundButtonDrawable(d, true);
+                return new MacapkCompoundButtonDrawable(d, true, theme);
             case "btn_default_material": {
                 android.graphics.drawable.GradientDrawable s =
                     new android.graphics.drawable.GradientDrawable();
@@ -4047,12 +4109,13 @@ public class Resources {
                     break;
                 }
                 case "stroke":
-                    gd.setStroke(macapkDimAttr(c, "width", 0, theme),
+                    gd.setStroke(macapkDimSizeAttr(c, "width", 0, theme),
                         macapkResolveColorString(
                             c.getAttributeNS(MACAPK_ANDROID_NS, "color"), 0, theme));
                     break;
                 case "size":
-                    gd.setSize(macapkDimAttr(c, "width", -1, theme), macapkDimAttr(c, "height", -1, theme));
+                    gd.setSize(macapkDimSizeAttr(c, "width", -1, theme),
+                            macapkDimSizeAttr(c, "height", -1, theme));
                     break;
                 case "gradient": {
                     // v1.0.499: a <shape> with a <gradient> (and no <solid>) was
@@ -4143,6 +4206,29 @@ public class Resources {
         return px != null ? (int) (float) px : def;
     }
 
+    /** macapkDimAttr for an attribute AOSP reads with getDimensionPixelSize
+     *  (GradientDrawable <stroke android:width>, <size>): round to nearest, and
+     *  a non-zero value never becomes 0 px (TypedValue.complexToDimensionPixelSize:
+     *  `res != 0 ? res : value == 0 ? 0 : value > 0 ? 1 : -1`). The truncating
+     *  read above turned a 0.5dp hairline at 1x into a 0 px stroke, which is not
+     *  drawn: underline-only input fields (a stroked rectangle with negative
+     *  left/top/right insets; Paz Yellow's phone field, 2026-10-28) showed no
+     *  line at all. MACAPK_DIM_PIXEL_SIZE=0 restores the truncation. */
+    static final boolean MACAPK_DIM_PIXEL_SIZE =
+            !"0".equals(System.getenv("MACAPK_DIM_PIXEL_SIZE"));
+    private int macapkDimSizeAttr(org.w3c.dom.Element e, String name, int def, Theme theme) {
+        String v = e.getAttributeNS(MACAPK_ANDROID_NS, name);
+        if (!MACAPK_DIM_PIXEL_SIZE || v == null || v.isEmpty()
+                || v.trim().startsWith("?") || v.startsWith("@")) {
+            return macapkDimAttr(e, name, def, theme);   // the reference paths already round
+        }
+        Float px = macapkParseDimenString(v);
+        if (px == null) return def;
+        int res = (int) (px + (px >= 0 ? 0.5f : -0.5f));
+        if (res != 0) return res;
+        return px == 0f ? 0 : (px > 0f ? 1 : -1);
+    }
+
     /** A `?attr` dimension: the theme's value for the attribute (chased through
      *  `?` hops by macapkResolveThemeAttrRaw), then read as a literal or a
      *  reference exactly like an attribute that held it directly. */
@@ -4189,8 +4275,25 @@ public class Resources {
         return id != 0 ? macapkDimenPx(id) : null;
     }
 
-    private Float macapkParseDimenString(String v) {
-        return TypedArray.macapkParseDimenLiteral(v, metrics);
+    private static Float macapkParseDimenString(String v) {
+        if (v == null) return null;
+        v = v.trim();
+        if (v.isEmpty() || v.startsWith("@") || v.startsWith("?")) return null;
+        int unitEnd = v.length();
+        for (int i = 0; i < v.length(); i++) {
+            if (Character.isLetter(v.charAt(i))) { unitEnd = i; break; }
+        }
+        try {
+            float n = Float.parseFloat(v.substring(0, unitEnd));
+            String unit = v.substring(unitEnd);
+            // dp/dip/sp scale by the device density (v1.0.2187; was a fixed
+            // 2x); px / bare numbers pass through.
+            if (unit.startsWith("dp") || unit.startsWith("dip") || unit.startsWith("sp"))
+                return n * android.util.DisplayMetrics.macapkDeviceDensity();
+            return n;
+        } catch (NumberFormatException ex) {
+            return null;
+        }
     }
 
     // Package-private (v1.0.499): TypedArray.getColor delegates here so a
@@ -5319,7 +5422,19 @@ public class Resources {
         } catch (Throwable ignored) {}
         return false;
     }
-    public float getFloat(int id) { return 0f; }
+    /** AOSP Resources.getFloat (API 29): getValue, then the value of a
+     *  TYPE_FLOAT row (<item type="dimen" format="float">). Was a `return 0f`
+     *  stub: Spotify sizes its side drawer as widthPixels * a float dimen, so
+     *  the drawer measured 0 wide, DrawerLayout's slide offset came out 0/0 =
+     *  NaN, and the main layout it translates by that offset drew nothing (a
+     *  black screen after sign-in). Answers 0 for another type, where AOSP
+     *  throws NotFoundException, as getFraction below does. */
+    public float getFloat(int id) {
+        android.util.TypedValue tv = new android.util.TypedValue();
+        try { getValue(id, tv, true); } catch (Throwable t) { return 0f; }
+        if (tv.type == android.util.TypedValue.TYPE_FLOAT) return tv.getFloat();
+        return 0f;
+    }
     public float getFraction(int id, int base, int pbase) {
         // AOSP Resources.getFraction (Resources.java:1130, android11-release):
         // getValue then complexToFraction(data, base, pbase) -- %  multiplies
@@ -5410,8 +5525,12 @@ public class Resources {
                 java.lang.reflect.Method m = macapkResourceIndex.getClass()
                     .getMethod("idOfName", String.class, String.class, String.class);
                 Object id = m.invoke(macapkResourceIndex, name, defType, defPackage);
-                if (id instanceof Integer) return (Integer) id;
+                if (id instanceof Integer && (Integer) id != 0) return (Integer) id;
             } catch (Throwable ignored) {}
+        }
+        if (System.getenv("MACAPK_TRACE_GETID") != null) {
+            com.macapk.loader.NativeLog.i("Mac.apk.Res", "getIdentifier(" + name + ", " + defType + ", "
+                + defPackage + ") -> 0" + (macapkResourceIndex == null ? " (no index)" : ""));
         }
         return 0;
     }
@@ -5590,25 +5709,12 @@ public class Resources {
     /** MACAPK_THEME_APP_ATTR_CASCADE (default ON): see
      *  Theme.macapkResolveAppAttrRawHonest. =0 restores the per-style cascade
      *  walk for every caller, exactly as before. */
-    static final boolean MACAPK_SELECTOR_APP_STATES =
-        !"0".equals(System.getenv("MACAPK_SELECTOR_APP_STATES"));
-    static final boolean MACAPK_THEME_SELECTOR_ATTR_ROW =
-        !"0".equals(System.getenv("MACAPK_THEME_SELECTOR_ATTR_ROW"));
     static final boolean MACAPK_THEME_APP_ATTR_CASCADE =
         !"0".equals(System.getenv("MACAPK_THEME_APP_ATTR_CASCADE"));
     /** ResourceIndex.resolveAttrInThemeExact, looked up once (the same cached
      *  reflective-handle idiom as macapkThemeRawMethod): the app-attr path runs
      *  inside every resolveAttribute a widget constructor makes. */
     private static volatile java.lang.reflect.Method macapkThemeExactMethod;
-    /** StyleBackedAttributeSet answers an app-package (res-auto) slot by the
-     *  app attribute's identity only; see its getAttributeValue. Off under
-     *  MACAPK_ATTR_IDENTITY=0 too, so that gate keeps restoring every
-     *  pre-identity answer. */
-    static final boolean MACAPK_STYLE_APP_SLOT_EXACT =
-        !"0".equals(System.getenv("MACAPK_ATTR_IDENTITY"))
-        && !"0".equals(System.getenv("MACAPK_STYLE_APP_SLOT_EXACT"));
-    private static final String MACAPK_NS_RES_AUTO =
-        "http://schemas.android.com/apk/res-auto";
 
     public final class Theme {
         // v1.0.128: per-Theme applied-style stack. Real AOSP keeps the
@@ -5931,32 +6037,6 @@ public class Resources {
          *  it did before, and a `?attr` hop can still reach the application theme
          *  after every style the caller actually applied. */
         private Integer macapkResolveAttrColorInCascade(String attrName) {
-            return macapkResolveAttrColorInCascade(attrName, 0);
-        }
-
-        /** The default row of selector `name` when it is a `?attr`, resolved in
-         *  this theme's cascade, with the row's android:alpha applied (AOSP
-         *  modulateColor). Null when the default row is not a theme attribute. */
-        private Integer macapkSelectorAttrRowColor(String name, int depth) {
-            try {
-                Object row = macapkResourceIndex.getClass()
-                    .getMethod("macapkSelectorDefaultAttrRow", String.class)
-                    .invoke(macapkResourceIndex, name);
-                if (!(row instanceof String[] r) || r.length < 2) return null;
-                String next = macapkAttrRefName(r[0]);
-                if (next == null || next.isEmpty()) return null;
-                Integer c = macapkResolveAttrColorInCascade(next, depth + 1);
-                if (c == null || r[1] == null) return c;
-                float mod = Float.parseFloat(r[1]);
-                int a = Math.round(((c >>> 24) & 0xFF) * mod);
-                a = Math.max(0, Math.min(255, a));
-                return (a << 24) | (c & 0x00FFFFFF);
-            } catch (Throwable t) {
-                return null;
-            }
-        }
-
-        private Integer macapkResolveAttrColorInCascade(String attrName, int depth) {
             try {
                 java.util.List<String> cascade =
                     new java.util.ArrayList<>(appliedStyles);
@@ -6003,18 +6083,6 @@ public class Resources {
                     }
                     Integer c = macapkResolveColorExpr(raw);
                     if (c != null) return c;
-                    // A res/color selector whose default row is itself a theme
-                    // attribute (AdGuard's navigation_icon_color ->
-                    // selector_background_navigation_item -> ?navigation_icon_color_normal):
-                    // AOSP inflates the ColorStateList against THIS theme, so chase
-                    // that row here. The theme-less resolver above cannot, and
-                    // answered null -- the stroke-only bottom-nav icons painted
-                    // transparent (issue #5, 2026-10-19).
-                    // MACAPK_THEME_SELECTOR_ATTR_ROW=0 restores the null.
-                    if (MACAPK_THEME_SELECTOR_ATTR_ROW && depth < 4 && raw.startsWith("@color/")) {
-                        Integer sc = macapkSelectorAttrRowColor(raw.substring(7), depth);
-                        if (sc != null) return sc;
-                    }
                     // Declared, but not a colour (a @drawable, say). The old
                     // per-style loop skipped such a style and kept walking;
                     // preserve that exactly.
@@ -6532,10 +6600,13 @@ public class Resources {
                     .getMethod("resolveAttrInTheme", String.class, String.class);
                 for (int hop = 0; hop < 4 && sr.startsWith("?"); hop++) {
                     String refAttr = sr.substring(1);
+                    // App attribute: whole-cascade identity first (see
+                    // macapkResolveAppAttrExact / resolveDefStyleName).
+                    final boolean appHop = !refAttr.startsWith("android:");
                     if (refAttr.startsWith("attr/")) refAttr = refAttr.substring(5);
                     else if (refAttr.startsWith("android:attr/")) refAttr = refAttr.substring(13);
-                    String next = null;
-                    for (String style : appliedStyles) {
+                    String next = appHop ? macapkResolveAppAttrExact(refAttr) : null;
+                    if (next == null) for (String style : appliedStyles) {
                         Object r = mResolve.invoke(macapkResourceIndex, style, refAttr);
                         if (r instanceof String) { next = (String) r; break; }
                     }
@@ -6552,6 +6623,31 @@ public class Resources {
                 }
             } catch (Throwable ignored) { return ref; }
             return sr;
+        }
+
+        /** Pass 1 of macapkResolveAppAttrRawHonest alone: the highest-priority
+         *  applied style whose chain declares the APP attribute `attrName` under
+         *  that exact key, or null (also for a one-style cascade, where the
+         *  per-style walk already asks that style first). */
+        private String macapkResolveAppAttrExact(String attrName) {
+            if (!MACAPK_THEME_APP_ATTR_CASCADE || attrName == null
+                    || attrName.startsWith("android:") || appliedStyles.size() <= 1
+                    || macapkResourceIndex == null) {
+                return null;
+            }
+            try {
+                java.lang.reflect.Method mExact = macapkThemeExactMethod;
+                if (mExact == null) {
+                    mExact = macapkResourceIndex.getClass()
+                        .getMethod("resolveAttrInThemeExact", String.class, String.class);
+                    macapkThemeExactMethod = mExact;
+                }
+                for (String style : appliedStyles) {
+                    Object r = mExact.invoke(macapkResourceIndex, style, attrName);
+                    if (r instanceof String s && !s.isEmpty()) return s;
+                }
+            } catch (Throwable ignored) {}
+            return null;
         }
 
         /** Resolve a defStyleAttr (a theme attr id like actionOverflowButtonStyle)
@@ -6587,9 +6683,28 @@ public class Resources {
                     if (attrName != null) {
                         java.lang.reflect.Method mResolve = macapkResourceIndex.getClass()
                             .getMethod("resolveAttrInTheme", String.class, String.class);
-                        for (String style : appliedStyles) {
-                            Object r = mResolve.invoke(macapkResourceIndex, style, attrName);
-                            if (r instanceof String) { styleRef = (String) r; break; }
+                        // An APP attribute (not 0x01) is answered by its own
+                        // identity across the WHOLE cascade first, the rule
+                        // resolveAttribute already follows
+                        // (macapkResolveAppAttrRawHonest). The per-style walk
+                        // below runs each style's `android:` alias and platform
+                        // fallback before the next style is asked, so a dialog
+                        // theme whose parent is a PLATFORM theme answered
+                        // AppCompat's alertDialogStyle with the platform's
+                        // android:alertDialogStyle before the activity theme's own
+                        // AlertDialog.AppCompat was reached. AlertController then
+                        // read listLayout 0 and every list dialog (ListPreference,
+                        // single/multi choice) threw ClassCastException in
+                        // AlertDialog.Builder.create (NoNonsense Notes'
+                        // ThemeNnnDialogLight extends Theme.DeviceDefault.Light.Dialog).
+                        if ((defStyleAttr >>> 24) != 0x01) {
+                            styleRef = macapkResolveAppAttrExact(attrName);
+                        }
+                        if (styleRef == null) {
+                            for (String style : appliedStyles) {
+                                Object r = mResolve.invoke(macapkResourceIndex, style, attrName);
+                                if (r instanceof String) { styleRef = (String) r; break; }
+                            }
                         }
                         if (styleRef == null) {
                             Object appName = macapkResourceIndex.getClass()
@@ -6621,12 +6736,15 @@ public class Resources {
                     // hang the inflater, so cap the hops and drop out.
                     for (int hop = 0; hop < 4 && sr.startsWith("?"); hop++) {
                         String refAttr = sr.substring(1);
+                        // `?X` / `?attr/X` names an APP attribute; the same
+                        // whole-cascade identity rule applies to the hop.
+                        final boolean appHop = !refAttr.startsWith("android:");
                         if (refAttr.startsWith("attr/")) refAttr = refAttr.substring(5);
                         else if (refAttr.startsWith("android:attr/")) refAttr = refAttr.substring(13);
-                        String next = null;
+                        String next = appHop ? macapkResolveAppAttrExact(refAttr) : null;
                         java.lang.reflect.Method mResolve2 = macapkResourceIndex.getClass()
                             .getMethod("resolveAttrInTheme", String.class, String.class);
-                        for (String style : appliedStyles) {
+                        if (next == null) for (String style : appliedStyles) {
                             Object r = mResolve2.invoke(macapkResourceIndex, style, refAttr);
                             if (r instanceof String) { next = (String) r; break; }
                         }
@@ -6721,46 +6839,6 @@ public class Resources {
         StyleBackedAttributeSet(String styleName) { this.styleName = styleName; }
         @Override public String getAttributeValue(String namespace, String name) {
             if (name == null || macapkResourceIndex == null) return null;
-            // An APP-package slot (TypedArray asks for it in the res-auto
-            // namespace) is filled by the app attribute's own 0x7f id and
-            // nothing else: AttributeResolution.cpp ApplyStyle matches the
-            // style bag by `cur_ident` (:277 xml_style_attr_finder.Find,
-            // :289 def_style_attr_finder.Find, android14-release). So a style
-            // that declares only `android:X` leaves the app slot `X` EMPTY on a
-            // device. resolveAttrInTheme's pass 2 (bare -> `android:X`) is the
-            // right fallback for a bare-NAME theme query, but for an app slot
-            // it crosses identities: the style's `android:X` answered app `X`.
-            //
-            // MEASURED VICTIM: F-Droid's Settings. Its preferences.xml gives
-            // LiveSeekBarPreference `android:layout="@layout/preference_seekbar"`
-            // (its own SeekBarForegroundThumb). androidx Preference reads
-            // TypedArrayUtils.getResourceId(a, Preference_layout,
-            // Preference_android_layout, ...), where the APP `layout` slot wins.
-            // The defStyle Preference.SeekBarPreference.Material sets only
-            // `android:layout` (the stock preference_widget_seekbar_material),
-            // which pass 2 fed to the app slot, so the stock layout beat the
-            // app's own and onBindViewHolder's cast to SeekBarForegroundThumb
-            // threw ClassCastException on AppCompatSeekBar.
-            //
-            // resolveAttrInThemeExact is pass 1 alone (the exact app key up the
-            // chain; a platform style never answers it). The framework-slot
-            // half of the same rule is TypedArray.macapkFrameworkSlotValue,
-            // which asks this set for `android:X` and is unaffected.
-            // MACAPK_STYLE_APP_SLOT_EXACT=0 (or MACAPK_ATTR_IDENTITY=0) restores
-            // the aliasing walk: a labelled bisect gate.
-            if (MACAPK_STYLE_APP_SLOT_EXACT && MACAPK_NS_RES_AUTO.equals(namespace)
-                    && !name.startsWith("android:")) {
-                try {
-                    java.lang.reflect.Method mExact = macapkThemeExactMethod;
-                    if (mExact == null) {
-                        mExact = macapkResourceIndex.getClass()
-                            .getMethod("resolveAttrInThemeExact", String.class, String.class);
-                        macapkThemeExactMethod = mExact;
-                    }
-                    Object v = mExact.invoke(macapkResourceIndex, styleName, name);
-                    return (v instanceof String) ? (String) v : null;
-                } catch (Throwable ignored) { return null; }
-            }
             try {
                 Object v = macapkResourceIndex.getClass()
                     .getMethod("resolveAttrInTheme", String.class, String.class)
@@ -7078,20 +7156,8 @@ public class Resources {
             Float px = dimenPx(index);
             return px != null ? (int) (float) px : def;
         }
-        /** AOSP: an int item answers its data (the enum names aapt compiles to
-         *  -1 / -2 included), a dimension its pixel size, anything else def. */
         @Override public int getLayoutDimension(int index, int def) {
-            Integer e = macapkLayoutEnumOrInt(raw(index));
-            if (e != null) return e;
-            Float px = dimenPx(index);
-            return px != null ? getDimensionPixelSize(index, def) : def;
-        }
-        @Override public int getLayoutDimension(int index, String name) {
-            Integer e = macapkLayoutEnumOrInt(raw(index));
-            if (e != null) return e;
-            if (dimenPx(index) != null) return getDimensionPixelSize(index, 0);
-            throw new UnsupportedOperationException(getPositionDescription()
-                    + ": You must supply a " + name + " attribute.");
+            return getDimensionPixelSize(index, def);
         }
         private Float dimenPx(int index) {
             String v = raw(index);
@@ -7104,8 +7170,7 @@ public class Resources {
                 // "no such dimen", which a real 0dp must not be confused with.
                 return r.macapkDimenPx(id);
             }
-            Resources r = getResources();
-            return TypedArray.macapkParseDimenLiteral(v, r != null ? r.getDisplayMetrics() : null);
+            return macapkParseDimenString(v);
         }
         @Override public float getFraction(int index, int base, int pbase, float def) {
             String v = raw(index);
@@ -7218,12 +7283,7 @@ public class Resources {
             }
             return true;
         }
-        /** AOSP: null when the slot holds no value (see TypedArray.peekValue). */
         @Override public android.util.TypedValue peekValue(int index) {
-            android.util.TypedValue v = new android.util.TypedValue();
-            return getValue(index, v) && v.type != android.util.TypedValue.TYPE_NULL ? v : null;
-        }
-        @Override public android.util.TypedValue macapkPeekRecord(int index) {
             android.util.TypedValue v = new android.util.TypedValue();
             getValue(index, v);
             return v;

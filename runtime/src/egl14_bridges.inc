@@ -455,72 +455,6 @@ bool egl14_win_swap(JNIEnv* env, const Egl14Win& w) {
     return true;
 }
 
-// ---- The native half of an EGL14 window (GitHub #16) ----
-//
-// An app may create the window through Java EGL14 and hand the handles to C++
-// that renders and swaps through the NDK's libEGL: MapLibre Native's Android GL
-// backend does (EGL14.eglCreateWindowSurface on a TextureView's SurfaceTexture,
-// then a native eglMakeCurrent / draw / eglSwapBuffers on its render thread), and
-// so does Rive (RiveEGLSurface.getSurfaceNativePointer). On a device both
-// libraries are one libEGL and one window, so the native swap queues the frame
-// to the SurfaceTexture exactly as the Java one does. Here the window is a
-// pbuffer whose present (readback + queue) lived only in EGL14_eglSwapBuffers,
-// so a native swap was a pbuffer flush and the TextureView stayed blank; the
-// reporter's extra Java EGL14.eglSwapBuffers after each frame made it appear.
-// This was OPEN 1 of docs/egl14-window-surface_2026-09-26.md.
-//
-// The bionic shim's __macapk_arm64_eglSwapBuffers / eglMakeCurrent /
-// eglQuerySurface call these through extern "C" exports defined after the
-// namespace in native_methods.cpp (__macapk_egl14_window_swap / _resolve),
-// looked up with dlsym(RTLD_DEFAULT), the way the shim already reaches
-// CocoaEnsureNativeEglLayer. A process without them (a harness, an older
-// runtime) keeps the plain ANGLE forward. With MACAPK_EGL14_WINDOW_REAL=0 the
-// registry is always empty, so both answer "not a window".
-
-// The pbuffer behind an app's window handle, for the shim's native bridges
-// (any other surface is returned unchanged).
-__attribute__((unused)) void* egl14_native_resolve(void* dpy, void* s) {
-    return egl14_win_cur(dpy, s);
-}
-
-// The window half of a NATIVE eglSwapBuffers: -1 when `s` is not an EGL14
-// window (the caller swaps it as before), else the readback + queue of
-// egl14_win_swap ran on this thread (1), or its upcall threw (0: logged and
-// cleared, since no Java caller is there to receive it). The caller then swaps
-// egl14_native_resolve(dpy, s), as EGL14_eglSwapBuffers does. A render thread
-// the JVM does not know is attached for the call and detached after it.
-__attribute__((unused)) int egl14_native_swap(void* dpy, void* s) {
-    Egl14Win w;
-    if (!s || !egl14_win_find(dpy, s, &w)) return -1;
-    // Looked up, not linked: the gate harnesses that include this file are not
-    // all linked against libjvm.
-    static auto getVms = (jint(*)(JavaVM**, jsize, jsize*))dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
-    JavaVM* vm = nullptr;
-    jsize n = 0;
-    if (!getVms || getVms(&vm, 1, &n) != JNI_OK || n < 1 || !vm) return -1;
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint rc = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
-    if (rc == JNI_EDETACHED) {
-        if (vm->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
-            return -1;
-        attached = true;
-    } else if (rc != JNI_OK || !env) {
-        return -1;
-    }
-    int r = 1;
-    if (!egl14_upcalls(env) || env->ExceptionCheck()) {
-        r = -1;
-    } else if (!egl14_win_swap(env, w)) {
-        fprintf(stderr, "[egl14] native eglSwapBuffers: the window's frame upcall threw\n");
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        r = 0;
-    }
-    if (attached) vm->DetachCurrentThread();
-    return r;
-}
-
 // ===================== EGL14 =====================
 jint EGL14_eglGetError(JNIEnv*, jclass) {
     static auto p = (MEGLint(*)())gl3_resolve("eglGetError");
@@ -653,7 +587,8 @@ jboolean EGL14_eglChooseConfig(JNIEnv* env, jclass, jobject dpy,
     MEGLint n = 0;
     // Copy, not pin: the boxConfig loop below runs while `al` is in scope.
     IntAttribs al(env, attribs, attOff);
-    const MEGLint* alist = al.get();
+    static_assert(sizeof(jint) == sizeof(MEGLint), "jint and EGLint must both be 32-bit");
+    const MEGLint* alist = reinterpret_cast<const MEGLint*>(al.get());
     MEGLBoolean r = p(egl_h(env, dpy), alist, configs ? tmp.data() : nullptr, cfgSize, &n);
     if (num) { AttribGuard g(env, num); if (g.base) g.base[numOff] = n; }
     if (configs && r) {
@@ -686,45 +621,10 @@ jobject EGL14_eglCreateWindowSurface(JNIEnv* env, jclass, jobject dpy, jobject c
         egl14_win_add(d, s);
         return boxSurface(env, s);
     }
-    static auto p = (MEGLSurface(*)(MEGLDisplay, MEGLConfig, MEGLNativeWindow, const MEGLint*))gl3_resolve("eglCreateWindowSurface");
-    if (r == -2) {
-        // A SurfaceView's Surface (GitHub #15): a real ANGLE window on the
-        // SurfaceView's native window, the dedicated native-EGL CAMetalLayer
-        // (ANGLE-Metal takes a CALayer as its EGLNativeWindowType). The same
-        // window ANativeWindow_fromSurface + the NDK eglCreateWindowSurface
-        // make (__macapk_arm64_egl_create_window_surface_bridge) and the
-        // EGL10 survivor path makes (angle_glue.cpp CreateSurfaceViewWindow),
-        // so it presents through ANGLE's own swap from Java or native code and
-        // is destroyed by a plain eglDestroySurface; it is not registered.
-        // Looked up, not linked: the gate harnesses that include this file
-        // have no Cocoa bridge. No layer (no render view yet) refuses the way
-        // a window that cannot connect is refused, EGL_BAD_NATIVE_WINDOW.
-        static auto ensureLayer = (void*(*)(int*, int*))dlsym(RTLD_DEFAULT, "CocoaEnsureNativeEglLayer");
-        static auto noteLive = (void(*)())dlsym(RTLD_DEFAULT, "CocoaNoteNativeEglSurfaceLive");
-        void* c = egl_h(env, cfg);
-        int lw = 0, lh = 0;
-        void* layer = ensureLayer ? ensureLayer(&lw, &lh) : nullptr;
-        if (!layer) {
-            fprintf(stderr, "[egl14] eglCreateWindowSurface(SurfaceView): no native-EGL "
-                    "layer (no render view yet) -> EGL_NO_SURFACE\n");
-            if (p) p(d, c, nullptr, nullptr);
-            return boxSurface(env, nullptr);
-        }
-        // MacApkGlWindow already applied AOSP's checks (offset >= 0, EGL_NONE
-        // present); copy, do not pin, since EGL runs arbitrary work first.
-        IntAttribs al(env, attribs, attOff);
-        void* s = p ? p(d, c, layer, al.get()) : nullptr;
-        al.release();   // before any JNI call (a pre-fix pin is a critical section)
-        if (s) {
-            if (noteLive) noteLive();
-            fprintf(stderr, "[egl14] eglCreateWindowSurface(SurfaceView) -> EGLSurface %p on "
-                    "native-EGL layer %p (%dx%d)\n", s, layer, lw, lh);
-        }
-        return boxSurface(env, s);   // a refusal leaves ANGLE's own error
-    }
     if (r == 0) {
         // Not a stream: let ANGLE refuse a window it cannot use. The attrib
         // list is not passed: both loaders reject the window before reading it.
+        static auto p = (MEGLSurface(*)(MEGLDisplay, MEGLConfig, MEGLNativeWindow, const MEGLint*))gl3_resolve("eglCreateWindowSurface");
         void* c = egl_h(env, cfg);
         if (p) p(d, c, nullptr, nullptr);
         return boxSurface(env, nullptr);
@@ -738,7 +638,8 @@ jobject EGL14_eglCreatePbufferSurface(JNIEnv* env, jclass, jobject dpy, jobject 
     if (!gl3_check_offset(env, attribs, attOff, "eglCreatePbufferSurface: attrib_list offset out of range"))
         return boxSurface(env, nullptr);
     IntAttribs al(env, attribs, attOff);   // copy, not pin: egl_h + boxSurface below
-    const MEGLint* alist = al.get();
+    static_assert(sizeof(jint) == sizeof(MEGLint), "jint and EGLint must both be 32-bit");
+    const MEGLint* alist = reinterpret_cast<const MEGLint*>(al.get());
     void* s = p ? p(egl_h(env, dpy), egl_h(env, cfg), alist) : nullptr;
     return boxSurface(env, s);
 }
@@ -798,7 +699,8 @@ jobject EGL14_eglCreatePbufferFromClientBuffer(JNIEnv* env, jclass, jobject dpy,
     if (!gl3_check_offset(env, attribs, attOff, "eglCreatePbufferFromClientBuffer: attrib_list offset out of range"))
         return boxSurface(env, nullptr);
     IntAttribs al(env, attribs, attOff);   // copy, not pin: egl_h + boxSurface below
-    const MEGLint* alist = al.get();
+    static_assert(sizeof(jint) == sizeof(MEGLint), "jint and EGLint must both be 32-bit");
+    const MEGLint* alist = reinterpret_cast<const MEGLint*>(al.get());
     void* s = p ? p(egl_h(env, dpy), buftype,
                     reinterpret_cast<void*>(static_cast<intptr_t>(buffer)),
                     egl_h(env, cfg), alist) : nullptr;
@@ -830,7 +732,8 @@ jobject EGL14_eglCreateContext(JNIEnv* env, jclass, jobject dpy, jobject cfg,
     if (!gl3_check_offset(env, attribs, attOff, "eglCreateContext: attrib_list offset out of range"))
         return boxContext(env, nullptr);
     IntAttribs al(env, attribs, attOff);   // copy, not pin: egl_h + boxContext below
-    const MEGLint* alist = al.get();
+    static_assert(sizeof(jint) == sizeof(MEGLint), "jint and EGLint must both be 32-bit");
+    const MEGLint* alist = reinterpret_cast<const MEGLint*>(al.get());
     void* c = p ? p(egl_h(env, dpy), egl_h(env, cfg), egl_h(env, share), alist) : nullptr;
     return boxContext(env, c);
 }

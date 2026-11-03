@@ -178,15 +178,15 @@ public class RecordingCanvas extends Canvas {
     // The op's KIND says whether our Canvas will make a REAL offscreen for it
     // (K_LAYER) or a plain save (K_STATE): pushLayer degenerates to save()
     // exactly when alpha is 255, the rule is SRC_OVER and the layer is not
-    // forced. Non-empty bounds OR a color filter force saveLayer offscreen,
-    // including a full-alpha, bounds-less filtered group. The hole pre-pass
-    // needs the difference: a hole inside a real layer stays in it.
+    // forced, and saveLayer forces one whenever its bounds are non-empty (a
+    // non-SRC_OVER rule needs bounds, so it never stands alone). The hole
+    // pre-pass needs the difference: a hole inside a real layer stays in it.
     private void layerOp(String method, MacApkDisplayList.Op o, boolean real) {
         rec.add(method, o, real ? MacApkDisplayList.K_LAYER : MacApkDisplayList.K_STATE);
     }
     private static boolean realAlphaLayer(int alpha) { return Math.max(0, Math.min(255, alpha)) < 255; }
     private static boolean realLayer(float l, float t, float r, float b, Paint p) {
-        return (r > l && b > t) || (p != null && (p.getAlpha() < 255 || p.getColorFilter() != null));
+        return (r > l && b > t) || (p != null && p.getAlpha() < 255);
     }
     private int layerState(float l, float t, float r, float b, boolean clips) {
         suppress++;

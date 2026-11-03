@@ -48,23 +48,6 @@ constexpr int kMetaAltOn   = 0x2;
 constexpr int kMetaCtrlOn  = 0x1000;
 constexpr int kMetaMetaOn  = 0x10000;
 
-// The meta state a POINTER event carries (GitHub #21): AOSP CursorInputMapper
-// stamps every motion event with getContext()->getGlobalMetaState(), the same
-// modifier set a key event reports. Mirrors MacKeyEventToAndroid's mapping
-// (Control -> CTRL, Option -> ALT, Command -> META, Shift -> SHIFT) plus Caps
-// Lock. No Command-as-Ctrl swap: that rule rewrites KEY CHORDS so Cmd+V pastes;
-// a pointer has no chord, and a Ctrl-drag is a physical Control key on a Mac.
-constexpr int kMetaCapsLockOn = 0x100000;
-inline int PointerMetaState(NSEventModifierFlags m) {
-    int meta = 0;
-    if (m & NSEventModifierFlagShift)    meta |= kMetaShiftOn;
-    if (m & NSEventModifierFlagOption)   meta |= kMetaAltOn;
-    if (m & NSEventModifierFlagControl)  meta |= kMetaCtrlOn;
-    if (m & NSEventModifierFlagCommand)  meta |= kMetaMetaOn;
-    if (m & NSEventModifierFlagCapsLock) meta |= kMetaCapsLockOn;
-    return meta;
-}
-
 inline bool CmdAsCtrlEnabled() {
     static const bool on = [] {
         const char* v = std::getenv("MACAPK_CMD_AS_CTRL");

@@ -182,7 +182,9 @@ public final class MacApkPackageManager extends PackageManager {
         // This is NOT a fabricated app: we really can open the URL, via
         // NSWorkspace. It advertises no capability we cannot honour -- note
         // resolveService stays null for CustomTabsService, which is what makes
-        // AppAuth set useCustomTab=false and fall back to plain ACTION_VIEW.
+        // AppAuth set useCustomTab=false and fall back to plain ACTION_VIEW --
+        // unless the runtime shows browser tabs itself (HostBrowserTab: a
+        // WebView2 window on Windows), where it answers HostCustomTabsService.
         if (MACAPK_HOST_PACKAGE.equals(packageName)) {
             PackageInfo hi = new PackageInfo();
             hi.packageName = MACAPK_HOST_PACKAGE;
@@ -192,6 +194,10 @@ public final class MacApkPackageManager extends PackageManager {
             hi.signatures = new android.content.pm.Signature[] {
                 new android.content.pm.Signature(new byte[0])
             };
+            // API 28+ callers read signingInfo instead (GET_SIGNING_CERTIFICATES):
+            // androidx.browser's Token.create(<browser>) for a TWA, Spotify's
+            // challenge launcher among them, dereferences it unchecked.
+            hi.signingInfo = new android.content.pm.SigningInfo(hi.signatures);
             android.content.pm.ApplicationInfo hai =
                 new android.content.pm.ApplicationInfo();
             hai.packageName = MACAPK_HOST_PACKAGE;
@@ -1221,10 +1227,8 @@ public final class MacApkPackageManager extends PackageManager {
         // WHY A DIRECTORY mtime. Removing (or adding) an entry updates the
         // containing directory's mtime, so one stat answers "could anything
         // have appeared or vanished" without walking bundles or stating each
-        // app. It is deliberately coarse: it costs a stat per bundle folder
-        // per PM query (/Applications and ~/Applications, where a user who
-        // cannot write /Applications gets their apps, GitHub #28) and
-        // over-fires (any change to either triggers it), which is the
+        // app. It is deliberately coarse: it costs one stat per PM query and
+        // over-fires (any /Applications change triggers it), which is the
         // right way round -- an extra reconcile is cheap and idempotent, a
         // missed one leaves a store lying about installed apps.
         //
@@ -1239,22 +1243,15 @@ public final class MacApkPackageManager extends PackageManager {
                 reconcileInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
         private static volatile long lastReconcileNanos = 0L;
 
-        /** Ask the helper to re-run its reconcile if a bundle folder changed.
+        /** Ask the helper to re-run its reconcile if /Applications changed.
          *  Never blocks the caller: a PM query must not wait on a subprocess.
          *  The rewritten registry is picked up by the NEXT snapshot() -- the
          *  same poll-driven honesty announceRemovals already documents. */
         private static void maybeReconcileBundles() {
-            // One number for both folders: a change to either moves it. A
-            // missing ~/Applications reads 0 and simply never moves.
+            java.io.File dir = new java.io.File("/Applications");
             long m;
-            try {
-                String[] roots = CrossAppLauncher.bundleRoots();
-                m = new java.io.File(roots[0]).lastModified();
-                if (m == 0L) return;
-                for (int i = 1; i < roots.length; i++) {
-                    m = m * 31 + new java.io.File(roots[i]).lastModified();
-                }
-            } catch (Throwable t) { return; }
+            try { m = dir.lastModified(); } catch (Throwable t) { return; }
+            if (m == 0L) return;
             long prev = bundlesDirMtime.getAndSet(m);
             if (prev < 0) return;          // first observation: baseline only
             if (prev == m) return;         // nothing appeared or vanished
@@ -1273,7 +1270,7 @@ public final class MacApkPackageManager extends PackageManager {
                             .redirectErrorStream(true).start();
                     p.getInputStream().close();
                     p.waitFor();
-                    logOnce("[PM.registry] a bundle folder changed; ran helper reconcile"
+                    logOnce("[PM.registry] /Applications changed; ran helper reconcile"
                             + " (a bundle may have been added or removed outside the"
                             + " install path)");
                 } catch (Throwable ignored) {
@@ -1437,11 +1434,6 @@ public final class MacApkPackageManager extends PackageManager {
                     // present when its code is gone, which is a state a device
                     // never has.
                     String state = a.optString("state", "installed");
-                    // "ok" is the pre-v1.0.2239 control panel's spelling of
-                    // installed (InstallCore.swift AppState.legacyInstalled).
-                    // Skipping it hid every drag-drop install from
-                    // PackageManager (issue #11: "0 installed row(s)").
-                    if ("ok".equals(state)) state = "installed";
                     if (!"installed".equals(state)) {
                         if ("removed".equals(state)) removed.add(pkg);
                         continue;
@@ -1555,131 +1547,7 @@ public final class MacApkPackageManager extends PackageManager {
             return true;
         }
         Manifest m = manifest();
-        if (m == null) return false;
-        if (m.queriesPackages.contains(pkg)) return true;
-        return macapkCanQueryViaComponents(m, pkg);
-    }
-
-    /** MACAPK_QUERIES_INTENT (default ON; =0 = only <queries><package>, the old
-     *  answer): AppsFilterUtils.canQueryViaComponents (android14-release).
-     *  A <queries><intent> makes a package visible when one of its EXPORTED
-     *  activities / services / receivers has a filter the intent matches
-     *  (matchesPackage -> matchesAnyComponents -> IntentFilter.match with
-     *  supportWildcards = true); a <queries><provider> when one of its exported
-     *  providers carries the authority (matchesProviders). Game frontends
-     *  (iiSU) and launchers declare these instead of QUERY_ALL_PACKAGES. */
-    private static final boolean QUERIES_INTENT =
-        !"0".equals(System.getenv("MACAPK_QUERIES_INTENT"));
-    /** pkg -> {target Manifest, Boolean}: the answer, recomputed when the target's
-     *  parsed manifest changes (registryManifest re-parses on an APK update). */
-    private final java.util.concurrent.ConcurrentHashMap<String, Object[]> mQueriesVisible =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    private boolean macapkCanQueryViaComponents(Manifest querying, String pkg) {
-        if (!QUERIES_INTENT) return false;
-        if (querying.queriesIntents.isEmpty() && querying.queriesProviders.isEmpty()) return false;
-        if (!InstalledRegistry.enabled()) return false;
-        Manifest target = registryManifest(InstalledRegistry.lookup(pkg));
-        if (target == null) return false;
-        Object[] c = mQueriesVisible.get(pkg);
-        if (c != null && c[0] == target) return (Boolean) c[1];
-        boolean v = false;
-        for (Manifest.QueriesIntent q : querying.queriesIntents) {
-            if (macapkQueriesMatchesPackage(q, target)) { v = true; break; }
-        }
-        if (!v && !querying.queriesProviders.isEmpty()) {
-            for (Manifest.ProviderEntry pe : target.providers) {
-                if (!pe.exported || pe.authorities == null) continue;
-                for (String a : pe.authorities.split(";")) {
-                    if (querying.queriesProviders.contains(a)) { v = true; break; }
-                }
-                if (v) break;
-            }
-        }
-        mQueriesVisible.put(pkg, new Object[] { target, v });
-        return v;
-    }
-
-    /** AppsFilterUtils.matchesPackage: services, activities, receivers. (Its
-     *  provider leg matches provider intent-filters, which our manifest model
-     *  does not carry; providers are reached through <queries><provider>.) */
-    private static boolean macapkQueriesMatchesPackage(Manifest.QueriesIntent q, Manifest t) {
-        for (Manifest.ServiceEntry se : t.services.values()) {
-            if (se.exported && macapkQueriesMatchesAny(q, se.filters)) return true;
-        }
-        for (Manifest.ActivityEntry ae : t.activities.values()) {
-            if (ae.exported && macapkQueriesMatchesAny(q, ae.filters)) return true;
-        }
-        for (Manifest.ActivityEntry re : t.receivers.values()) {
-            if (re.exported && macapkQueriesMatchesAny(q, re.filters)) return true;
-        }
-        return false;
-    }
-
-    private static boolean macapkQueriesMatchesAny(Manifest.QueriesIntent q,
-            java.util.List<Manifest.IntentFilterEntry> filters) {
-        if (filters == null) return false;
-        for (Manifest.IntentFilterEntry f : filters) {
-            if (macapkQueriesIntentMatches(q, f)) return true;
-        }
-        return false;
-    }
-
-    /** IntentFilter.match(action, type, scheme, data, categories, tag,
-     *  supportWildcards = true) for a <queries><intent>, over the four dimensions
-     *  our filter model keeps (action, categories, scheme, MIME type; host and
-     *  path are not modelled, and a queries intent's path is always the wildcard).
-     *  android14-release IntentFilter.java: match :2338, matchAction :834,
-     *  matchData :1647, findMimeType :2997, matchCategories :1790. */
-    static boolean macapkQueriesIntentMatches(Manifest.QueriesIntent q,
-            Manifest.IntentFilterEntry f) {
-        // matchAction: a null action matches; otherwise the filter must list it.
-        if (q.action != null && !f.actions.contains(q.action)) return false;
-        // matchData.
-        final boolean hasTypes = !f.mimeTypes.isEmpty();
-        final boolean hasSchemes = !f.schemes.isEmpty();
-        final boolean hasDataUri = q.scheme != null;
-        if (!hasTypes && !hasSchemes) {
-            if (q.type != null || hasDataUri) return false;
-        } else {
-            if (hasSchemes) {
-                String sc = q.scheme != null ? q.scheme : "";
-                if (!f.schemes.contains(sc) && !"*".equals(sc)) return false;
-            } else if (q.scheme != null && !q.scheme.isEmpty() && !"content".equals(q.scheme)
-                    && !"file".equals(q.scheme) && !"*".equals(q.scheme)) {
-                return false;
-            }
-            if (hasTypes) {
-                if (!macapkFindMimeType(f.mimeTypes, q.type)) return false;
-            } else if (q.type != null) {
-                return false;
-            }
-        }
-        // matchCategories: every category of the intent must be in the filter.
-        for (String c : q.categories) {
-            if (!f.categories.contains(c)) return false;
-        }
-        return true;
-    }
-
-    /** IntentFilter.findMimeType, for types as the manifest declares them. */
-    private static boolean macapkFindMimeType(java.util.List<String> t, String type) {
-        if (type == null) return false;
-        if (t.contains(type)) return true;
-        if (type.equals("*/*")) return !t.isEmpty();
-        // a filter type of "*" or "*/*" accepts every type (hasPartialTypes + "*")
-        if (t.contains("*") || t.contains("*/*")) return true;
-        int slash = type.indexOf('/');
-        if (slash > 0) {
-            String base = type.substring(0, slash);
-            if (t.contains(base) || t.contains(base + "/*")) return true;
-            if (type.length() == slash + 2 && type.charAt(slash + 1) == '*') {
-                for (String v : t) {
-                    if (type.regionMatches(0, v, 0, slash + 1)) return true;
-                }
-            }
-        }
-        return false;
+        return m != null && m.queriesPackages.contains(pkg);
     }
 
     /** PackageInfo for a registry-installed package, or null when the registry
@@ -1790,8 +1658,10 @@ public final class MacApkPackageManager extends PackageManager {
                     // The primary instruction set the installer extracted (apk_unpacker
                     // AbiToIsa: arm64-v8a -> arm64, armeabi[-v7a] -> arm); arm64 when the
                     // package ships no native code, as a device reports its own ISA.
-                    String isa = new java.io.File(libRoot, "arm64").isDirectory() ? "arm64"
-                               : new java.io.File(libRoot, "arm").isDirectory() ? "arm" : "arm64";
+                    String hostIsa = InstalledSplits.isaOf(android.os.Build.CPU_ABI);
+                    String isa = new java.io.File(libRoot, hostIsa).isDirectory() ? hostIsa
+                               : new java.io.File(libRoot, "arm64").isDirectory() ? "arm64"
+                               : new java.io.File(libRoot, "arm").isDirectory() ? "arm" : hostIsa;
                     ai.nativeLibraryDir = new java.io.File(libRoot, isa).getAbsolutePath();
                 }
             }
@@ -1839,62 +1709,6 @@ public final class MacApkPackageManager extends PackageManager {
         return REGISTRY_ACTIVITIES && InstalledRegistry.enabled();
     }
 
-    /** path -> {mtime, Drawable.ConstantState-free Bitmap}: decoded bundle icons. */
-    private static final java.util.concurrent.ConcurrentHashMap<String, Object[]> sRegistryIcons =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** Another installed Mac.apk app's icon: Contents/Resources/AppIcon.png of its
-     *  bundle (launcher/BundleGenerator.swift renders it from the APK's own
-     *  launcher icon at install). Only for a package the caller can see, like
-     *  every other answer about it; null otherwise and for the running app, whose
-     *  own Resources answer. MACAPK_XAPP_IMPLICIT=0 -> null (the old default icon). */
-    @Override
-    protected android.graphics.drawable.Drawable macapkRegistryAppIcon(String pkg) {
-        if (!XAPP_IMPLICIT || pkg == null || pkg.equals(packageName)) return null;
-        if (!macapkRegistryActivities() || !packageVisible(pkg)) return null;
-        InstalledRegistry.Row row = InstalledRegistry.lookup(pkg);
-        if (row == null || row.bundlePath == null) return null;
-        java.io.File f = new java.io.File(row.bundlePath, "Contents/Resources/AppIcon.png");
-        if (!f.isFile()) return null;
-        String key = f.getPath();
-        long mt = f.lastModified();
-        Object[] c = sRegistryIcons.get(key);
-        android.graphics.Bitmap bm = (c != null && (Long) c[0] == mt) ? (android.graphics.Bitmap) c[1] : null;
-        if (bm == null) {
-            try {
-                bm = android.graphics.BitmapFactory.decodeFile(key);
-            } catch (Throwable t) {
-                bm = null;
-            }
-            if (bm == null) return null;
-            sRegistryIcons.put(key, new Object[] { mt, bm });
-        }
-        android.app.Application app = android.app.Application.macapk_get();
-        return new android.graphics.drawable.BitmapDrawable(
-                app != null ? app.getResources() : null, bm);
-    }
-
-    /** Stage 4 gate (default ON; =0 restores package-scoped-only registry rows). */
-    private static final boolean XAPP_IMPLICIT =
-        !"0".equals(System.getenv("MACAPK_XAPP_IMPLICIT"));
-    static boolean macapkXappImplicit() { return XAPP_IMPLICIT; }
-
-    /** True while ActivityHost resolves a START (resolveForStart): registry rows are
-     *  then not narrowed by package visibility, as ComputerEngine does for a start. */
-    private static final ThreadLocal<Boolean> FOR_START = ThreadLocal.withInitial(() -> false);
-
-    /** queryIntentActivities in START mode (see FOR_START). */
-    public static java.util.List<ResolveInfo> macapkQueryForStart(
-            android.content.pm.PackageManager pm, Intent intent, int flags) {
-        final boolean prev = FOR_START.get();
-        FOR_START.set(true);
-        try {
-            return pm.queryIntentActivities(intent, flags);
-        } finally {
-            FOR_START.set(prev);
-        }
-    }
-
     /** apk path -> {mtime, size, Manifest}: a registry app's parsed manifest,
      *  re-parsed only when its installed APK changes (an update rewrites it). */
     private static final java.util.concurrent.ConcurrentHashMap<String, Object[]> sRegistryManifests =
@@ -1926,18 +1740,6 @@ public final class MacApkPackageManager extends PackageManager {
     private android.content.pm.ActivityInfo registryActivityInfo(
             InstalledRegistry.Row row, Manifest.ActivityEntry e, int flags) {
         android.content.pm.ActivityInfo info = toActivityInfo(e, flags);
-        // toActivityInfo resolves @-references against THIS app's resource table,
-        // so for another app's component those ids name nothing of theirs (or
-        // something of ours). Drop them: loadLabel then falls back to the
-        // application label (the registry row's), and loadIcon to the app icon
-        // (macapkRegistryAppIcon). A literal android:label is kept.
-        // MACAPK_XAPP_IMPLICIT=0 keeps the old ids.
-        if (XAPP_IMPLICIT) {
-            info.icon = 0;
-            info.logo = 0;
-            info.labelRes = 0;
-            info.theme = 0;
-        }
         info.packageName = row.pkg;
         info.processName = e.processName != null ? e.processName : row.pkg;
         if (e.taskAffinity == null) info.taskAffinity = row.pkg;
@@ -2940,26 +2742,6 @@ public final class MacApkPackageManager extends PackageManager {
             registryScan(want, query, resolvedType, flags, null, order, defaultOnly,
                     perPackage, clamp, out, cuts);
         }
-        // Stage 4 (MACAPK_XAPP_IMPLICIT, docs/cross-app-launch-and-implicit-start-design_2026-09-26.md
-        // section 9): an UNSCOPED implicit query also scans every installed Mac.apk
-        // app's manifest, as ComputerEngine.queryIntentActivitiesInternal unions all
-        // installed packages. A query is narrowed by package visibility
-        // (shouldFilterApplication); a START is not (ComputerEngine :561-569, :777),
-        // which macapkQueryForStart marks. Web intents never take a registry row
-        // unless setPackage names the app: Android 12+ opens an unverified web link
-        // in the browser and we never verify Digital Asset Links (CDD 3.2.3.2 C-0-4).
-        // This is what a launcher or a game frontend's MAIN + LAUNCHER query, and an
-        // ACTION_VIEW of a file type, need to see the other installed apps.
-        if (explicit == null && intent.getPackage() == null && macapkXappImplicit()
-                && macapkRegistryActivities() && !ActivityHost.macapkWebIntent(query)) {
-            final boolean forStart = FOR_START.get();
-            for (InstalledRegistry.Row r : InstalledRegistry.allBest()) {
-                if (r.pkg.equals(packageName)) continue;
-                if (!forStart && !packageVisible(r.pkg)) continue;
-                registryScan(r.pkg, query, resolvedType, flags, null, order, defaultOnly,
-                        perPackage, clamp, out, cuts);
-            }
-        }
         if (order) aospSortResults(out, cuts);
         // ⚠ v1.0.938: THE HOST HANDOFF. Mac.apk already routes some implicit
         // intents to macOS -- ACTION_VIEW of an http/https/geo/mailto/tel URI,
@@ -3006,11 +2788,16 @@ public final class MacApkPackageManager extends PackageManager {
         // The host rows are appended AFTER the app rows even though
         // MACAPK_PM_RESOLVE_ORDER sorts those: on a device they would take part
         // in RESOLVE_PRIORITY_SORTER, and a system browser wins a tie on
-        // `system`, but whether the app's own row would tie depends on the
-        // `<data android:host>` match category, which Manifest does not parse yet
-        // (docs/pm-intent-resolution-scope-and-matchdata_2026-09-26.md
-        // section 3). Sorting them in before that lands would hand resolveActivity
-        // to the browser for every app with an https deep link. Tracked in
+        // `system`. With the `<data>` authority modelled
+        // (MACAPK_INTENT_DATA_MATCH, macapkFrameworkFilter) an app's deep-link
+        // row for a web URI matched one of its declared hosts, i.e. with
+        // MATCH_CATEGORY_HOST or better, which outranks a browser's scheme-only
+        // MATCH_CATEGORY_SCHEME, so for those "app rows first" is also the
+        // sorter's order (only an app whose http filter names no host -- a
+        // browser itself -- would tie). And a URI on no declared host -- androidx.browser's
+        // and AppAuth's host-less "which apps are browsers?" probe included --
+        // lists the browser row alone, so an app with https deep links no
+        // longer looks like a browser to itself. Tracked in
         // docs/pm-service-selector-and-resolver-order_2026-09-26.md.
         //
         // ⚠ The host rows are OTHER PACKAGES (com.macapk.host,
@@ -3057,9 +2844,6 @@ public final class MacApkPackageManager extends PackageManager {
                         ? SpecialAccessHandler.appDetailsResolveInfo()
                         : act.kind == ActivityHost.HostAction.Kind.DOCUMENT_PICKER
                         ? macapkDocumentsUiResolveInfo(hostQuery)
-                        : act.kind == ActivityHost.HostAction.Kind.INSTALL_PACKAGE
-                                && macapkInstallerComponent()
-                        ? macapkInstallerResolveInfo(hostQuery)
                         : macapkHostResolveInfo(hostQuery);
                 boolean listed = want == null
                         || (row != null && row.activityInfo != null
@@ -3172,55 +2956,6 @@ public final class MacApkPackageManager extends PackageManager {
         ai.enabled = true;
         android.content.pm.ApplicationInfo app = new android.content.pm.ApplicationInfo();
         app.packageName = MACAPK_HOST_PACKAGE;
-        ai.applicationInfo = app;
-        ri.activityInfo = ai;
-        return ri;
-    }
-
-    /** The platform package installer as a device lists it. On a Google
-     *  device the PackageInstaller app is package
-     *  com.google.android.packageinstaller, and the activity that takes
-     *  {VIEW, INSTALL_PACKAGE} x {file, content} x
-     *  application/vnd.android.package-archive is
-     *  com.android.packageinstaller.InstallStart (packages/apps/PackageInstaller
-     *  AndroidManifest.xml). Stores pick it out of queryIntentActivities BY
-     *  PACKAGE NAME and pin it: the Epic Games Store's AndroidInstaller keeps
-     *  the row whose package is com.android.packageinstaller or
-     *  com.google.android.packageinstaller and setClassName()s it, and with only
-     *  the generic com.macapk.host row the start stayed implicit and went to the
-     *  first app row instead (Organic Maps), so the install never ran.
-     *  ActivityHost hands an explicit start of this component to the same
-     *  installer surface (InstallIntentHandler). MACAPK_PM_INSTALLER_COMPONENT=0
-     *  lists the com.macapk.host row instead (pre-change). */
-    static final String MACAPK_INSTALLER_PACKAGE = "com.google.android.packageinstaller";
-    static final String MACAPK_INSTALLER_ACTIVITY = "com.android.packageinstaller.InstallStart";
-    static boolean macapkInstallerComponent() {
-        return !"0".equals(System.getenv("MACAPK_PM_INSTALLER_COMPONENT"));
-    }
-    static boolean macapkIsInstallerPackage(String pkg) {
-        return MACAPK_INSTALLER_PACKAGE.equals(pkg) || "com.android.packageinstaller".equals(pkg);
-    }
-    private static ResolveInfo macapkInstallerResolveInfo(Intent intent) {
-        ResolveInfo ri = new ResolveInfo();
-        android.content.IntentFilter f = new android.content.IntentFilter();
-        String action = intent != null ? intent.getAction() : null;
-        f.addAction(action != null ? action : Intent.ACTION_VIEW);
-        f.addCategory(Intent.CATEGORY_DEFAULT);
-        android.net.Uri data = intent != null ? intent.getData() : null;
-        String scheme = data != null ? data.getScheme() : null;
-        if (scheme != null && !scheme.isEmpty()) f.addDataScheme(scheme);
-        try {
-            f.addDataType("application/vnd.android.package-archive");
-        } catch (Throwable ignored) {
-        }
-        ri.filter = f;
-        android.content.pm.ActivityInfo ai = new android.content.pm.ActivityInfo();
-        ai.name = MACAPK_INSTALLER_ACTIVITY;
-        ai.packageName = MACAPK_INSTALLER_PACKAGE;
-        ai.exported = true;
-        ai.enabled = true;
-        android.content.pm.ApplicationInfo app = new android.content.pm.ApplicationInfo();
-        app.packageName = MACAPK_INSTALLER_PACKAGE;
         ai.applicationInfo = app;
         ri.activityInfo = ai;
         return ri;
@@ -3524,16 +3259,21 @@ public final class MacApkPackageManager extends PackageManager {
      *  install failure, so no such filter exists on a device. Treating it as
      *  "matches nothing" is the conservative reading; dropping only the bad
      *  type would widen the filter into an untyped one, the opposite error.
+     *  The same holds for a port that is not a number (AuthorityEntry's
+     *  Integer.parseInt throws) and a pathAdvancedPattern / sspAdvancedPattern
+     *  that PatternMatcher rejects (IllegalArgumentException).
      *
-     *  ⚠ NOT YET MODELLED: <data> host / port / path* / ssp*. Manifest's
-     *  IntentFilterEntry does not parse them, so a filter that names a scheme
-     *  still matches every authority of that scheme -- over-permissive in the
-     *  same direction as before, never newly restrictive. The IntentFilter
-     *  below already implements matchDataAuthority / hasDataPath /
-     *  hasDataSchemeSpecificPart; the follow-up is only to parse those
-     *  attributes and add them here (addDataAuthority / addDataPath /
-     *  addDataSchemeSpecificPart). Written up in
-     *  docs/pm-intent-resolution-scope-and-matchdata_2026-09-26.md. */
+     *  The `<data>` authority, path and ssp constraints (MACAPK_INTENT_DATA_MATCH,
+     *  default ON) are added exactly as ParsedIntentInfoUtils.parseData adds
+     *  them -- addDataSchemeSpecificPart, addDataAuthority(host, port),
+     *  addDataPath -- so IntentFilter.matchData applies AOSP's rules: a filter
+     *  that names hosts matches only a URI whose host is one of them ("*." a
+     *  suffix, "*" any non-null host), with the port when one is given, and
+     *  then only a path one of its path patterns accepts. A URI with no host
+     *  (Uri.fromParts("http", "", null), androidx.browser's / AppAuth's
+     *  "which apps are browsers?" probe) matches no such filter, so an app's
+     *  own https deep links no longer make it look like a browser. "0"
+     *  restores the scheme-only filter (any authority of a declared scheme). */
     private static android.content.IntentFilter macapkFrameworkFilter(Manifest.IntentFilterEntry f,
                                                                       java.util.List<String> schemes,
                                                                       java.util.List<String> types) {
@@ -3546,9 +3286,35 @@ public final class MacApkPackageManager extends PackageManager {
         } catch (android.content.IntentFilter.MalformedMimeTypeException bad) {
             return null;
         }
+        if (macapkIntentDataUriMatch()) {
+            try {
+                for (Manifest.DataPattern p : f.ssps) {
+                    real.addDataSchemeSpecificPart(macapkResolvedDataValue(p.value), p.type);
+                }
+                for (int i = 0; i < f.hosts.size(); i++) {
+                    String port = f.ports.get(i);
+                    real.addDataAuthority(macapkResolvedDataValue(f.hosts.get(i)),
+                            port != null ? macapkResolvedDataValue(port) : null);
+                }
+                for (Manifest.DataPattern p : f.paths) {
+                    real.addDataPath(macapkResolvedDataValue(p.value), p.type);
+                }
+            } catch (RuntimeException bad) {
+                return null;
+            }
+        }
         real.setPriority(f.priority);
         return real;
     }
+
+    /** MACAPK_INTENT_DATA_MATCH (default ON): manifest filters carry their
+     *  `<data>` host / port / path* / ssp* constraints into matching (see
+     *  macapkFrameworkFilter). "0" matches on scheme and type alone, as before. */
+    static boolean macapkIntentDataUriMatch() {
+        return INTENT_DATA_URI_MATCH;
+    }
+    private static final boolean INTENT_DATA_URI_MATCH =
+            !"0".equals(System.getenv("MACAPK_INTENT_DATA_MATCH"));
 
     /** MACAPK_PM_INTENT_DATA_RESREF (default ON; only consulted on the
      *  MACAPK_PM_INTENT_MATCH_DATA path, so MATCH_DATA=0 also restores the raw
@@ -3581,7 +3347,7 @@ public final class MacApkPackageManager extends PackageManager {
      *  ResourceIndex does not report changing-configurations, and a redirect
      *  scheme is translatable="false" in every SDK seen, so the default-config
      *  value is used. */
-    static java.util.List<String> macapkResolvedDataValues(java.util.List<String> raw) {
+    private static java.util.List<String> macapkResolvedDataValues(java.util.List<String> raw) {
         if (raw.isEmpty() || !macapkIntentDataResRef()) return raw;
         java.util.List<String> out = null;
         for (int i = 0; i < raw.size(); i++) {
@@ -4456,11 +4222,17 @@ public final class MacApkPackageManager extends PackageManager {
         // opt-out). The answer is still PROBED off networksetup's hardware-port
         // table rather than assumed -- see MacApkHostNetwork.hasWifiHardware.
         try {
-            if (android.net.ConnectivityManager.macapkHostHasWifiHardware())
+            if (android.net.ConnectivityManager.macapkHostHasWifiHardware()
+                    || HostRadios.wifiState() >= 0)
                 f.add("android.hardware.wifi");
         } catch (Throwable t) {
             f.add("android.hardware.wifi");
         }
+        // FEATURE_BLUETOOTH: only when the host reports a radio, which is also
+        // when BluetoothAdapter.getDefaultAdapter() is non-null. Not LE: there
+        // is no LE scanner behind BluetoothLeScanner, and an app that sees
+        // bluetooth_le goes looking for devices it can never find.
+        if (HostRadios.bluetoothRadio() != null) f.add("android.hardware.bluetooth");
         // FEATURE_RAM_NORMAL ("android.hardware.ram.normal"). AOSP's doc
         // string ties it to exactly one call: "The device's
         // ActivityManager.isLowRamDevice() method returns false." That method
@@ -4840,7 +4612,7 @@ public final class MacApkPackageManager extends PackageManager {
         // toActivityInfo already did this; these two were simply missed.
         info.applicationInfo = makeAppInfo(flags);
         info.name        = entry.name;
-        info.authority   = entry.authorities;
+        info.authority   = entry.resolvedAuthorities(null);
         info.packageName = this.packageName;
         // The MANIFEST value, never the runtime-resolved one. AOSP puts the
         // manifest value in the info object (PackageInfoUtils.java:829) and applies
@@ -4874,9 +4646,10 @@ public final class MacApkPackageManager extends PackageManager {
     @Override public ProviderInfo resolveContentProvider(String authority, int flags) {
         if (authority == null) return null;
         for (Manifest.ProviderEntry entry : providers.values()) {
-            if (entry.authorities == null) continue;
+            final String authorities = entry.resolvedAuthorities(null);
+            if (authorities == null) continue;
             boolean match = false;
-            for (String a : entry.authorities.split(";")) {
+            for (String a : authorities.split(";")) {
                 if (authority.equals(a.trim())) { match = true; break; }
             }
             if (!match) continue;
@@ -4896,7 +4669,7 @@ public final class MacApkPackageManager extends PackageManager {
             // toActivityInfo already did this; these two were simply missed.
             info.applicationInfo = makeAppInfo(flags);
             info.name        = entry.name;
-            info.authority   = entry.authorities;
+            info.authority   = authorities;
             info.packageName = this.packageName;
             // The MANIFEST value, never the runtime-resolved one. AOSP puts the
             // manifest value in the info object (PackageInfoUtils.java:829) and applies
@@ -5551,14 +5324,31 @@ public final class MacApkPackageManager extends PackageManager {
     /** A boolean `<application>` attribute with AOSP's default for an undeclared
      *  one. The binary manifest renders TYPE_INT_BOOLEAN as "true"/"false"; the
      *  apktool decode writes the same spellings. */
+    private static boolean macapkRtlLogged;
+
     private boolean appAttrBool(String name, boolean def) {
         String v = appAttr(name);
         if (v == null) return def;
         if ("true".equalsIgnoreCase(v))  return true;
         if ("false".equalsIgnoreCase(v)) return false;
-        // A reference or an int-encoded boolean ("1"/"0").
-        if ("1".equals(v)) return true;
-        if ("0".equals(v)) return false;
+        // A reference to a bool resource ("@bool/x", "@0x7f05..."), which the
+        // parser hands on as the reference: resolved against the app's table,
+        // as PackageParser's TypedArray.getBoolean does. Apps that pick
+        // supportsRtl per configuration (WhatsApp) declare it this way, and
+        // reading the default false left every one of them mirrored nowhere.
+        if (v.charAt(0) == '@') {
+            try {
+                int id = resolveResRef(v, "bool");
+                Object idx = android.content.res.Resources.macapkGetResourceIndex();
+                if (id != 0 && idx instanceof ResourceIndex) {
+                    Boolean b = ((ResourceIndex) idx).getBoolById(id);
+                    if (b != null) return b;
+                }
+            } catch (Throwable ignored) {}
+            return def;
+        }
+        // An int-encoded boolean: any nonzero value is true (aapt writes -1).
+        try { return Long.parseLong(v) != 0; } catch (NumberFormatException ignored) {}
         return def;
     }
 
@@ -5634,7 +5424,13 @@ public final class MacApkPackageManager extends PackageManager {
         if (appAttrBool("hardwareAccelerated", targetSdk >= 14))
             f |= ApplicationInfo.FLAG_HARDWARE_ACCELERATED;
         // android:supportsRtl defaults to false regardless of targetSdk.
-        if (appAttrBool("supportsRtl", false))        f |= ApplicationInfo.FLAG_SUPPORTS_RTL;
+        final boolean rtl = appAttrBool("supportsRtl", false);
+        if (rtl) f |= ApplicationInfo.FLAG_SUPPORTS_RTL;
+        if (!macapkRtlLogged) {
+            macapkRtlLogged = true;
+            NativeLog.i("Mac.apk.PM", "supportsRtl=\"" + appAttr("supportsRtl") + "\" -> " + rtl
+                      + (android.content.res.Resources.macapkGetResourceIndex() == null ? " (no resource index yet)" : ""));
+        }
         // android:usesCleartextTraffic defaults to true BELOW targetSdk 28 and
         // false from 28 (Pie) on. Mac.apk enforces no cleartext policy, but the
         // flag is what an app's own networking layer reads to decide whether to
@@ -6048,6 +5844,7 @@ public final class MacApkPackageManager extends PackageManager {
         if (ri == null) ri = macapkResolveGmsMeasurementService(intent);
         if (ri == null) ri = macapkResolveGmsIdentityService(intent);
         if (ri == null) ri = macapkResolveGmsLocationService(intent);
+        if (ri == null) ri = macapkResolveCustomTabsService(intent);
         if (ri != null) out.add(ri);
         if (intent == null) return out;
 
@@ -6136,6 +5933,7 @@ public final class MacApkPackageManager extends PackageManager {
         if (ri == null) ri = macapkResolveGmsMeasurementService(intent);
         if (ri == null) ri = macapkResolveGmsIdentityService(intent);
         if (ri == null) ri = macapkResolveGmsLocationService(intent);
+        if (ri == null) ri = macapkResolveCustomTabsService(intent);
         if (ri != null) return ri;
         // Fall through to the hosted package's own services (v1.0.1177). This
         // is the call firebase-messaging's ServiceStarter makes to locate the
@@ -6145,6 +5943,39 @@ public final class MacApkPackageManager extends PackageManager {
         // filter matcher activities and receivers use.
         List<ResolveInfo> all = queryIntentServices(intent, flags);
         return all.isEmpty() ? null : all.get(0);
+    }
+
+    /** The host browser row's Custom Tabs service (HostCustomTabsService),
+     *  only where the runtime shows browser tabs itself. Matches the action,
+     *  and the package or component when the caller names one, like the
+     *  licensing service below. The filter (GET_RESOLVED_FILTER) carries the
+     *  action alone: no TrustedWebActivities category, so a TWA launcher uses
+     *  Custom Tab mode. */
+    private ResolveInfo macapkResolveCustomTabsService(Intent intent) {
+        if (intent == null || !HostCustomTabsService.ACTION.equals(intent.getAction())) return null;
+        String want = intent.getPackage();
+        if (want != null && !MACAPK_HOST_PACKAGE.equals(want)) return null;
+        ComponentName explicit = intent.getComponent();
+        if (explicit != null && !MACAPK_HOST_PACKAGE.equals(explicit.getPackageName())) return null;
+        if (!HostBrowserTab.available()) return null;
+        android.content.pm.ServiceInfo si = new android.content.pm.ServiceInfo();
+        si.packageName = MACAPK_HOST_PACKAGE;
+        si.name = HostCustomTabsService.class.getName();
+        si.exported = true;
+        si.enabled = true;
+        android.content.pm.ApplicationInfo app = new android.content.pm.ApplicationInfo();
+        app.packageName = MACAPK_HOST_PACKAGE;
+        app.enabled = true;
+        si.applicationInfo = app;
+        android.content.IntentFilter f = new android.content.IntentFilter();
+        f.addAction(HostCustomTabsService.ACTION);
+        ResolveInfo ri = new ResolveInfo();
+        ri.serviceInfo = si;
+        ri.filter = f;
+        ri.resolvePackageName = MACAPK_HOST_PACKAGE;
+        ri.isDefault = true;
+        ri.match = android.content.IntentFilter.MATCH_CATEGORY_EMPTY;
+        return ri;
     }
 
     /** The one implicit service Intent Mac.apk can answer. Matches on ACTION

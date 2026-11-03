@@ -931,7 +931,7 @@ public final class SpecialAccessHandler {
             Manifest m = Boot.macapkManifest();
             if (m != null && m.launchableActivity != null && pkg != null) {
                 Intent in = new Intent(Intent.ACTION_MAIN);
-                in.addCategory(m.launchableCategory);
+                in.addCategory(Intent.CATEGORY_LAUNCHER);
                 in.setComponent(new android.content.ComponentName(pkg, m.launchableActivity));
                 in.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 android.os.Parcel p = android.os.Parcel.obtain();

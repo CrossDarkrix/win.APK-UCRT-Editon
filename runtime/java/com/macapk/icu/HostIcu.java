@@ -35,68 +35,6 @@ public final class HostIcu {
     private static native String nativeFormatDouble(String skeleton, String icuLocaleId, double value);
     private static native String nativeFormatDecimal(String skeleton, String icuLocaleId, String decimal);
 
-    // android.icu.util.LocaleData over ICU4C's ulocdata_* (same file, kIcuHostMethods).
-    // Lookup failures throw java.util.MissingResourceException, as ICU4J does.
-    private static native int nativeMeasurementSystem(String icuLocaleId);
-    private static native int[] nativePaperSize(String icuLocaleId);
-    private static native int[] nativeCldrVersion();
-    private static native String nativeDelimiter(String icuLocaleId, boolean noSubstitute, int type);
-    private static native Object[] nativeExemplarSet(String icuLocaleId, boolean noSubstitute,
-            int options, int icu4cExtype);
-    private static native String nativeLocaleDisplayPattern(String icuLocaleId);
-    private static native String nativeLocaleSeparator(String icuLocaleId);
-
-    private static UnsupportedOperationException unbound(UnsatisfiedLinkError e) {
-        UnsupportedOperationException x = new UnsupportedOperationException(
-                "host ICU (libicucore) bridge is not registered in this process");
-        x.initCause(e);
-        return x;
-    }
-
-    /** ICU4C UMeasurementSystem: 0 SI, 1 US, 2 UK. Region from rg / region / likely subtags. */
-    public static int measurementSystem(String icuLocaleId) {
-        try { return nativeMeasurementSystem(icuLocaleId); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
-    /** {height, width} in millimetres. */
-    public static int[] paperSize(String icuLocaleId) {
-        try { return nativePaperSize(icuLocaleId); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
-    /** The host ICU's CLDR version, {major, minor, milli, micro}. */
-    public static int[] cldrVersion() {
-        try { return nativeCldrVersion(); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
-    /** One quotation delimiter (ULocaleDataDelimiterType 0-3); null when there is none. */
-    public static String delimiter(String icuLocaleId, boolean noSubstitute, int type) {
-        try { return nativeDelimiter(icuLocaleId, noSubstitute, type); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
-    /**
-     * An exemplar set as {int[] start,end pairs, String[] multi-character strings};
-     * null when ICU has none (or, with noSubstitute, only root has one).
-     */
-    public static Object[] exemplarSet(String icuLocaleId, boolean noSubstitute, int options,
-            int icu4cExtype) {
-        try { return nativeExemplarSet(icuLocaleId, noSubstitute, options, icu4cExtype); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
-    public static String localeDisplayPattern(String icuLocaleId) {
-        try { return nativeLocaleDisplayPattern(icuLocaleId); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
-    public static String localeSeparator(String icuLocaleId) {
-        try { return nativeLocaleSeparator(icuLocaleId); }
-        catch (UnsatisfiedLinkError e) { throw unbound(e); }
-    }
-
     /**
      * Format a number with an ICU number skeleton ("measure-unit/length-kilometer
      * unit-width-full-name .00") in an ICU locale ID ("nl_NL", "en@numbers=arab").

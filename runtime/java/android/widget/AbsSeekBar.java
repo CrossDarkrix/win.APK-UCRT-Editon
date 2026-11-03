@@ -120,7 +120,9 @@ public abstract class AbsSeekBar extends ProgressBar {
     public Drawable getThumb() { return mThumb; }
 
     /** AOSP AbsSeekBar.onMeasure (android14 :881-897): ProgressBar's clamp, at
-     *  least as tall as the thumb. */
+     *  least as tall as the thumb. Same as Mac.apk main 902e6ff. There was no
+     *  onMeasure here or in ProgressBar, so a SeekBar measured 0 high under the
+     *  UNSPECIFIED height a RecyclerView row gets (NoNonsense Notes' SeekBarPreference). */
     @Override
     protected synchronized void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         Drawable d = getCurrentDrawable();

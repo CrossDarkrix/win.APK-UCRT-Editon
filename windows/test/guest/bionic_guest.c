@@ -1,0 +1,909 @@
+// bionic_guest.c -- guest-side test of the Windows Bionic shim (src/bionic/).
+//
+// Built like the other test guests (build_guest.sh): plain clang for
+// x86_64-linux-android, no NDK, the libc imports declared by hand. Every check
+// goes through the shim exactly as NDK code does, System V calls and Bionic
+// layouts included. bionic_test(dir) returns the number of failed checks and
+// prints one line per check; `dir` is a scratch directory.
+
+typedef unsigned long size_t;
+typedef long ssize_t;
+typedef long off_t;
+typedef int wchar_t;  // 32-bit on Android
+
+int printf(const char*, ...);
+int snprintf(char*, size_t, const char*, ...);
+int sprintf(char*, const char*, ...);
+int asprintf(char**, const char*, ...);
+int sscanf(const char*, const char*, ...);
+int strcmp(const char*, const char*);
+size_t strlen(const char*);
+char* strchr(const char*, int);
+char* strstr(const char*, const char*);
+char* strdup(const char*);
+size_t strlcpy(char*, const char*, size_t);
+int strcasecmp(const char*, const char*);
+long strtol(const char*, char**, int);
+unsigned long strtoul(const char*, char**, int);
+double strtod(const char*, char**);
+int atoi(const char*);
+void* malloc(size_t);
+void free(void*);
+void* memset(void*, int, size_t);
+void* memcpy(void*, const void*, size_t);
+int memcmp(const void*, const void*, size_t);
+int* __errno(void);
+char* strerror(int);
+int isdigit(int);
+int toupper(int);
+size_t wcslen(const wchar_t*);
+
+typedef struct { int __private[10]; } pthread_mutex_t;
+typedef struct { int __private[12]; } pthread_cond_t;
+typedef long pthread_t;
+typedef int pthread_key_t;
+typedef int pthread_once_t;
+int pthread_create(pthread_t*, const void*, void* (*)(void*), void*);
+int pthread_join(pthread_t, void**);
+int pthread_mutex_lock(pthread_mutex_t*);
+int pthread_mutex_unlock(pthread_mutex_t*);
+int pthread_mutex_trylock(pthread_mutex_t*);
+int pthread_cond_wait(pthread_cond_t*, pthread_mutex_t*);
+int pthread_cond_signal(pthread_cond_t*);
+int pthread_key_create(pthread_key_t*, void (*)(void*));
+int pthread_setspecific(pthread_key_t, const void*);
+void* pthread_getspecific(pthread_key_t);
+int pthread_once(pthread_once_t*, void (*)(void));
+pthread_t pthread_self(void);
+
+int open(const char*, int, ...);
+int close(int);
+ssize_t read(int, void*, size_t);
+ssize_t write(int, const void*, size_t);
+off_t lseek(int, off_t, int);
+int unlink(const char*);
+int mkdir(const char*, unsigned);
+int rmdir(const char*);
+char* getcwd(char*, size_t);
+int chdir(const char*);
+struct stat { unsigned long dev, ino, nlink; unsigned mode, uid, gid; int pad; unsigned long rdev;
+              long size, blksize, blocks, atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns, unused[3]; };
+int stat(const char*, struct stat*);
+typedef struct DIR DIR;
+struct dirent { unsigned long d_ino; long d_off; unsigned short d_reclen; unsigned char d_type; char d_name[256]; };
+DIR* opendir(const char*);
+struct dirent* readdir(DIR*);
+int closedir(DIR*);
+typedef struct FILE FILE;
+FILE* fopen(const char*, const char*);
+int fputs(const char*, FILE*);
+int fprintf(FILE*, const char*, ...);
+int fclose(FILE*);
+char* fgets(char*, int, FILE*);
+
+struct timespec { long tv_sec; long tv_nsec; };
+int clock_gettime(int, struct timespec*);
+int nanosleep(const struct timespec*, struct timespec*);
+int __system_property_get(const char*, char*);
+char* getenv(const char*);
+int setenv(const char*, const char*, int);
+void* mmap(void*, size_t, int, int, int, long);
+int munmap(void*, size_t);
+int mprotect(void*, size_t, int);
+extern char** environ;
+long sysconf(int);
+
+#define EXPORT __attribute__((visibility("default")))
+
+static int failures;
+
+static void check(const char* what, int ok, const char* got) {
+    printf("  [%s] %s%s%s\n", ok ? "PASS" : "FAIL", what, got ? ": " : "", got ? got : "");
+    if (!ok) ++failures;
+}
+
+static void check_str(const char* what, const char* got, const char* want) {
+    check(what, strcmp(got, want) == 0, got);
+}
+
+// ---- printf -----------------------------------------------------------------
+static void test_printf(void) {
+    char b[256];
+    snprintf(b, sizeof b, "%d %u %x %ld %lld", -42, 3000000000u, 0xbeef, -9000000000L, 123456789012LL);
+    check_str("snprintf integers", b, "-42 3000000000 beef -9000000000 123456789012");
+    snprintf(b, sizeof b, "%.3f|%8.2f|%-6.1f|%e|%g", 3.14159, 2.5, 1.25, 12345.678, 0.0001);
+    check_str("snprintf doubles", b, "3.142|    2.50|1.2   |1.234568e+04|0.0001");
+    // More than eight doubles and six integers: the rest go on the stack.
+    snprintf(b, sizeof b, "%d %d %d %d %d %d %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f", 1, 2, 3, 4, 5, 6,
+             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0);
+    check_str("snprintf stack arguments", b, "1 2 3 4 5 6 1 2 3 4 5 6 7 8 9 10");
+    snprintf(b, sizeof b, "[%s] [%5s] [%-5s] [%.2s] [%c] [%%] [%s]", "abc", "ab", "ab", "abcdef", 'z', (char*)0);
+    check_str("snprintf strings", b, "[abc] [   ab] [ab   ] [ab] [z] [%] [(null)]");
+    snprintf(b, sizeof b, "%*d|%-*d|%.*f", 5, 7, 4, 8, 2, 1.0);
+    check_str("snprintf star width/precision", b, "    7|8   |1.00");
+    static const wchar_t w[] = {'w', 'i', 'd', 'e', 0x5d0, 0};
+    snprintf(b, sizeof b, "%ls", w);
+    check_str("snprintf %ls (32-bit wchar_t)", b, "wide\xd7\x90");
+    snprintf(b, sizeof b, "%p", (void*)0x1234);
+    check_str("snprintf %p", b, "0x1234");
+    int n = 0;
+    snprintf(b, sizeof b, "abc%nde", &n);
+    check("snprintf %n", n == 3, b);
+    const int len = snprintf(b, 5, "123456789");
+    check("snprintf truncates and counts", len == 9 && strcmp(b, "1234") == 0, b);
+    char* a = 0;
+    asprintf(&a, "%s-%d", "x", 99);
+    check_str("asprintf", a ? a : "(null)", "x-99");
+    free(a);
+    // The way engines read GL_VERSION, plus a 64-bit %ld, a set and a skip.
+    int major = 0, minor = 0;
+    long big = 0;
+    float f = 0;
+    char word[16] = {0};
+    const int got = sscanf("OpenGL ES 3.0 (ANGLE) 9000000000 2.5 abc123", "OpenGL ES %d.%d %*s %ld %f %[a-z]", &major,
+                           &minor, &big, &f, word);
+    snprintf(b, sizeof b, "%d: %d.%d %ld %.1f %s", got, major, minor, big, f, word);
+    check_str("sscanf", b, "5: 3.0 9000000000 2.5 abc");
+}
+
+// ---- strings ------------------------------------------------------------------
+static void test_strings(void) {
+    char b[64];
+    check("strtol 64-bit", strtol("-9000000000", 0, 10) == -9000000000L, 0);
+    check("strtoul hex", strtoul("ffffffffff", 0, 16) == 0xffffffffffUL, 0);
+    check("strtod", strtod("2.5", 0) == 2.5, 0);
+    check("atoi", atoi("1234") == 1234, 0);
+    check("strchr/strstr", strchr("hello", 'l') && strstr("hello", "llo"), 0);
+    check("strcasecmp", strcasecmp("HeLLo", "hello") == 0, 0);
+    char* d = strdup("dup");
+    check_str("strdup", d, "dup");
+    free(d);
+    strlcpy(b, "truncated", 6);
+    check_str("strlcpy", b, "trunc");
+    check("ctype", isdigit('7') && !isdigit('x') && toupper('q') == 'Q', 0);
+    static const wchar_t w[] = {'a', 'b', 'c', 0};
+    check("wcslen (32-bit)", wcslen(w) == 3, 0);
+    check_str("strerror(ENOENT), Linux numbering", strerror(2), "No such file or directory");
+}
+
+// ---- threads --------------------------------------------------------------------
+static pthread_mutex_t g_mu;  // zero: PTHREAD_MUTEX_INITIALIZER
+static pthread_cond_t g_cv;
+static int g_counter, g_ready;
+static pthread_key_t g_key;
+static int g_dtor_runs;
+static pthread_once_t g_once;
+static int g_once_runs;
+
+static void once_fn(void) { ++g_once_runs; }
+static void key_dtor(void* v) { (void)v; ++g_dtor_runs; }
+
+static void* worker(void* arg) {
+    pthread_setspecific(g_key, arg);
+    pthread_once(&g_once, once_fn);
+    for (int i = 0; i < 10000; ++i) {
+        pthread_mutex_lock(&g_mu);
+        ++g_counter;
+        pthread_mutex_unlock(&g_mu);
+    }
+    pthread_mutex_lock(&g_mu);
+    ++g_ready;
+    pthread_cond_signal(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+    return (void*)((long)arg * 2);
+}
+
+// ELF TLS (built with -fno-emulated-tls): a hidden variable reached through the
+// local-dynamic model, an exported one through general-dynamic, and a .tbss
+// array. Every thread must start from the initial values.
+static __thread int t_hidden = 11;
+__attribute__((visibility("default"))) __thread long t_exported = 22;
+static __thread int t_zeroed[64];
+
+static void* tls_worker(void* arg) {
+    long id = (long)arg;
+    int fresh = t_hidden == 11 && t_exported == 22 && t_zeroed[63] == 0;
+    t_hidden += (int)id;
+    t_exported *= id;
+    t_zeroed[63] = (int)id;
+    for (volatile int i = 0; i < 1000; ++i) {}
+    int kept = t_hidden == 11 + id && t_exported == 22 * id && t_zeroed[63] == id;
+    return (void*)(long)(fresh && kept);
+}
+
+static void test_tls(void) {
+    check("TLS initial values on the main thread", t_hidden == 11 && t_exported == 22 && t_zeroed[0] == 0, 0);
+    t_hidden = 100;
+    pthread_t t[3];
+    for (long i = 0; i < 3; ++i) pthread_create(&t[i], 0, tls_worker, (void*)(i + 2));
+    long ok = 1;
+    for (int i = 0; i < 3; ++i) {
+        void* r = 0;
+        pthread_join(t[i], &r);
+        ok &= (long)r;
+    }
+    check("TLS is per thread (3 threads, .tdata and .tbss)", ok == 1, 0);
+    check("TLS of the main thread is untouched by other threads", t_hidden == 100 && t_exported == 22, 0);
+}
+
+// UTF-8 conversion, locales and raw syscalls (libc++ and Chromium use them).
+size_t mbrtowc(wchar_t*, const char*, size_t, void*);
+size_t wcrtomb(char*, wchar_t, void*);
+size_t mbstowcs(wchar_t*, const char*, size_t);
+char* setlocale(int, const char*);
+void* newlocale(int, const char*, void*);
+void* uselocale(void*);
+long syscall(long, ...);
+int gettid(void);
+struct futex_timespec { long tv_sec, tv_nsec; };
+
+static void test_locale_and_syscall(void) {
+    wchar_t c = 0;
+    unsigned st = 0;
+    check("mbrtowc decodes a 3-byte UTF-8 character", mbrtowc(&c, "\xe2\x82\xac!", 4, &st) == 3 && c == 0x20ac, 0);
+    st = 0;
+    int partial = mbrtowc(&c, "\xe2", 1, &st) == (size_t)-2;
+    check("mbrtowc continues a split sequence", partial && mbrtowc(&c, "\x82\xac", 2, &st) == 2 && c == 0x20ac, 0);
+    check("mbrtowc rejects an illegal byte", mbrtowc(&c, "\xff", 1, 0) == (size_t)-1 && *__errno() == 84, 0);
+    char b[8] = {0};
+    check("wcrtomb encodes U+1F600 as 4 bytes",
+          wcrtomb(b, 0x1f600, 0) == 4 && (unsigned char)b[0] == 0xf0 && (unsigned char)b[3] == 0x80, 0);
+    wchar_t w[8];
+    check("mbstowcs converts a string", mbstowcs(w, "a\xc3\xa9z", 8) == 3 && w[1] == 0xe9 && w[3] == 0, 0);
+    void* loc = newlocale(63, "C", 0);
+    check("setlocale and newlocale/uselocale for C and C.UTF-8",
+          setlocale(6, "") != 0 && loc != 0 && uselocale(loc) == (void*)-1 && uselocale(0) == loc, 0);
+    check("syscall(gettid)", syscall(186) == gettid(), 0);
+    unsigned word = 5;
+    struct futex_timespec ts = {0, 2000000};
+    check("futex WAIT on a changed value fails with EAGAIN", syscall(202, &word, 128, 4, 0) == -1 && *__errno() == 11, 0);
+    check("futex WAIT times out with ETIMEDOUT", syscall(202, &word, 128, 5, &ts) == -1 && *__errno() == 110, 0);
+    check("futex WAKE succeeds", syscall(202, &word, 129, 1) >= 0, 0);
+    check("an unknown syscall fails with ENOSYS", syscall(9999) == -1 && *__errno() == 38, 0);
+}
+
+// Pipes, eventfd, poll and epoll: the wake-up machinery of every event loop.
+int pipe(int[2]);
+int eventfd(unsigned, int);
+struct pollfd { int fd; short events, revents; };
+int poll(struct pollfd*, unsigned long, int);
+int epoll_create1(int);
+struct __attribute__((packed)) epoll_event { unsigned events; unsigned long data; };
+int epoll_ctl(int, int, int, struct epoll_event*);
+int epoll_wait(int, struct epoll_event*, int, int);
+int fcntl(int, int, ...);
+int usleep(unsigned);
+
+static int g_wake_fd;
+static void* waker(void* arg) {
+    (void)arg;
+    usleep(20000);
+    unsigned long one = 1;
+    write(g_wake_fd, &one, 8);
+    return 0;
+}
+
+static void test_event_fds(void) {
+    int p[2];
+    char b[16] = {0};
+    check("pipe write/read", pipe(p) == 0 && write(p[1], "ping", 4) == 4 && read(p[0], b, 16) == 4 && !strcmp(b, "ping"), b);
+    struct pollfd pf = {p[0], 1, 0};
+    check("poll: empty pipe times out", poll(&pf, 1, 10) == 0, 0);
+    write(p[1], "x", 1);
+    check("poll: pipe readable", poll(&pf, 1, 100) == 1 && (pf.revents & 1), 0);
+    read(p[0], b, 1);
+    fcntl(p[0], 4, 04000);  // F_SETFL O_NONBLOCK
+    check("non-blocking empty read is EAGAIN", read(p[0], b, 1) == -1 && *__errno() == 11, 0);
+    close(p[1]);
+    check("read after the writer closed is EOF", read(p[0], b, 1) == 0, 0);
+    close(p[0]);
+
+    const int efd = eventfd(0, 0);
+    const int ep = epoll_create1(0);
+    struct epoll_event ev = {1, 42};
+    check("epoll_ctl ADD an eventfd", efd >= 0 && ep >= 0 && epoll_ctl(ep, 1, efd, &ev) == 0, 0);
+    g_wake_fd = efd;
+    pthread_t t;
+    pthread_create(&t, 0, waker, 0);
+    struct epoll_event out[4];
+    const int n = epoll_wait(ep, out, 4, 2000);
+    check("epoll_wait wakes when another thread writes the eventfd", n == 1 && out[0].data == 42 && (out[0].events & 1), 0);
+    unsigned long v = 0;
+    check("eventfd read returns the count", read(efd, &v, 8) == 8 && v == 1, 0);
+    pthread_join(t, 0);
+    check("epoll_wait times out once drained", epoll_wait(ep, out, 4, 10) == 0, 0);
+    close(ep);
+    close(efd);
+}
+
+// Sockets on Winsock: a loopback TCP exchange, IPv6 addresses, name lookup.
+struct sockaddr_in { unsigned short family, port; unsigned addr; char zero[8]; };
+struct sockaddr_in6 { unsigned short family, port; unsigned flowinfo; unsigned char addr[16]; unsigned scope; };
+struct addrinfo { int flags, family, socktype, protocol; unsigned addrlen; char* canonname; void* addr; struct addrinfo* next; };
+int socket(int, int, int);
+int bind(int, const void*, unsigned);
+int listen(int, int);
+int accept(int, void*, unsigned*);
+int connect(int, const void*, unsigned);
+int getsockname(int, void*, unsigned*);
+int setsockopt(int, int, int, const void*, unsigned);
+int getsockopt(int, int, int, void*, unsigned*);
+long send(int, const void*, size_t, int);
+long recv(int, void*, size_t, int);
+int socketpair(int, int, int, int[2]);
+int getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
+void freeaddrinfo(struct addrinfo*);
+int inet_pton(int, const char*, void*);
+const char* inet_ntop(int, const void*, char*, unsigned);
+
+static int g_listener;
+static void* echo_server(void* arg) {
+    (void)arg;
+    int c = accept(g_listener, 0, 0);
+    char b[32];
+    long n = recv(c, b, sizeof b, 0);
+    if (n > 0) send(c, b, (size_t)n, 0);
+    close(c);
+    return 0;
+}
+
+static void test_sockets(void) {
+    g_listener = socket(2, 1, 0);  // AF_INET, SOCK_STREAM
+    int one = 1;
+    struct sockaddr_in a = {2, 0, 0x0100007f, {0}};  // 127.0.0.1, any port
+    unsigned len = sizeof a;
+    check("socket/setsockopt(SO_REUSEADDR)/bind/listen",
+          g_listener >= 0 && setsockopt(g_listener, 1, 2, &one, 4) == 0 && bind(g_listener, &a, sizeof a) == 0 &&
+              listen(g_listener, 1) == 0 && getsockname(g_listener, &a, &len) == 0 && a.family == 2 && a.port != 0,
+          0);
+    pthread_t t;
+    pthread_create(&t, 0, echo_server, 0);
+    int c = socket(2, 1, 0);
+    char b[32] = {0};
+    check("connect + send + recv over loopback TCP",
+          connect(c, &a, sizeof a) == 0 && send(c, "echo", 4, 0) == 4 && recv(c, b, sizeof b, 0) == 4 && !strcmp(b, "echo"), b);
+    struct pollfd pf = {c, 1, 0};
+    check("poll on a socket: readable at EOF", poll(&pf, 1, 1000) == 1 && read(c, b, 1) == 0, 0);
+    int err = -1;
+    len = 4;
+    check("getsockopt(SO_ERROR) is 0", getsockopt(c, 1, 4, &err, &len) == 0 && err == 0, 0);
+    close(c);
+    pthread_join(t, 0);
+    close(g_listener);
+
+    int sv[2];
+    check("socketpair passes data both ways",
+          socketpair(1, 1, 0, sv) == 0 && write(sv[0], "a", 1) == 1 && read(sv[1], b, 1) == 1 && b[0] == 'a' &&
+              write(sv[1], "b", 1) == 1 && read(sv[0], b, 1) == 1 && b[0] == 'b', 0);
+    close(sv[0]);
+    close(sv[1]);
+
+    struct sockaddr_in6 a6;
+    char text[64];
+    check("inet_pton/inet_ntop with Linux's AF_INET6 (10)",
+          inet_pton(10, "::1", a6.addr) == 1 && inet_ntop(10, a6.addr, text, sizeof text) && !strcmp(text, "::1"), text);
+    struct addrinfo hints = {4, 2, 1, 0, 0, 0, 0, 0};  // AI_NUMERICHOST, AF_INET, SOCK_STREAM
+    struct addrinfo* res = 0;
+    int ok = getaddrinfo("127.0.0.1", "80", &hints, &res) == 0 && res && res->family == 2 && res->addrlen == 16 &&
+             ((struct sockaddr_in*)res->addr)->port == 0x5000;
+    check("getaddrinfo (numeric) in bionic's addrinfo layout", ok, 0);
+    if (res) freeaddrinfo(res);
+}
+
+// The NDK's ALooper: a callback on a pipe, and a wake from another thread.
+void* ALooper_prepare(int);
+int ALooper_addFd(void*, int, int, int, int (*)(int, int, void*), void*);
+int ALooper_pollOnce(int, int*, int*, void**);
+void ALooper_wake(void*);
+static int g_looper_hits;
+static int on_pipe(int fd, int events, void* data) {
+    char c;
+    read(fd, &c, 1);
+    g_looper_hits += (events & 1) && data == (void*)7;
+    return 1;
+}
+static void* g_looper;
+static void* looper_waker(void* arg) {
+    (void)arg;
+    usleep(20000);
+    ALooper_wake(g_looper);
+    return 0;
+}
+static void test_looper(void) {
+    int p[2];
+    pipe(p);
+    g_looper = ALooper_prepare(0);
+    check("ALooper_prepare + addFd", g_looper && ALooper_addFd(g_looper, p[0], -2, 1, on_pipe, (void*)7) == 1, 0);
+    write(p[1], "z", 1);
+    check("pollOnce runs the descriptor's callback", ALooper_pollOnce(100, 0, 0, 0) == -2 && g_looper_hits == 1, 0);
+    check("pollOnce times out when idle", ALooper_pollOnce(10, 0, 0, 0) == -3, 0);
+    pthread_t t;
+    pthread_create(&t, 0, looper_waker, 0);
+    check("ALooper_wake from another thread ends a blocking pollOnce", ALooper_pollOnce(2000, 0, 0, 0) == -1, 0);
+    pthread_join(t, 0);
+    close(p[0]);
+    close(p[1]);
+}
+
+static void test_threads(void) {
+    pthread_key_create(&g_key, key_dtor);
+    pthread_t t[4];
+    for (long i = 0; i < 4; ++i) pthread_create(&t[i], 0, worker, (void*)(i + 1));
+    pthread_mutex_lock(&g_mu);
+    while (g_ready < 4) pthread_cond_wait(&g_cv, &g_mu);
+    pthread_mutex_unlock(&g_mu);
+    long sum = 0;
+    for (int i = 0; i < 4; ++i) {
+        void* r = 0;
+        pthread_join(t[i], &r);
+        sum += (long)r;
+    }
+    char b[96];
+    snprintf(b, sizeof b, "counter=%d results=%ld once=%d dtors=%d", g_counter, sum, g_once_runs, g_dtor_runs);
+    check("4 threads: mutex, condition, join, once, key destructors",
+          g_counter == 40000 && sum == 20 && g_once_runs == 1 && g_dtor_runs == 4, b);
+    check("trylock on a held mutex fails",
+          pthread_mutex_lock(&g_mu) == 0 && pthread_mutex_trylock(&g_mu) != 0 && pthread_mutex_unlock(&g_mu) == 0, 0);
+    check("pthread_self is stable", pthread_self() == pthread_self(), 0);
+}
+
+// ---- files --------------------------------------------------------------------------
+static void test_files(const char* dir) {
+    char sub[512], path[512], line[64];
+    snprintf(sub, sizeof sub, "%s/bionic_test_dir", dir);
+    mkdir(sub, 0755);
+    snprintf(path, sizeof path, "%s/file.txt", sub);
+    const int fd = open(path, 01 | 0100 | 01000, 0644);  // O_WRONLY | O_CREAT | O_TRUNC
+    check("open(O_CREAT)", fd >= 0, 0);
+    check("write", write(fd, "hello\n", 6) == 6, 0);
+    close(fd);
+    struct stat st;
+    check("stat size and regular file", stat(path, &st) == 0 && st.size == 6 && (st.mode & 0170000) == 0100000, 0);
+    const int rfd = open(path, 0);
+    char buf[8] = {0};
+    check("read back", rfd >= 0 && read(rfd, buf, 5) == 5 && strcmp(buf, "hello") == 0, buf);
+    check("lseek", lseek(rfd, 0, 2) == 6, 0);
+    close(rfd);
+    FILE* f = fopen(path, "a");
+    fprintf(f, "%s %d\n", "line", 2);
+    fclose(f);
+    f = fopen(path, "r");
+    fgets(line, sizeof line, f);
+    fgets(line, sizeof line, f);
+    fclose(f);
+    check_str("fopen/fprintf/fgets", line, "line 2\n");
+    int found = 0;
+    DIR* d = opendir(sub);
+    for (struct dirent* e; d && (e = readdir(d));) found |= strcmp(e->d_name, "file.txt") == 0 && e->d_type == 8;
+    if (d) closedir(d);
+    check("opendir/readdir", found, 0);
+    check("open a missing file sets ENOENT", open("Z:/no/such/file", 0) < 0 && *__errno() == 2, 0);
+    unlink(path);
+    rmdir(sub);
+    check("unlink + rmdir", stat(sub, &st) != 0, 0);
+    // Android's absolute paths land under the android root (the runner sets
+    // it to `dir`), and /dev/null is the null device.
+    mkdir("/data", 0755);
+    f = fopen("/data/mapped.txt", "w");
+    if (f) { fputs("mapped\n", f); fclose(f); }
+    snprintf(path, sizeof path, "%s/data/mapped.txt", dir);
+    line[0] = 0;
+    f = fopen(path, "r");
+    if (f) { fgets(line, sizeof line, f); fclose(f); }
+    check_str("/data/... maps under the android root", line, "mapped\n");
+    unlink("/data/mapped.txt");
+    rmdir("/data");
+    const int nfd = open("/dev/null", 01);
+    check("/dev/null accepts writes", nfd >= 0 && write(nfd, "x", 1) == 1, 0);
+    if (nfd >= 0) close(nfd);
+    // The working directory is rooted, as POSIX code expects (it resolves any
+    // other answer against getcwd() again), and chdir takes it back.
+    char cwd[1024];
+    check("getcwd is rooted, with '/' separators",
+          getcwd(cwd, sizeof cwd) == cwd && cwd[0] == '/' && !strchr(cwd, '\\'), cwd);
+    check("chdir takes getcwd's answer", chdir(cwd) == 0, 0);
+    snprintf(path, sizeof path, "%s/cwd_probe.txt", cwd);
+    f = fopen(path, "w");
+    if (f) fclose(f);
+    check("a path under getcwd's answer opens", f != 0 && stat(path, &st) == 0, path);
+    unlink(path);
+}
+
+// ---- zlib (libz.so) ---------------------------------------------------------------
+// Android's z_stream: uLong is 64 bits (LP64), so it is 112 bytes where Windows
+// zlib's is 88 (see src/bionic/zlib.cpp). The constants are zlib.h's: Z_OK 0,
+// Z_STREAM_END 1, Z_STREAM_ERROR -2, Z_DATA_ERROR -3, Z_BUF_ERROR -5,
+// Z_VERSION_ERROR -6; Z_NO_FLUSH 0, Z_FINISH 4; Z_DEFLATED 8.
+typedef struct {
+    const unsigned char* next_in;
+    unsigned avail_in;
+    unsigned long total_in;
+    unsigned char* next_out;
+    unsigned avail_out;
+    unsigned long total_out;
+    const char* msg;
+    void* state;
+    void* (*zalloc)(void*, unsigned, unsigned);
+    void (*zfree)(void*, void*);
+    void* opaque;
+    int data_type;
+    unsigned long adler;
+    unsigned long reserved;
+} z_stream;
+const char* zlibVersion(void);
+unsigned long zlibCompileFlags(void);
+int deflateInit2_(z_stream*, int, int, int, int, int, const char*, int);
+int deflate(z_stream*, int);
+int deflateEnd(z_stream*);
+int inflateInit2_(z_stream*, int, const char*, int);
+int inflate(z_stream*, int);
+int inflateCopy(z_stream*, z_stream*);
+int inflateEnd(z_stream*);
+unsigned long crc32(unsigned long, const unsigned char*, unsigned);
+unsigned long adler32(unsigned long, const unsigned char*, unsigned);
+unsigned long crc32_combine(unsigned long, unsigned long, long);
+unsigned long adler32_combine(unsigned long, unsigned long, long);
+unsigned long compressBound(unsigned long);
+int compress2(unsigned char*, unsigned long*, const unsigned char*, unsigned long, int);
+int uncompress(unsigned char*, unsigned long*, const unsigned char*, unsigned long);
+// gzFile's public part, which zlib.h's gzgetc() macro reads in place.
+struct gzFile_s { unsigned have; unsigned char* next; long pos; };
+typedef struct gzFile_s* gzFile;
+#define GZGETC(g) ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : gzgetc(g))
+gzFile gzopen(const char*, const char*);
+int gzwrite(gzFile, const void*, unsigned);
+int gzprintf(gzFile, const char*, ...);
+int gzread(gzFile, void*, unsigned);
+int gzgetc(gzFile);
+long gztell(gzFile);
+int gzclose(gzFile);
+
+static int g_z_allocs, g_z_frees;
+static void* z_alloc(void* opaque, unsigned items, unsigned size) {
+    if (opaque == &g_z_allocs) ++g_z_allocs;
+    return malloc((size_t)items * size);
+}
+static void z_free(void* opaque, void* p) {
+    if (opaque == &g_z_allocs) ++g_z_frees;
+    free(p);
+}
+
+static void test_zlib(const char* dir) {
+    static const unsigned char nine[] = "123456789";
+    check("crc32(\"123456789\") is CBF43926", crc32(0, nine, 9) == 0xcbf43926UL, 0);
+    check("adler32(\"123456789\") is 091E01DE", adler32(1, nine, 9) == 0x091e01deUL, 0);
+    check("crc32_combine and adler32_combine (64-bit z_off_t)",
+          crc32_combine(crc32(0, nine, 4), crc32(0, nine + 4, 5), 5) == 0xcbf43926UL &&
+              adler32_combine(adler32(1, nine, 4), adler32(1, nine + 4, 5), 5) == 0x091e01deUL, 0);
+    check("zlibVersion is 1.x", zlibVersion()[0] == '1', zlibVersion());
+    const unsigned long flags = zlibCompileFlags();
+    check("zlibCompileFlags: 64-bit uLong and z_off_t", ((flags >> 2) & 3) == 2 && ((flags >> 6) & 3) == 2, 0);
+
+    enum { N = 256 * 1024 };
+    unsigned char* data = malloc(N);
+    unsigned char* packed = malloc(compressBound(N));
+    unsigned char* back = malloc(N);
+    unsigned char* back2 = malloc(N);
+    for (int i = 0; i < N; ++i) data[i] = (unsigned char)("Win.apk zlib "[i % 13] + (i / 4096) % 7);
+
+    // gzip, in 1000-byte output slices, through the guest's own allocator.
+    z_stream s;
+    memset(&s, 0, sizeof s);
+    s.zalloc = z_alloc;
+    s.zfree = z_free;
+    s.opaque = &g_z_allocs;
+    int r = deflateInit2_(&s, 9, 8, 15 + 16, 8, 0, "1.3.1", (int)sizeof s);
+    check("deflateInit2_ (gzip) with a 112-byte z_stream", r == 0 && s.state != 0, 0);
+    s.next_in = data;
+    s.avail_in = N;
+    s.next_out = packed;
+    while (r == 0 && s.next_out + 1000 <= packed + N) {
+        s.avail_out = 1000;
+        r = deflate(&s, 4);
+    }
+    const unsigned long packed_len = s.total_out;
+    check("deflate in slices ends with Z_STREAM_END",
+          r == 1 && s.total_in == N && packed_len == (unsigned long)(s.next_out - packed) && packed_len < N / 10, 0);
+    check("deflate's adler is the data's CRC-32 (gzip)", s.adler == crc32(0, data, N), 0);
+    r = deflateEnd(&s);
+    check("deflateEnd; the guest's zalloc/zfree got its opaque",
+          r == 0 && s.state == 0 && g_z_allocs > 0 && g_z_allocs == g_z_frees, 0);
+
+    // What Telegram's tgnet does with a gzip_packed reply: header auto-detect
+    // (15 + 32), one inflate(Z_NO_FLUSH) into a buffer that fits.
+    memset(&s, 0, sizeof s);
+    r = inflateInit2_(&s, 15 + 32, "1.2.13", (int)sizeof s);
+    s.next_in = packed;
+    s.avail_in = (unsigned)packed_len;
+    s.next_out = back;
+    s.avail_out = N;
+    if (r == 0) r = inflate(&s, 0);
+    check("inflateInit2_ + inflate: Z_STREAM_END and the data",
+          r == 1 && s.total_out == N && memcmp(back, data, N) == 0, 0);
+    check("inflate's totals and CRC-32", s.total_in == packed_len && s.adler == crc32(0, data, N), 0);
+    inflateEnd(&s);
+
+    // Many calls on one stream: 17 bytes in, 511 out at a time.
+    memset(&s, 0, sizeof s);
+    memset(back, 0, N);
+    r = inflateInit2_(&s, 15 + 16, "1.3", (int)sizeof s);
+    s.next_in = packed;
+    s.next_out = back;
+    while (r == 0) {
+        s.avail_in = (unsigned)(packed + packed_len - s.next_in);
+        if (s.avail_in > 17) s.avail_in = 17;
+        s.avail_out = (unsigned)(back + N - s.next_out);
+        if (s.avail_out > 511) s.avail_out = 511;
+        r = inflate(&s, 0);
+    }
+    check("inflate in 17/511-byte slices", r == 1 && s.total_out == N && memcmp(back, data, N) == 0, 0);
+    inflateEnd(&s);
+
+    // The totals are 64 bits: counters already past 4 GiB keep counting.
+    memset(&s, 0, sizeof s);
+    r = inflateInit2_(&s, 15 + 16, "1.3.1", (int)sizeof s);
+    s.total_in = 0x1fffffff0UL;
+    s.total_out = 0x2fffffff8UL;
+    s.next_in = packed;
+    s.avail_in = (unsigned)packed_len;
+    s.next_out = back;
+    s.avail_out = N;
+    if (r == 0) r = inflate(&s, 4);
+    check("total_in/total_out count past 4 GiB",
+          r == 1 && s.total_in == 0x1fffffff0UL + packed_len && s.total_out == 0x2fffffff8UL + N, 0);
+    inflateEnd(&s);
+
+    // inflateCopy halfway: both streams finish on their own, and the copy's
+    // state goes through the guest's allocator too.
+    g_z_allocs = g_z_frees = 0;
+    memset(&s, 0, sizeof s);
+    memset(back, 0, N);
+    s.zalloc = z_alloc;
+    s.zfree = z_free;
+    s.opaque = &g_z_allocs;
+    r = inflateInit2_(&s, 15 + 16, "1.3.1", (int)sizeof s);
+    s.next_in = packed;
+    s.avail_in = (unsigned)(packed_len / 2);
+    s.next_out = back;
+    s.avail_out = N;
+    if (r == 0) r = inflate(&s, 0);
+    z_stream t;
+    const int copied = r == 0 && inflateCopy(&t, &s) == 0;
+    const unsigned long half = s.total_out;
+    memcpy(back2, back, half);
+    t.next_out = back2 + half;
+    s.avail_in = t.avail_in = (unsigned)(packed_len - packed_len / 2);
+    const int rs = inflate(&s, 4), rt = copied ? inflate(&t, 4) : -99;
+    check("inflateCopy mid-stream; both copies finish",
+          copied && t.state != s.state && rs == 1 && rt == 1 && t.total_out == N && memcmp(back, data, N) == 0 &&
+              memcmp(back2, data, N) == 0, 0);
+    inflateEnd(&s);
+    if (copied) inflateEnd(&t);
+    check("the copy's allocations are freed too", g_z_allocs > 1 && g_z_allocs == g_z_frees, 0);
+
+    // Wrong stream size (Windows zlib's 88), corrupt input, an ended stream.
+    memset(&s, 0, sizeof s);
+    check("inflateInit2_ refuses an 88-byte z_stream", inflateInit2_(&s, 15, "1.3.1", 88) == -6, 0);
+    r = inflateInit2_(&s, 15, "1.3.1", (int)sizeof s);
+    s.next_in = data;
+    s.avail_in = 64;
+    s.next_out = back;
+    s.avail_out = N;
+    if (r == 0) r = inflate(&s, 0);
+    check("inflate of garbage: Z_DATA_ERROR with a message", r == -3 && s.msg != 0, s.msg);
+    inflateEnd(&s);
+    check("inflate on an ended stream: Z_STREAM_ERROR", inflate(&s, 0) == -2 && s.state == 0, 0);
+
+    // One-call forms, with 64-bit lengths.
+    unsigned long plen = compressBound(N), blen = N;
+    r = compress2(packed, &plen, data, N, 6);
+    memset(back, 0, N);
+    const int ru = uncompress(back, &blen, packed, plen);
+    check("compress2 + uncompress", r == 0 && ru == 0 && blen == N && plen < N / 10 && memcmp(back, data, N) == 0, 0);
+    blen = 100;
+    check("uncompress into a short buffer: Z_BUF_ERROR", uncompress(back, &blen, packed, plen) == -5 && blen == 100, 0);
+
+    // gzip files on an Android path, gzprintf with guest varargs, and the
+    // gzgetc() macro reading the host's gzFile.
+    gzFile f = gzopen("/zlib_test.gz", "wb");
+    const int w = f ? gzwrite(f, data, 5000) : 0;
+    const int p = f ? gzprintf(f, "|%d|%s|%.2f|", 42, "gz", 2.5) : 0;
+    const int c = f ? gzclose(f) : -1;
+    check("gzopen/gzwrite/gzprintf/gzclose", f && w == 5000 && p == 12 && c == 0, 0);
+    memset(back, 0, 6000);
+    f = gzopen("/zlib_test.gz", "rb");
+    const int c0 = f ? gzgetc(f) : -1;
+    const int c1 = f ? GZGETC(f) : -1;
+    const long at = f ? gztell(f) : -1;
+    const int n = f ? gzread(f, back + 2, 6000) : -1;
+    if (f) gzclose(f);
+    check("gzgetc, the gzgetc() macro and gztell", c0 == data[0] && c1 == data[1] && at == 2, 0);
+    check("gzread reads it back",
+          n == 5010 && memcmp(back + 2, data + 2, 4998) == 0 && memcmp(back + 5000, "|42|gz|2.50|", 12) == 0, 0);
+    char path[512];
+    snprintf(path, sizeof path, "%s/zlib_test.gz", dir);
+    struct stat st;
+    check("the .gz file is under the android root", stat(path, &st) == 0 && st.size > 0 && st.size < 5000, 0);
+    unlink("/zlib_test.gz");
+    free(data);
+    free(packed);
+    free(back);
+    free(back2);
+}
+
+// ---- rand48, statfs, getopt ---------------------------------------------------------
+long lrand48(void);
+long mrand48(void);
+double drand48(void);
+void srand48(long);
+long nrand48(unsigned short[3]);
+long jrand48(unsigned short[3]);
+unsigned short* seed48(unsigned short[3]);
+// Bionic's struct statfs on x86_64 (the kernel's: 64-bit fields, f_fsid two ints).
+struct statfs { unsigned long f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree; int f_fsid[2];
+                unsigned long f_namelen, f_frsize, f_flags, f_spare[4]; };
+int statfs(const char*, struct statfs*);
+int fstatfs(int, struct statfs*);
+struct option { const char* name; int has_arg; int* flag; int val; };
+int getopt(int, char* const*, const char*);
+int getopt_long(int, char* const*, const char*, const struct option*, int*);
+extern char* optarg;
+extern int optind;
+
+static void test_rand48_statfs_getopt(const char* dir) {
+    // rand48 is fully specified by POSIX; glibc gives the same values.
+    srand48(12345);
+    const long l1 = lrand48(), l2 = lrand48(), m3 = mrand48();
+    const double d4 = drand48();
+    check("srand48, then lrand48/mrand48/drand48",
+          l1 == 483889296 && l2 == 1973930609 && m3 == 888376418 && d4 > 0.72477972027 && d4 < 0.72477972028, 0);
+    srand48(7);
+    mrand48();
+    check("mrand48 is signed 32-bit", mrand48() == -1365648288L, 0);
+    unsigned short xs[3] = {0x1111, 0x2222, 0x3333};
+    const long n = nrand48(xs), j = jrand48(xs);
+    check("nrand48/jrand48 step the caller's state", n == 175951553 && j == 1299530545, 0);
+    unsigned short seed[3] = {0x330e, 12345, 0};  // what srand48(12345) sets
+    check("seed48 returns the previous state and sets the new one", seed48(seed) != 0 && lrand48() == 483889296, 0);
+
+    struct statfs sd, sf;
+    char path[512];
+    snprintf(path, sizeof path, "%s/statfs_probe.txt", dir);
+    const int fd = open(path, 01 | 0100 | 01000, 0644);  // O_WRONLY | O_CREAT | O_TRUNC
+    check("statfs on a directory: ext4's magic, 4 KiB blocks, sane counts",
+          statfs(dir, &sd) == 0 && sd.f_type == 0xef53 && sd.f_bsize == 4096 && sd.f_frsize == 4096 &&
+              sd.f_blocks > 0 && sd.f_bavail <= sd.f_bfree && sd.f_bfree <= sd.f_blocks && sd.f_namelen == 255, 0);
+    check("statfs on a file, and fstatfs, see the same filesystem",
+          fd >= 0 && statfs(path, &sf) == 0 && sf.f_blocks == sd.f_blocks && fstatfs(fd, &sf) == 0 &&
+              sf.f_blocks == sd.f_blocks, 0);
+    if (fd >= 0) close(fd);
+    unlink(path);
+    *__errno() = 0;
+    check("statfs of a missing path: ENOENT", statfs("/no/such/dir", &sd) == -1 && *__errno() == 2, 0);
+
+    char* args[] = {"prog", "-a", "-b", "val", "--long=x", "rest", 0};
+    static const struct option longs[] = {{"long", 1, 0, 'L'}, {0, 0, 0, 0}};
+    char seen[64] = {0};
+    int k = 0;
+    for (int c; (c = getopt_long(6, args, "ab:", longs, 0)) != -1 && k < 40;) {
+        seen[k++] = (char)c;
+        if ((c == 'b' || c == 'L') && optarg) {
+            seen[k++] = '=';
+            for (const char* q = optarg; *q && k < 50; ++q) seen[k++] = *q;
+        }
+        seen[k++] = ' ';
+    }
+    check_str("getopt_long and optarg", seen, "a b=val L=x ");
+    check("optind stops at the first operand", optind == 5, 0);
+    optind = 1;
+    char* again[] = {"prog", "-b", "v", 0};
+    check("optind = 1 restarts getopt", getopt(3, again, "ab:") == 'b' && strcmp(optarg, "v") == 0 && optind == 3, 0);
+}
+
+// ---- the rest -------------------------------------------------------------------------
+static void test_misc(void) {
+    struct timespec a, b2;
+    clock_gettime(1, &a);
+    struct timespec ten_ms = {0, 10000000};
+    nanosleep(&ten_ms, 0);
+    clock_gettime(1, &b2);
+    const long ns = (b2.tv_sec - a.tv_sec) * 1000000000L + (b2.tv_nsec - a.tv_nsec);
+    check("CLOCK_MONOTONIC advances across nanosleep(10 ms)", ns >= 9000000 && ns < 500000000, 0);
+    clock_gettime(0, &a);
+    check("CLOCK_REALTIME is after 2020", a.tv_sec > 1577836800L, 0);
+    char v[92];
+    check("__system_property_get", __system_property_get("ro.product.cpu.abi", v) > 0 && strcmp(v, "x86_64") == 0, v);
+    setenv("WINAPK_TEST", "yes", 1);
+    check("setenv/getenv", getenv("WINAPK_TEST") && strcmp(getenv("WINAPK_TEST"), "yes") == 0, 0);
+    char* m = mmap(0, 65536, 3, 0x22, -1, 0);  // PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS
+    check("mmap anonymous is zeroed and writable", m != (char*)-1 && m[100] == 0 && (m[100] = 7) == 7, 0);
+    munmap(m, 65536);
+    // An allocator-style reservation: 8 GiB of PROT_NONE, then one piece
+    // opened with mprotect.
+    char* big = mmap(0, 1UL << 33, 0, 0x22, -1, 0);
+    int opened = big != (char*)-1 && mprotect(big + (1UL << 32), 65536, 3) == 0;
+    if (opened) big[(1UL << 32) + 10] = 5;
+    check("mmap reserves 8 GiB with PROT_NONE; mprotect commits a piece", opened && big[(1UL << 32) + 10] == 5, 0);
+    if (big != (char*)-1) munmap(big, 1UL << 33);
+    int found = 0;
+    for (char** e = environ; e && *e; ++e) found |= strcmp(*e, "WINAPK_TEST=yes") == 0;
+    check("environ lists the guest environment", found, 0);
+    check("sysconf(_SC_PAGESIZE)", sysconf(0x27) == 4096, 0);
+}
+
+// Signals are never delivered on Windows, but what the calls set must read
+// back (crash reporters chain to the handler they replace), and libgen,
+// fnmatch and mkstemp. See src/bionic/signal.cpp.
+struct guest_sigaction {
+    void (*handler)(int);
+    unsigned long flags, restorer, mask;  // 32 bytes, as on LP64 bionic
+};
+struct guest_stack {
+    void* sp;
+    int flags;
+    unsigned long size;
+};
+int sigemptyset(unsigned long*);
+int sigaddset(unsigned long*, int);
+int sigismember(const unsigned long*, int);
+int sigaction(int, const struct guest_sigaction*, struct guest_sigaction*);
+int sigaltstack(const struct guest_stack*, struct guest_stack*);
+int sigprocmask(int, const unsigned long*, unsigned long*);
+int timer_create(int, void*, void**);
+char* dirname(const char*);
+char* basename(const char*);
+int fnmatch(const char*, const char*, int);
+int mkstemp(char*);
+static void on_signal(int sig) { (void)sig; }
+
+static void test_signals_and_paths(const char* dir) {
+    unsigned long set;
+    check("sigemptyset/sigaddset/sigismember",
+          sigemptyset(&set) == 0 && sigaddset(&set, 11) == 0 && sigismember(&set, 11) == 1 &&
+              sigismember(&set, 6) == 0 && set == (1UL << 10),
+          0);
+    struct guest_sigaction act = {on_signal, 0x08000000, 0, 0}, old;
+    memset(&old, 0x55, sizeof old);
+    int first = sigaction(11, &act, &old);
+    check("sigaction reports SIG_DFL first, all of it zeroed", first == 0 && old.handler == 0 && old.flags == 0, 0);
+    struct guest_sigaction back;
+    check("sigaction reports the handler set before",
+          sigaction(11, 0, &back) == 0 && back.handler == on_signal && back.flags == 0x08000000, 0);
+    struct guest_stack ss;
+    memset(&ss, 0x55, sizeof ss);
+    check("sigaltstack reports SS_DISABLE before one is set", sigaltstack(0, &ss) == 0 && ss.flags == 2, 0);
+    unsigned long block = 1UL << 1, was = 99;
+    sigprocmask(0, &block, 0);  // SIG_BLOCK
+    check("sigprocmask keeps the thread's mask", sigprocmask(2, 0, &was) == 0 && was == block, 0);
+    sigprocmask(2, &set, 0);
+    void* timer = 0;
+    check("timer_create gives an id", timer_create(1, 0, &timer) == 0 && timer != 0, 0);
+    check("dirname", strcmp(dirname("/data/app/lib.so"), "/data/app") == 0 && strcmp(dirname("lib.so"), ".") == 0 &&
+                         strcmp(dirname("/lib.so"), "/") == 0, 0);
+    check("basename", strcmp(basename("/data/app/lib.so/"), "lib.so") == 0, 0);
+    check("fnmatch", fnmatch("*.so", "libc.so", 0) == 0 && fnmatch("lib[a-c]?.so", "libcx.so", 0) == 0 &&
+                         fnmatch("*.so", "lib/c.so", 2) != 0 && fnmatch("[!a]*", "abc", 0) != 0, 0);
+    char path[512];
+    snprintf(path, sizeof path, "%s/tmpXXXXXX", dir);
+    const int fd = mkstemp(path);
+    check("mkstemp creates a new file", fd >= 0 && strcmp(path + strlen(path) - 6, "XXXXXX") != 0, path);
+    if (fd >= 0) close(fd);
+}
+
+EXPORT int bionic_test(const char* dir) {
+    printf("Bionic shim, from guest code\n");
+    test_printf();
+    test_strings();
+    test_threads();
+    test_tls();
+    test_locale_and_syscall();
+    test_event_fds();
+    test_sockets();
+    test_looper();
+    test_files(dir);
+    test_zlib(dir);
+    test_rand48_statfs_getopt(dir);
+    test_misc();
+    test_signals_and_paths(dir);
+    return failures;
+}

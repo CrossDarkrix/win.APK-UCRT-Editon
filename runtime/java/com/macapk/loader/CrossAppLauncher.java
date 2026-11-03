@@ -17,9 +17,7 @@
 // The trust boundary is the macOS user account (every Mac.apk app runs as this
 // user); what this guarantees is narrower and real: we only ever OPEN a bundle
 // that the installed-apps registry names AND whose own Info.plist agrees it is
-// that package's Mac.apk bundle directly under /Applications or the per-user
-// ~/Applications (where the installer puts it for a user who cannot write
-// /Applications, GitHub #28).
+// that package's Mac.apk bundle directly under /Applications.
 package com.macapk.loader;
 
 import android.content.ActivityNotFoundException;
@@ -40,31 +38,9 @@ public final class CrossAppLauncher {
      *  through to the pre-change path (performLaunch misses and logs). */
     static final boolean XAPP_START = !"0".equals(System.getenv("MACAPK_XAPP_START"));
 
-    /** Where an openable bundle must live: the two folders the installer
-     *  generates bundles in (InstallCore.swift Paths.bundleDirs). A parameter
-     *  for the gate's scratch root; there is deliberately no env seam that
-     *  widens it at runtime. */
+    /** Where an openable bundle must live. A parameter for the gate's scratch
+     *  root; there is deliberately no env seam that widens it at runtime. */
     static final String BUNDLES_ROOT = "/Applications";
-
-    /** BUNDLES_ROOT, then the per-user ~/Applications. */
-    static String[] bundleRoots() {
-        String home = System.getProperty("user.home");
-        if (home == null || home.isEmpty()) return new String[] { BUNDLES_ROOT };
-        return new String[] { BUNDLES_ROOT, new File(home, "Applications").getPath() };
-    }
-
-    /** validateBundle against each root in turn: null when the bundle is
-     *  valid under one of them, else the reason from the first root. */
-    static String validateBundleAnyRoot(String[] roots, String bundlePath, String pkg,
-                                        String dirName) {
-        String first = null;
-        for (String r : roots) {
-            String why = validateBundle(r, bundlePath, pkg, dirName);
-            if (why == null) return null;
-            if (first == null) first = why;
-        }
-        return first;
-    }
 
     private CrossAppLauncher() {}
 
@@ -80,7 +56,7 @@ public final class CrossAppLauncher {
         final String pkg = ai.packageName;
         final String bundlePath = bundle[0], dirName = bundle[1];
         final ComponentName target = new ComponentName(pkg, ai.name);
-        String why = validateBundleAnyRoot(bundleRoots(), bundlePath, pkg, dirName);
+        String why = validateBundle(BUNDLES_ROOT, bundlePath, pkg, dirName);
         if (why != null) {
             NativeLog.w(TAG, "start " + target.flattenToShortString() + ": bundle "
                     + bundlePath + " refused (" + why + ") -- not installed");

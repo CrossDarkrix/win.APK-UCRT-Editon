@@ -768,26 +768,7 @@ public abstract class Transition implements Cloneable {
         runAnimators();
     }
 
-    /** MACAPK_TRACE_TRANSITION=1: one line per run / animator end / end /
-     *  cancel of every transition (diagnostic). */
-    static final boolean sTraceTransition = "1".equals(System.getenv("MACAPK_TRACE_TRANSITION"));
-    /** A listener that throws is the APP's bug on a device too (AOSP does not
-     *  catch here), so we keep the other listeners running but never hide it:
-     *  a swallowed throw in a TransitionListener left leanback's headers
-     *  transition half-finished with no trace. */
-    void macapkListenerThrew(String what, Throwable t) {
-        StringBuilder sb = new StringBuilder("transition listener ").append(what).append(" threw: ").append(t);
-        StackTraceElement[] st = t.getStackTrace();
-        for (int i = 0; i < Math.min(8, st.length); i++) sb.append("\n    at ").append(st[i]);
-        com.macapk.loader.NativeLog.w("Mac.apk.Transition", sb.toString());
-    }
-    void macapkTraceT(String what) {
-        if (sTraceTransition) com.macapk.loader.NativeLog.i("Mac.apk.Transition", what + " "
-            + getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(this))
-            + " animators=" + mCurrentAnimators.size() + " pending=" + mNumInstances);
-    }
     void runAnimators() {
-        macapkTraceT("run");
         mEnded = false;
         if (mCurrentAnimators.isEmpty()) {
             // Nothing to animate -- still fire the start/end lifecycle so callers
@@ -802,9 +783,7 @@ public abstract class Transition implements Cloneable {
         for (Animator anim : mCurrentAnimators) {
             anim.addListener(new AnimatorListenerAdapter() {
                 @Override public void onAnimationEnd(Animator animation) {
-                    --mNumInstances;
-                    macapkTraceT("animator-end");
-                    if (mNumInstances == 0) dispatchEnd();
+                    if (--mNumInstances == 0) dispatchEnd();
                 }
             });
             anim.start();
@@ -816,30 +795,28 @@ public abstract class Transition implements Cloneable {
     void dispatchStart() {
         if (mListeners != null) {
             for (TransitionListener l : new ArrayList<TransitionListener>(mListeners)) {
-                try { l.onTransitionStart(this); } catch (Throwable t) { macapkListenerThrew("onTransitionStart", t); }
+                try { l.onTransitionStart(this); } catch (Throwable ignored) {}
             }
         }
     }
 
     void dispatchEnd() {
-        macapkTraceT(mEnded ? "end(again)" : "end");
         if (mEnded) return;
         mEnded = true;
         if (mListeners != null) {
             for (TransitionListener l : new ArrayList<TransitionListener>(mListeners)) {
-                try { l.onTransitionEnd(this); } catch (Throwable t) { macapkListenerThrew("onTransitionEnd", t); }
+                try { l.onTransitionEnd(this); } catch (Throwable ignored) {}
             }
         }
     }
 
     public void cancel() {
-        macapkTraceT("cancel");
         for (Animator a : new ArrayList<Animator>(mCurrentAnimators)) {
             try { a.cancel(); } catch (Throwable ignored) {}
         }
         if (mListeners != null) {
             for (TransitionListener l : new ArrayList<TransitionListener>(mListeners)) {
-                try { l.onTransitionCancel(this); } catch (Throwable t) { macapkListenerThrew("onTransitionCancel", t); }
+                try { l.onTransitionCancel(this); } catch (Throwable ignored) {}
             }
         }
     }

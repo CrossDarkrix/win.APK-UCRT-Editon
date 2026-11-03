@@ -112,32 +112,15 @@ public class Linkify {
     /** AOSP Linkify.addLinks(Spannable, int): add link spans for each enabled
      *  match type. Returns true iff at least one link was added. */
     public static boolean addLinks(Spannable text, int mask) {
-        return addLinks(text, mask, (java.util.function.Function<String, URLSpan>) null);
-    }
-
-    /** AOSP Linkify.addLinks(Spannable, int, Function&lt;String, URLSpan&gt;) (API 33,
-     *  android13 Linkify.java): the mask form with a URLSpan factory, so a caller
-     *  can substitute its own URLSpan subclass; null means a plain URLSpan.
-     *  Compose's text linking calls exactly this, and before it existed every
-     *  composition that linkified text died with NoSuchMethodError (the Epic
-     *  Games Store's product page force-closed, 2026-10-20). As AOSP, the
-     *  URLSpans already on the text are removed first, so links are rebuilt
-     *  rather than stacked. */
-    public static boolean addLinks(Spannable text, int mask,
-            java.util.function.Function<String, URLSpan> urlSpanFactory) {
         if (text == null || mask == 0) return false;
-        URLSpan[] old = text.getSpans(0, text.length(), URLSpan.class);
-        if (old != null) {
-            for (int i = old.length - 1; i >= 0; i--) text.removeSpan(old[i]);
-        }
         boolean added = false;
         if ((mask & WEB_URLS) != 0) {
             added |= gatherLinks(text, android.util.Patterns.WEB_URL,
-                                 new String[]{"http://", "https://", "ftp://", "www."}, urlSpanFactory);
+                                 new String[]{"http://", "https://", "ftp://", "www."});
         }
         if ((mask & EMAIL_ADDRESSES) != 0) {
             added |= gatherLinks(text, android.util.Patterns.EMAIL_ADDRESS,
-                                 new String[]{"mailto:"}, urlSpanFactory);
+                                 new String[]{"mailto:"});
         }
         // PHONE_NUMBERS / MAP_ADDRESSES intentionally not gathered (see header).
         return added;
@@ -172,8 +155,7 @@ public class Linkify {
     }
 
     private static boolean gatherLinks(Spannable text, java.util.regex.Pattern pattern,
-                                       String[] schemes,
-                                       java.util.function.Function<String, URLSpan> urlSpanFactory) {
+                                       String[] schemes) {
         boolean added = false;
         String content = text.toString();
         Matcher m = pattern.matcher(content);
@@ -182,8 +164,7 @@ public class Linkify {
             int end = m.end();
             if (!sUrlMatchFilter.acceptMatch(content, start, end)) continue;
             String url = makeUrl(m.group(0), schemes);
-            URLSpan span = (urlSpanFactory == null) ? new URLSpan(url) : urlSpanFactory.apply(url);
-            text.setSpan(span, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            text.setSpan(new URLSpan(url), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             added = true;
         }
         return added;

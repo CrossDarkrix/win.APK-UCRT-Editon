@@ -1440,28 +1440,17 @@ public final class PackageInstallerBackend {
      *  sweep (launcher/InstallCore.swift) cleans day-old leftovers here, so an
      *  interrupted session never accumulates. */
     public static File stagingRoot() throws IOException {
-        File dir = new File(System.getProperty("user.home"),
-                "Library/Application Support/Mac.apk/staging");
+        // MACAPK_STAGING_DIR: a host whose library lives elsewhere (Win.apk's
+        // runtime sets it to <data>\staging, next to its install helper's
+        // library).
+        String override = System.getenv("MACAPK_STAGING_DIR");
+        File dir = (override != null && !override.isEmpty()) ? new File(override)
+                : new File(System.getProperty("user.home"),
+                        "Library/Application Support/Mac.apk/staging");
         if (!dir.isDirectory() && !dir.mkdirs()) {
             throw new IOException("cannot create staging dir " + dir);
         }
         return dir;
-    }
-
-    /** Where the Mac.apk control panel (Mac.apk.app) may live, in order:
-     *  MACAPK_CANONICAL_APP (the app stub exports the one it resolved, which
-     *  covers any folder Launch Services knows), /Applications, then the
-     *  per-user ~/Applications (GitHub #13). The staged shared runtime ships
-     *  neither macapk-installhelper nor the location helper, so an installed
-     *  app finds both here. */
-    public static java.util.List<File> canonicalAppCandidates() {
-        java.util.List<File> out = new java.util.ArrayList<>();
-        String env = System.getenv("MACAPK_CANONICAL_APP");
-        if (env != null && !env.isEmpty()) out.add(new File(env));
-        out.add(new File("/Applications/Mac.apk.app"));
-        String home = System.getProperty("user.home");
-        if (home != null && !home.isEmpty()) out.add(new File(home, "Applications/Mac.apk.app"));
-        return out;
     }
 
     /** Find the install helper, for BOTH install surfaces (InstallIntentHandler
@@ -1495,14 +1484,9 @@ public final class PackageInstallerBackend {
                 }
             }
         } catch (Throwable ignored) {}
-        // The control panel: MACAPK_CANONICAL_APP (the stub exports the one it
-        // resolved), then the two standard install locations (GitHub #13: a
-        // Mac.apk in ~/Applications left installed apps with no helper).
-        for (File app : PackageInstallerBackend.canonicalAppCandidates()) {
-            File f = new File(app, "Contents/bin/macapk-installhelper");
-            if (f.canExecute()) return f;
-        }
-        return null;
+        File canonical = new File(
+                "/Applications/Mac.apk.app/Contents/bin/macapk-installhelper");
+        return canonical.canExecute() ? canonical : null;
     }
 
     public static final class HelperResult {

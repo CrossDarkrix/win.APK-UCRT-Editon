@@ -104,63 +104,6 @@ public class ScrollView extends FrameLayout {
         return mIsBeingDragged;
     }
 
-    /** AOSP ScrollView.onGenericMotionEvent (android14-release ScrollView.java:
-     *  942-996): a mouse wheel step scrolls by AXIS_VSCROLL x the vertical scroll
-     *  factor (64dp), clamped to the content; a step that cannot move the view
-     *  is not consumed, so it reaches the scroller around this one. A MOUSE never
-     *  overscrolls (canOverscroll is false for SOURCE_MOUSE).
-     *  WheelScroll.VIEWS=0: not handled (pre-v1.0.2273). */
-    @Override public boolean onGenericMotionEvent(MotionEvent event) {
-        if (com.macapk.loader.WheelScroll.VIEWS
-                && event.getAction() == MotionEvent.ACTION_SCROLL) {
-            final float axisValue;
-            if (event.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER)) {
-                axisValue = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-            } else if (event.isFromSource(android.view.InputDevice.SOURCE_ROTARY_ENCODER)) {
-                axisValue = event.getAxisValue(MotionEvent.AXIS_SCROLL);
-            } else {
-                axisValue = 0;
-            }
-            final float factor = android.view.ViewConfiguration.get(getContext())
-                    .getScaledVerticalScrollFactor();
-            final int delta = Math.round(axisValue * factor);
-            if (delta != 0) {
-                final int range = getScrollRange();
-                int oldScrollY = getScrollY();
-                int newScrollY = oldScrollY - delta;
-                final int overscrollMode = getOverScrollMode();
-                boolean canOverscroll = !event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
-                        && (overscrollMode == OVER_SCROLL_ALWAYS
-                        || (overscrollMode == OVER_SCROLL_IF_CONTENT_SCROLLS && range > 0));
-                boolean absorbed = false;
-                if (newScrollY < 0) {
-                    if (canOverscroll) {
-                        mEdgeGlowTop.onPullDistance(-(float) newScrollY / getHeight(), 0.5f);
-                        mEdgeGlowTop.onRelease();
-                        invalidate();
-                        absorbed = true;
-                    }
-                    newScrollY = 0;
-                } else if (newScrollY > range) {
-                    if (canOverscroll) {
-                        mEdgeGlowBottom.onPullDistance(
-                                (float) (newScrollY - range) / getHeight(), 0.5f);
-                        mEdgeGlowBottom.onRelease();
-                        invalidate();
-                        absorbed = true;
-                    }
-                    newScrollY = range;
-                }
-                if (newScrollY != oldScrollY) {
-                    super.scrollTo(getScrollX(), newScrollY);
-                    return true;
-                }
-                if (absorbed) return true;
-            }
-        }
-        return super.onGenericMotionEvent(event);
-    }
-
     @Override public boolean onTouchEvent(MotionEvent ev) {
         initVelocityTrackerIfNotExists();
         boolean handled = true;

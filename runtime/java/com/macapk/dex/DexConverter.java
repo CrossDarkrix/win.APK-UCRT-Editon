@@ -333,36 +333,143 @@ public final class DexConverter {
             try {
                 return convertOne(cls, hierarchy, plan, superIfaces, nestIndex, true);
             } catch (CodeWriter.CodeLengthExceeded e2) {
-                // ⭐ LAST RESORT: keep the CLASS, lose only the one method.
-                //
-                // Both rescues can legitimately refuse -- MethodSplitter will
-                // not cut inside a try range or between a method's first and
-                // last monitor op (MethodSplitter.java, rules 2 and 5), so a
-                // method that is one big try or one big lock has no legal cut,
-                // and MethodOutliner will not outline across a try range.
-                // Until this existed, that refusal dropped the ENTIRE class, and
-                // silently: the only report was a stderr line at convert time,
-                // so at runtime the app saw NoClassDefFoundError for a class its
-                // dex plainly defines, with nothing anywhere saying why.
-                //
-                // Measured on Instagram: SEVEN classes were dropped this way,
-                // and one of them (X/9Pu, a 24,040-code-unit expression
-                // dispatcher) is constructed on the render path. Its absence
-                // made X.DCj's constructor throw NoClassDefFoundError at run
-                // time, and X.DCj owns the view the whole UI mounts into, so
-                // nothing rendered -- with the real cause (a class the
-                // converter dropped) far away from the symptom. A class with
-                // 31 working methods and one that throws is strictly better
-                // than no class at all, and the throw NAMES ITSELF instead of
-                // surfacing as a missing type.
-                //
-                // This is a loud stub, not a silent one: the distinction
-                // MethodOutliner's header draws. Nothing is faked -- the method
-                // says exactly why it cannot run.
-                return convertOne(cls, hierarchy, plan, superIfaces, nestIndex,
-                                  true, true);
+                // Neither transform could bring the method under 65535 bytes.
+                // Before stubbing it, try once more with ConstReadingElision
+                // armed: a Dalvik constant is stored once per POSSIBLE reading
+                // (int and float, long and double), and dropping the readings
+                // nothing can observe shrinks a constant-heavy body, and with it
+                // the parts the transforms have to place. rescueWithElision ends
+                // in the same loud stub (see there) that used to come next, so
+                // this step can only improve the outcome.
+                return rescueWithElision(cls, hierarchy, plan, superIfaces, nestIndex);
+            } catch (RuntimeException e2) {
+                if (!poolFull(e2)) throw e2;       // the transforms filled the pool
+                return rescueWithElision(cls, hierarchy, plan, superIfaces, nestIndex);
             }
+        } catch (RuntimeException e) {
+            // The CONSTANT POOL, not a method, overflowed (JVMS 4.1:
+            // constant_pool_count is a u2, so at most 65534 usable entries).
+            // The code-length transforms cannot help -- they move code between
+            // methods of the SAME class, which share the one pool -- but dead
+            // constant readings are what fills such a pool: WhatsApp
+            // 2.26.41.71's X/0Ec, a 22,452-entry long[] table, needs ~49k
+            // entries and was heading for ~116k, a double and a float beside
+            // every long and int it stores.
+            // Anything else is a genuine failure and keeps propagating.
+            if (!poolFull(e)) throw e;
+            return rescueWithElision(cls, hierarchy, plan, superIfaces, nestIndex);
         }
+    }
+
+    /**
+     * The rescue ladder again, with {@link ConstReadingElision} armed on this
+     * thread: elision alone (no synthetic members), then elision plus
+     * MethodOutliner / MethodSplitter, then elision plus the oversize stub.
+     *
+     * <p>The stub is the LAST RESORT: keep the CLASS, lose only the one method.
+     * Both transforms can legitimately refuse -- MethodSplitter will not cut
+     * inside a try range or between a method's first and last monitor op
+     * (MethodSplitter.java, rules 2 and 5), and MethodOutliner will not outline
+     * across a try range. Before the stub existed that refusal dropped the
+     * ENTIRE class, silently, so at run time the app saw NoClassDefFoundError
+     * for a class its dex plainly defines (measured on Instagram: seven classes,
+     * one of them, X/9Pu, on the render path). A class with one method that
+     * throws -- and NAMES ITSELF in the message -- is strictly better than no
+     * class at all. This is a loud stub, not a silent one: the distinction
+     * MethodOutliner's header draws.
+     *
+     * <p>A constant pool that still overflows after elision propagates, and the
+     * class fails as before, now with a census of what filled the pool.
+     */
+    static byte[] rescueWithElision(DexClass cls, DexType.ClassHierarchy hierarchy,
+                                    InitRepointPlan plan, SuperInterfacePlan superIfaces,
+                                    NestIndex nestIndex) {
+        boolean was = ConstReadingElision.arm(true);
+        try {
+            try {
+                return convertOne(cls, hierarchy, plan, superIfaces, nestIndex, false);
+            } catch (CodeWriter.CodeLengthExceeded e) {
+                // elision alone was not enough; add the transforms
+            }
+            try {
+                return convertOne(cls, hierarchy, plan, superIfaces, nestIndex, true);
+            } catch (CodeWriter.CodeLengthExceeded e2) {
+                return stubPass(cls, hierarchy, plan, superIfaces, nestIndex);
+            }
+        } finally {
+            ConstReadingElision.arm(was);
+        }
+    }
+
+    /**
+     * The oversize-stub pass, with {@link ClinitPrecompute} armed: a
+     * &lt;clinit&gt; still over the limit whose every step is a whitelisted data
+     * operation gets the final state it computes emitted instead of the stub,
+     * so the class can initialise. Any other oversize method is stubbed exactly
+     * as before.
+     *
+     * <p>The precomputed initializer takes constant pool entries the stub does
+     * not (its data strings, its helpers). Should the class then run out of
+     * pool, it is converted once more with the rescue disarmed, which is the
+     * stub path as it was, so this pass can only improve the outcome.
+     */
+    static byte[] stubPass(DexClass cls, DexType.ClassHierarchy hierarchy,
+                           InitRepointPlan plan, SuperInterfacePlan superIfaces,
+                           NestIndex nestIndex) {
+        boolean was = ClinitPrecompute.arm(true);
+        ClinitPrecompute.resetFired();
+        try {
+            byte[] out;
+            try {
+                out = convertOne(cls, hierarchy, plan, superIfaces, nestIndex, true, true);
+            } catch (RuntimeException e) {
+                if (!ClinitPrecompute.fired() || !poolFull(e)) throw e;
+                ClinitPrecompute.arm(false);
+                ClinitPrecompute.resetFired();
+                return convertOne(cls, hierarchy, plan, superIfaces, nestIndex, true, true);
+            }
+            if (ClinitPrecompute.fired()) {
+                ClinitPrecompute.precomputed.incrementAndGet();
+                System.err.println("[" + Options.logTag + "] precomputed oversize <clinit> of "
+                    + cls.name() + " (" + ClinitPrecompute.lastSummary() + ")");
+            }
+            return out;
+        } finally {
+            ClinitPrecompute.arm(was);
+            ClinitPrecompute.resetFired();
+        }
+    }
+
+    /**
+     * Whether {@code m} on its own translates past code_length 65535, measured
+     * in a throwaway class file so the attempt leaves nothing behind in the
+     * real class's constant pool: a 100 KB data initializer's literals would
+     * otherwise stay there, unused, once ClinitPrecompute replaces the body.
+     */
+    static boolean overflowsAlone(DexClass cls, DexMethod m, DexType.ClassHierarchy hierarchy,
+                                  InitRepointPlan plan, SuperInterfacePlan superIfaces,
+                                  boolean allowOutlining) {
+        ClassFileWriter scratch = new ClassFileWriter(classAccessFlags(cls), cls.name(),
+            cls.superclassName(), cls.interfaceNames().toArray(new String[0]));
+        ClassFileWriter.MethodWriter smw =
+            scratch.addMethod(m.accessFlags() & METHOD_FLAGS_MASK, m.name(), m.descriptor());
+        try {
+            Translator.translate(m, smw, hierarchy, plan, superIfaces, allowOutlining);
+            CodeWriter body = smw.code();
+            return body != null && body.measuredLength() > 65535;
+        } catch (CodeWriter.CodeLengthExceeded e) {
+            return true;
+        } catch (RuntimeException e) {
+            return false;   // not a size problem; the real translation reports it
+        }
+    }
+
+    /** True when the failure is the constant pool running out of slots. */
+    static boolean poolFull(Throwable t) {
+        for (int depth = 0; t != null && depth < 8; depth++, t = t.getCause()) {
+            if (t instanceof ConstantPool.PoolFullException) return true;
+        }
+        return false;
     }
 
     static byte[] convertOne(DexClass cls, DexType.ClassHierarchy hierarchy,
@@ -385,6 +492,7 @@ public final class DexConverter {
             cls.name(),
             cls.superclassName() == null ? null : cls.superclassName(),
             cls.interfaceNames().toArray(new String[0]));
+        cw.setUnfinalForeignWrites(UNFINAL_FOREIGN_WRITES);
 
         String src = cls.sourceFile();
         if (src != null) cw.setSourceFile(src);
@@ -408,6 +516,21 @@ public final class DexConverter {
             applyMethodAnnotations(cw, mw, m, defaults.get(m.name()));
             if (m.isAbstract() || m.isNative()) continue;
             if (stubOversize) {
+                // An oversize <clinit> is usually a data table, and when it
+                // computes nothing but this class's own static state,
+                // ClinitPrecompute emits that state instead of the stub (which
+                // would make the CLASS fail to initialise). Measured in a
+                // scratch class first, so a body it replaces leaves no
+                // constants behind.
+                boolean precompute = ClinitPrecompute.armed() && ClinitPrecompute.candidate(m);
+                String refusal = null;
+                if (precompute && overflowsAlone(cls, m, hierarchy, plan, superIfaces, allowOutlining)) {
+                    refusal = ClinitPrecompute.tryEmit(cls, m, cw, mw);
+                    if (refusal == null) {
+                        m.releaseCode();
+                        continue;
+                    }
+                }
                 int over = -1;
                 try {
                     Translator.translate(m, mw, hierarchy, plan, superIfaces,
@@ -428,10 +551,23 @@ public final class DexConverter {
                     over = e.length;        // belt and braces
                 }
                 if (over >= 0) {
+                    mw.resetCode();
+                    if (precompute && refusal == null) {
+                        // The scratch measurement fit and this one did not
+                        // (a fuller pool needs wider ldc forms): still worth it.
+                        refusal = ClinitPrecompute.tryEmit(cls, m, cw, mw);
+                        if (refusal == null) {
+                            m.releaseCode();
+                            continue;
+                        }
+                    }
+                    if (refusal != null) {
+                        System.err.println("[" + Options.logTag + "] oversize <clinit> of "
+                            + cls.name() + " not precomputed: " + refusal);
+                    }
                     // Only THIS method is inexpressible; the rest of the class
                     // is fine. Emit a body that throws with the reason in the
                     // message, so a caller that actually reaches it says so.
-                    mw.resetCode();
                     Translator.emitUnsupportedBody(mw, m,
                         Options.syntheticPrefix + ": " + cls.name() + "." + m.name() + m.descriptor()
                         + " needs code_length " + over + ", over the JVM's 65535"
@@ -444,6 +580,14 @@ public final class DexConverter {
                         + " this one method throws if called");
                 }
             } else {
+                // Test knob DEX2JVM_CLINIT_PRECOMPUTE_FORCE=1: every <clinit>
+                // the rescue accepts, so a gate can exercise it on classes
+                // nowhere near the limit. Never set in normal use.
+                if (ClinitPrecompute.FORCE && ClinitPrecompute.candidate(m)
+                        && ClinitPrecompute.tryEmit(cls, m, cw, mw) == null) {
+                    m.releaseCode();
+                    continue;
+                }
                 Translator.translate(m, mw, hierarchy, plan, superIfaces, allowOutlining);
             }
             // The bytecode is written; nothing reads this body again, and the
@@ -467,8 +611,27 @@ public final class DexConverter {
             }
         }
 
-        return cw.toByteArray();
+        // toByteArray also clears ACC_FINAL on own fields written outside
+        // their initializer (UNFINAL_FOREIGN_WRITES).
+        byte[] bytes = cw.toByteArray();
+        List<String> unfinaled = cw.foreignWriteUnfinals();
+        if (!unfinaled.isEmpty()) {
+            foreignWriteClasses.incrementAndGet();
+            foreignWriteFields.addAndGet(unfinaled.size());
+            if (UNFINAL_DEBUG) {
+                System.err.println("[" + Options.logTag + "] unfinal " + cls.name() + ": "
+                    + String.join(" ", unfinaled) + " (written outside its initializer)");
+            }
+        }
+        return bytes;
     }
+
+    /** Classes, and fields, that UNFINAL_FOREIGN_WRITES changed, for the
+     *  convert report. Counted per successful conversion of a class. */
+    static final java.util.concurrent.atomic.AtomicInteger foreignWriteClasses =
+        new java.util.concurrent.atomic.AtomicInteger();
+    static final java.util.concurrent.atomic.AtomicInteger foreignWriteFields =
+        new java.util.concurrent.atomic.AtomicInteger();
 
     // ==================================================================
     // Annotations -> attributes
@@ -979,6 +1142,33 @@ public final class DexConverter {
      */
     static final boolean INITIALIZER_HELPER_FINALS =
             !"0".equals(System.getenv("DEX2JVM_INITIALIZER_HELPER_FINALS"));
+
+    /**
+     * DEX2JVM_UNFINAL_FOREIGN_WRITES (default ON; =0 keeps ACC_FINAL, byte for
+     * byte the old output).
+     *
+     * The general form of the rule above, for writes that are already in the
+     * DEX: in a class emitted at major_version 53 or above, clear ACC_FINAL on
+     * each own static field a method other than &lt;clinit&gt; writes, and on each
+     * own instance field a method other than &lt;init&gt; writes, as read from the
+     * emitted bytecode. ART lets any method of the class write its own finals,
+     * and obfuscated SDKs do (a static {@code init$0} filling a private static
+     * final table for &lt;clinit&gt;); HotSpot refuses it from version 53 on, so
+     * the class never initializes. Measured 2026-10-25 on com.leumi.leumiwallet
+     * 155.3.1, where o.ey.b.$$a killed the Firebase-Messaging thread: 399
+     * classes, 1,096 static fields, every other class byte-identical; none in
+     * WhatsApp. Helpers marked as initializer parts stay under
+     * DEX2JVM_INITIALIZER_HELPER_FINALS. See
+     * ClassFileWriter.unfinalFieldsWrittenOutsideInitializers.
+     *
+     * DEX2JVM_UNFINAL_DEBUG=1 prints one line per class it changes; the counts
+     * are always kept (foreignWriteClasses / foreignWriteFields) and the CLI
+     * reports them.
+     */
+    static final boolean UNFINAL_FOREIGN_WRITES =
+            !"0".equals(System.getenv("DEX2JVM_UNFINAL_FOREIGN_WRITES"));
+    static final boolean UNFINAL_DEBUG =
+            System.getenv("DEX2JVM_UNFINAL_DEBUG") != null;
 
     static int fieldAccessFlags(DexClass cls, DexField f, SuperInterfacePlan app) {
         int flags = f.accessFlags() & FIELD_FLAGS_MASK;

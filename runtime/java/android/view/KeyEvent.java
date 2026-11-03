@@ -785,19 +785,6 @@ public class KeyEvent extends InputEvent implements Parcelable {
      *  Per AOSP's own doc on this method, the lock keys (CAPS_LOCK/
      *  SCROLL_LOCK/NUM_LOCK) are NOT considered modifier keys and return
      *  false. */
-    /** AOSP KeyEvent.isConfirmKey (@hide, public static): the keys that
-     *  "confirm" a focused view -- what View.onKeyDown/onKeyUp click on. */
-    public static final boolean isConfirmKey(int keyCode) {
-        switch (keyCode) {
-            case KEYCODE_DPAD_CENTER:
-            case KEYCODE_ENTER:
-            case KEYCODE_SPACE:
-            case KEYCODE_NUMPAD_ENTER:
-                return true;
-            default:
-                return false;
-        }
-    }
     public static boolean isModifierKey(int keyCode) {
         switch (keyCode) {
             case KEYCODE_SHIFT_LEFT:

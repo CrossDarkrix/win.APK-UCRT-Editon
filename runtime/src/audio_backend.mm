@@ -41,8 +41,6 @@
 //   (PCM is little-endian on Android/arm).
 
 #import <AVFAudio/AVFAudio.h>
-#import <AudioToolbox/AudioToolbox.h>
-#import <CoreAudio/CoreAudio.h>
 #import <CoreAudio/HostTime.h>
 #import <Foundation/Foundation.h>
 #include <jni.h>
@@ -144,12 +142,6 @@ struct Ring {
     uint64_t mask = 0;
     std::atomic<uint64_t> wpos{0};  // written (producer advances)
     std::atomic<uint64_t> rpos{0};  // read    (consumer advances)
-    // How many elements the producer may have queued at once: the track's
-    // buffer size (AudioTrack.setBufferSizeInFrames), <= cap. `cap` is only
-    // the power-of-two STORAGE; without this the producer could fill all of
-    // it, and the storage is up to 2x the track's frameCount. Set by
-    // stream_create (MACAPK_AUDIO_AOSP_FRAMECOUNT) and set_buffer_size.
-    std::atomic<uint64_t> limit{0};
 
     void init(uint64_t want_elems) {
         uint64_t c = 1;
@@ -157,16 +149,12 @@ struct Ring {
         cap  = c;
         mask = c - 1;
         buf  = static_cast<float*>(std::calloc(cap, sizeof(float)));
-        limit.store(cap, std::memory_order_relaxed);
     }
     // Producer: push up to n elements. Returns number actually pushed.
     uint32_t push(const float* src, uint32_t n) {
         uint64_t w = wpos.load(std::memory_order_relaxed);
         uint64_t r = rpos.load(std::memory_order_acquire);
-        uint64_t lim = limit.load(std::memory_order_relaxed);
-        if (lim > cap) lim = cap;
-        uint64_t used = w - r;
-        uint64_t space = used < lim ? lim - used : 0;   // a shrunk limit may sit below the fill
+        uint64_t space = cap - (w - r);
         if (n > space) n = static_cast<uint32_t>(space);
         for (uint32_t i = 0; i < n; ++i) buf[(w + i) & mask] = src[i];
         wpos.store(w + n, std::memory_order_release);
@@ -254,17 +242,6 @@ struct Stream {
     int channels    = 2;
     int encoding    = ENC_PCM_16BIT;
     Ring ring;                       // MODE_RING
-    // The track's frameCount (AOSP AudioTrack::frameCount(), what
-    // getBufferCapacityInFrames answers): the app's requested buffer raised
-    // to the platform minimum. See stream_create.
-    uint32_t frame_count = 0;
-    // AudioTrack.getUnderrunCount(): starved render cycles, counted once per
-    // episode as AOSP ServerProxy::tallyUnderrunFrames does ("if
-    // (!mUnderrunning) { mCblk->u.mStreaming.mUnderrunCount++; mUnderrunning
-    // = true; }", media/libaudioclient/AudioTrackShared.cpp). Render thread
-    // writes; any thread reads.
-    std::atomic<uint32_t> underruns{0};
-    bool underrunning = false;   // render thread only
 
     // MODE_CLIP voice state.
     const float* clip_pcm = nullptr; // borrowed from a Clip (never freed)
@@ -426,10 +403,6 @@ struct WavDump {
     }
 };
 static WavDump* g_dump = nullptr;
-// Underrun episodes across every MODE_RING stream (see Stream::underruns), for
-// the MACAPK_AUDIO_PROBE [audio-stats] line: "pulled < wanted" there also counts
-// paused and stopped cycles, this counts only a PLAYING track starving.
-static std::atomic<uint64_t> g_underrun_episodes{0};
 
 static int16_t f2s16(float x) {
     if (x >  1.0f) x =  1.0f;
@@ -594,20 +567,6 @@ static OSStatus render_stream(Stream* s, BOOL* isSilence,
             s->last_render_nanos.store(ns, std::memory_order_relaxed);
         }
     }
-    // Underrun episodes, for getUnderrunCount: a PLAYING track that has
-    // already played something and now cannot fill the cycle. Before its
-    // first frame it has not started on Android either (the start threshold).
-    if (s->smode == MODE_RING && active) {
-        if (got < want) {
-            if (!s->underrunning && s->played_frames.load(std::memory_order_relaxed) > 0) {
-                s->underruns.fetch_add(1, std::memory_order_relaxed);
-                g_underrun_episodes.fetch_add(1, std::memory_order_relaxed);
-                s->underrunning = true;
-            }
-        } else {
-            s->underrunning = false;
-        }
-    }
     // Zero the tail (underrun) so we never emit garbage.
     for (uint32_t i = got; i < want && i < s->scratch_elems; ++i) s->scratch[i] = 0.0f;
 
@@ -685,14 +644,13 @@ static OSStatus render_stream(Stream* s, BOOL* isSilence,
                 float wpk; std::memcpy(&wpk, &pb, 4);
                 std::fprintf(stderr,
                     "[audio-stats] %.1fs: renders=%llu pulled=%llu/%llu "
-                    "nonsilent_renders=%llu peak=%.3f underruns=%llu\n",
+                    "nonsilent_renders=%llu peak=%.3f\n",
                     (now_ms - w0) / 1000.0,
                     (unsigned long long)a_calls.exchange(0, std::memory_order_relaxed),
                     (unsigned long long)a_got.exchange(0, std::memory_order_relaxed),
                     (unsigned long long)a_want.exchange(0, std::memory_order_relaxed),
                     (unsigned long long)a_loud.exchange(0, std::memory_order_relaxed),
-                    wpk,
-                    (unsigned long long)g_underrun_episodes.exchange(0, std::memory_order_relaxed));
+                    wpk);
                 std::fflush(stderr);
             }
         }
@@ -821,17 +779,6 @@ static void ensure_engine_locked() {
         const bool forced_fail = no_out && no_out[0] == '1';
         g_engine_started = forced_fail ? false
                                        : [g_engine startAndReturnError:&err];
-        // MACAPK_AUDIO_TEST_MUTE=1 is a TEST HOOK like the one above: the
-        // whole graph runs (render callbacks pull, rings drain, positions and
-        // underrun counts advance) but the mixer's output gain is 0, so a
-        // harness can drive a real app's audio on the owner's Mac without
-        // playing it out loud (debug/audio_latency_gate.sh notes). Never set
-        // it for a user.
-        const char* mute = std::getenv("MACAPK_AUDIO_TEST_MUTE");
-        if (g_engine_started && mute && mute[0] == '1') {
-            g_engine.mainMixerNode.outputVolume = 0.0f;
-            std::fprintf(stderr, "[audio] output muted (MACAPK_AUDIO_TEST_MUTE=1, test hook)\n");
-        }
         if (!g_engine_started) {
             std::fprintf(stderr, "[audio] AVAudioEngine start FAILED: %s\n",
                          forced_fail ? "forced by MACAPK_AUDIO_TEST_NO_OUTPUT=1 (test hook)"
@@ -877,109 +824,6 @@ static bool audio_honest_open() {
     return on;
 }
 
-// ---- A track's buffer is its frameCount, as on Android ---------------------
-// (MACAPK_AUDIO_AOSP_FRAMECOUNT, default ON.)
-//
-// THE BUG THIS FIXES (2026-10-20, owner report: "a very noticeable audio delay
-// in-game"). The ring used to be nextpow2(2 * max(app buffer, 120 ms)) frames
-// and every producer that writes as fast as the stream accepts (AudioTrack
-// WRITE_BLOCKING, AAudioStream_write, our OpenSL ES buffer-queue pull thread)
-// kept ALL of it full, so a sound reached the speaker 341 ms (48 kHz) to
-// 371 ms (44.1 kHz) after the app wrote it, whatever buffer the app asked for.
-// Measured by debug/audio_latency_gate.sh. Only the AAudio data-callback path
-// (its feeder keeps 3 bursts ahead) was spared.
-//
-// What Android does. A streaming AudioTrack's buffer is frameCount frames and
-// a blocking write blocks once frameCount (or the smaller
-// setBufferSizeInFrames value) is queued, so that is the most audio the app
-// can get ahead of the mixer. AudioFlinger PlaybackThread::createTrack_l
-// (frameworks/av services/audioflinger/Threads.cpp, android14, 2507-2525):
-// "Buffer depth is forced to be at least 2 x the normal mixer frame count and
-// cover audio hardware latency ... minFrameCount =
-// AudioSystem::calculateMinFrameCount(latencyMs, mNormalFrameCount,
-// mSampleRate, sampleRate, speed); ... if (frameCount < minFrameCount)
-// frameCount = minFrameCount;". calculateMinFrameCount (media/libaudioclient/
-// AudioSystem.cpp:318-339): "minBufCount = afLatencyMs / ((1000 *
-// afFrameCount) / afSampleRate); if (minBufCount < 2) minBufCount = 2; ...
-// return minBufCount * sourceFramesNeededWithTimestretch(sampleRate,
-// afFrameCount, afSampleRate, speed);" and AudioResamplerPublic.h:84-110
-// sourceFramesNeeded = equal rates ? dst : dst * src / dst_rate + 1 + 1, then
-// "required * (double)speed + 1 + 1". A requested frameCount of 0 (OpenSL ES:
-// AudioPlayer_to_android.cpp:1650 "0, // frameCount"; AAudio with no
-// setBufferCapacityInFrames: AudioStreamTrack.cpp:96) is raised to that
-// minimum the same way.
-//
-// Our mixer thread is the host's CoreAudio IO cycle, so afFrameCount /
-// afSampleRate are the output device's IO buffer size and rate, and
-// afLatency covers that buffer plus the device's safety offset (the part of
-// the HAL pipeline that pulls from us). The device's own presentation latency
-// (a Bluetooth link's 100+ ms) is downstream of the pull and does not drain
-// the ring any faster, so it is not counted: on Android it stops at the HAL
-// too. At 48 kHz with a 512-frame IO buffer that is 2 * (512 + 2) = 1028
-// frames, ~21 ms, against the old 16384.
-//
-// =0 restores the old sizing exactly (ring and fill both
-// nextpow2(2 * max(buffer, 120 ms)); a 0 request is treated as the old OpenSL
-// constant 4096). docs/audio-output-latency_2026-10-20.md.
-static bool aosp_frame_count_on() {
-    static const bool on = [] {
-        const char* g = std::getenv("MACAPK_AUDIO_AOSP_FRAMECOUNT");
-        return !(g && g[0] == '0');
-    }();
-    return on;
-}
-
-struct HalParams { uint32_t frames; uint32_t rate; uint32_t latency_ms; };
-
-// The output device's IO cycle, read from the engine's output unit (AUHAL
-// passes kAudioDevicePropertyBufferFrameSize through, kAudioUnitScope_Global).
-// Falls back to 512 frames at the output rate (macOS's default IO buffer) when
-// a query fails. Caller holds g_mtx and the engine is started.
-static HalParams host_hal_locked() {
-    HalParams hp{512, 48000, 0};
-    UInt32 safety = 0;
-    @autoreleasepool {
-        if (g_engine) {
-            AVAudioFormat* of = [g_engine.outputNode outputFormatForBus:0];
-            if (of && of.sampleRate >= 4000) hp.rate = (uint32_t)of.sampleRate;
-            AudioUnit au = g_engine.outputNode.audioUnit;
-            if (au) {
-                UInt32 v = 0, sz = sizeof v;
-                if (AudioUnitGetProperty(au, kAudioDevicePropertyBufferFrameSize,
-                                         kAudioUnitScope_Global, 0, &v, &sz) == noErr
-                    && v >= 16 && v <= 16384)
-                    hp.frames = v;
-                AudioDeviceID dev = 0; sz = sizeof dev;
-                if (AudioUnitGetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
-                                         kAudioUnitScope_Global, 0, &dev, &sz) == noErr
-                    && dev != 0) {
-                    AudioObjectPropertyAddress a{kAudioDevicePropertySafetyOffset,
-                                                 kAudioObjectPropertyScopeOutput,
-                                                 kAudioObjectPropertyElementMain};
-                    UInt32 so = 0; sz = sizeof so;
-                    if (AudioObjectGetPropertyData(dev, &a, 0, nullptr, &sz, &so) == noErr
-                        && so < 16384)
-                        safety = so;
-                }
-            }
-        }
-    }
-    hp.latency_ms = (uint32_t)((uint64_t)(hp.frames + safety) * 1000u / hp.rate);
-    return hp;
-}
-
-// AudioSystem::calculateMinFrameCount with speed 1.0, against host_hal_locked.
-static uint32_t min_frame_count(const HalParams& hp, uint32_t sample_rate) {
-    uint32_t period_ms = (uint32_t)((1000ull * hp.frames) / hp.rate);
-    uint32_t min_buf_count = period_ms ? hp.latency_ms / period_ms : 2;
-    if (min_buf_count < 2) min_buf_count = 2;
-    uint64_t needed = sample_rate == hp.rate
-        ? hp.frames
-        : (uint64_t)hp.frames * sample_rate / hp.rate + 1 + 1;   // sourceFramesNeeded
-    needed = needed + 1 + 1;                                     // ...WithTimestretch, speed 1
-    return (uint32_t)(min_buf_count * needed);
-}
-
 extern "C" int64_t macapk_audio_stream_create(int sample_rate, int channels,
                                                  int encoding, int buffer_frames) {
     if (audio_honest_open()) {
@@ -1011,34 +855,14 @@ extern "C" int64_t macapk_audio_stream_create(int sample_rate, int channels,
     // original bit-exact copy path until an app calls setPlaybackRate.
     s->playback_sr.store(sample_rate, std::memory_order_relaxed);
 
-    HalParams hal{0, 0, 0};
-    if (aosp_frame_count_on()) {
-        // The track's frameCount: the app's request raised to the platform
-        // minimum (see aosp_frame_count_on). The ring's storage rounds up to
-        // a power of two; ring.limit is what the producer may actually fill.
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            ensure_engine_locked();
-            hal = host_hal_locked();
-        }
-        uint64_t fc = buffer_frames > 0 ? (uint64_t)buffer_frames : 0;
-        uint64_t minfc = min_frame_count(hal, (uint32_t)sample_rate);
-        if (fc < minfc) fc = minfc;
-        if (fc > (1u << 22)) fc = 1u << 22;
-        s->frame_count = (uint32_t)fc;
-        s->ring.init(fc * (uint64_t)channels);
-        s->ring.limit.store(fc * (uint64_t)channels, std::memory_order_relaxed);
-    } else {
-        // Pre-2026-10-20 sizing (MACAPK_AUDIO_AOSP_FRAMECOUNT=0): honor the
-        // app's buffer but floor at ~120 ms, x2 headroom, and let the producer
-        // fill all of it.
-        if (buffer_frames <= 0) buffer_frames = 4096;   // the old OpenSL ES constant
-        uint64_t want_frames = (uint64_t)buffer_frames;
-        uint64_t floor_frames = (uint64_t)(sample_rate * 0.12);
-        if (want_frames < floor_frames) want_frames = floor_frames;
-        s->ring.init(want_frames * (uint64_t)channels * 2);
-        s->frame_count = (uint32_t)buffer_frames;
-    }
+    // Ring capacity: honor the app's buffer (for realtime pacing via
+    // backpressure) but floor at ~120 ms so SR-conversion jitter doesn't
+    // underrun, and provide headroom (x2) so the producer isn't perpetually
+    // wall-to-wall with the consumer.
+    uint64_t want_frames = (uint64_t)buffer_frames;
+    uint64_t floor_frames = (uint64_t)(sample_rate * 0.12);
+    if (want_frames < floor_frames) want_frames = floor_frames;
+    s->ring.init(want_frames * (uint64_t)channels * 2);
 
     // Render scratch: enough for a large CoreAudio callback (device buffer
     // can be up to a few thousand frames). 8192 frames is generous.
@@ -1061,10 +885,9 @@ extern "C" int64_t macapk_audio_stream_create(int sample_rate, int channels,
     if (trace_on()) {
         std::fprintf(stderr,
             "[audio] stream_create h=%lld sr=%d ch=%d enc=%d bufFrames=%d "
-            "frameCount=%u ringElems=%llu hal=%u@%u/%ums engineOK=%d\n",
+            "ringElems=%llu engineOK=%d\n",
             (long long)handle, sample_rate, channels, encoding, buffer_frames,
-            s->frame_count, (unsigned long long)s->ring.cap, hal.frames, hal.rate,
-            hal.latency_ms, g_engine_started ? 1 : 0);
+            (unsigned long long)s->ring.cap, g_engine_started ? 1 : 0);
     }
     return handle;
 }
@@ -1293,48 +1116,6 @@ extern "C" bool macapk_audio_stream_get_timestamp(int64_t h, int64_t* out_frames
     *out_nanos  = (int64_t)s->last_render_nanos.load(std::memory_order_relaxed);
     return true;
 }
-// AudioTrack.getBufferCapacityInFrames() / AAudioStream_getBufferCapacityInFrames:
-// the track's frameCount (AOSP AudioTrack::frameCount()).
-extern "C" int macapk_audio_stream_buffer_capacity(int64_t h) {
-    Stream* s = stream_of(h);
-    return s ? (int)s->frame_count : 0;
-}
-// AudioTrack.getBufferSizeInFrames() / AAudioStream_getBufferSizeInFrames: how
-// much of the buffer the producer may fill (frameCount until it is lowered).
-extern "C" int macapk_audio_stream_buffer_size(int64_t h) {
-    Stream* s = stream_of(h);
-    if (!s || s->channels <= 0) return 0;
-    if (!aosp_frame_count_on()) return (int)s->frame_count;
-    return (int)(s->ring.limit.load(std::memory_order_relaxed) / (uint64_t)s->channels);
-}
-// AudioTrack.setBufferSizeInFrames / AAudioStream_setBufferSizeInFrames: lower
-// (or restore) the fill threshold, which is what cuts the latency. AOSP
-// ClientProxy::setBufferSizeInFrames (media/libaudioclient/AudioTrackShared.cpp
-// :128-147): "const uint32_t minimum = 16; // based on AudioMixer::BLOCKSIZE
-// const uint32_t maximum = frameCount();" and clips to [minimum, maximum],
-// returning the clipped size. A shrink below the current fill drops nothing:
-// the producer just waits until the ring drains under the new size.
-// Under MACAPK_AUDIO_AOSP_FRAMECOUNT=0 it only reports min(size, frameCount),
-// which is what the Java layer answered before.
-extern "C" int macapk_audio_stream_set_buffer_size(int64_t h, int frames) {
-    Stream* s = stream_of(h);
-    if (!s || s->channels <= 0) return 0;
-    uint32_t maximum = s->frame_count;
-    uint32_t size = frames < 0 ? 0 : (uint32_t)frames;
-    if (!aosp_frame_count_on()) return (int)std::min(size, maximum);
-    const uint32_t minimum = 16;
-    if (maximum < minimum)    size = maximum;
-    else if (size < minimum)  size = minimum;
-    else if (size > maximum)  size = maximum;
-    s->ring.limit.store((uint64_t)size * (uint64_t)s->channels, std::memory_order_relaxed);
-    return (int)size;
-}
-
-extern "C" int macapk_audio_stream_underruns(int64_t h) {
-    Stream* s = stream_of(h);
-    return s ? (int)s->underruns.load(std::memory_order_relaxed) : 0;
-}
-
 // Frames currently buffered (written but not yet rendered). Lets a producer
 // (e.g. the AAudio feeder driving a guest mixer callback) pace itself to a
 // realtime lead instead of running far ahead and overrunning the guest's
@@ -2419,12 +2200,6 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_macapk_loader_NativeAudio_nativeMpIsPlaying(JNIEnv*, jclass, jlong h) { return macapk_mp_is_playing((int64_t)h) ? JNI_TRUE : JNI_FALSE; }
 extern "C" JNIEXPORT void JNICALL
 Java_com_macapk_loader_NativeAudio_nativeMpRelease(JNIEnv*, jclass, jlong h) { macapk_mp_release((int64_t)h); }
-extern "C" JNIEXPORT jint JNICALL
-Java_com_macapk_loader_NativeAudio_nativeGetBufferCapacity(JNIEnv*, jclass, jlong h) { return macapk_audio_stream_buffer_capacity((int64_t)h); }
-extern "C" JNIEXPORT jint JNICALL
-Java_com_macapk_loader_NativeAudio_nativeGetUnderrunCount(JNIEnv*, jclass, jlong h) { return macapk_audio_stream_underruns((int64_t)h); }
-extern "C" JNIEXPORT jint JNICALL
-Java_com_macapk_loader_NativeAudio_nativeSetBufferSize(JNIEnv*, jclass, jlong h, jint frames) { return macapk_audio_stream_set_buffer_size((int64_t)h, frames); }
 
 static const JNINativeMethod kNativeAudioMethods[] = {
     {(char*)"nativeCreate",       (char*)"(IIII)J", (void*)Java_com_macapk_loader_NativeAudio_nativeCreate},
@@ -2467,9 +2242,6 @@ static const JNINativeMethod kNativeAudioMethods[] = {
     {(char*)"nativeMpPosition",   (char*)"(J)I",     (void*)Java_com_macapk_loader_NativeAudio_nativeMpPosition},
     {(char*)"nativeMpIsPlaying",  (char*)"(J)Z",     (void*)Java_com_macapk_loader_NativeAudio_nativeMpIsPlaying},
     {(char*)"nativeMpRelease",    (char*)"(J)V",     (void*)Java_com_macapk_loader_NativeAudio_nativeMpRelease},
-    {(char*)"nativeGetBufferCapacity", (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeAudio_nativeGetBufferCapacity},
-    {(char*)"nativeSetBufferSize",     (char*)"(JI)I", (void*)Java_com_macapk_loader_NativeAudio_nativeSetBufferSize},
-    {(char*)"nativeGetUnderrunCount",  (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeAudio_nativeGetUnderrunCount},
 };
 
 // Called from native_methods.cpp::RegisterAllNativeMethods at boot.

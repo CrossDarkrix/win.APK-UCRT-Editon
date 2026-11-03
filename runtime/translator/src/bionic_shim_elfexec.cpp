@@ -104,7 +104,6 @@
 // (PT_INTERP / DF_1_PIE / ET_EXEC), and this file names no package, no
 // library and no address. See docs/apk-native-executables_2026-07-29.md.
 
-#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -405,19 +404,6 @@ extern "C" void __macapk_guest_env_exec(char** envp);   // bionic_shim.cpp
 namespace {
 
 bool g_elfexec_process = false;
-// Set once the RUNTIME process has loaded a guest ELF through __macapk_runtime_guest_dlopen,
-// so dlsym/dlclose only take dl_mu() for a handle that could be one of ours.
-std::atomic<bool> g_runtime_dl_used{false};
-
-// MACAPK_RUNTIME_ELF_DLOPEN (default ON; =0 restores the pre-change path, where the request
-// reaches host dyld and fails): see __macapk_runtime_guest_dlopen.
-bool runtime_elf_dlopen_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("MACAPK_RUNTIME_ELF_DLOPEN");
-        return !(e && e[0] == '0');
-    }();
-    return on;
-}
 
 bool elfexec_dlopen_on() {
     static const bool on = [] {
@@ -648,46 +634,11 @@ int __macapk_elfexec_guest_dlopen(const char* path, int bionic_flag, void** out)
     return 1;
 }
 
-// The same route in the RUNTIME process (2026-10-19), for a dlopen that NAMES A FILE.
-// __macapk_arm64_dlopen tries its own cases first (platform-library markers, the app's
-// translated lib_native wrappers for a bare name or a nativeLibraryDir path) and calls this
-// only for what is left, with the path already remapped from its Android spelling. Without
-// it such a request reached host dyld, which cannot load a Linux ELF. On a device the app's
-// classloader namespace dlopens any readable library by path, including one the app wrote
-// itself: bionic linker.cpp open_library opens a name containing '/' as-is, and Android 10's
-// W^X rule restricts execve() from app data, not dlopen(). MEASURED need: Lemuroid 1.17.0
-// downloads a libretro core into files/cores/<ver>/ and LibretroDroid dlopen()s it by
-// absolute path, so every game closed with "Cannot dlopen library".
-// A bare name is NOT handled here: in the runtime process that stays the lib_native lookup.
-// Returns 1 when handled (the result in *out), 0 to fall through to host dlopen.
-int __macapk_runtime_guest_dlopen(const char* path, int bionic_flag, void** out) {
-    *out = nullptr;
-    if (g_elfexec_process || !runtime_elf_dlopen_on() || !path || path[0] != '/') return 0;
-    const std::string file(path);
-    if (!is_arm64_elf(file)) return 0;
-    std::lock_guard<std::mutex> lk(dl_mu());
-    g_runtime_dl_used.store(true, std::memory_order_release);
-    char rp[PATH_MAX];
-    const std::string key = ::realpath(file.c_str(), rp) ? std::string(rp) : file;
-    if (bionic_flag & 0x4) {                                   // RTLD_NOLOAD
-        auto hit = dl_by_path().find(key);
-        if (hit != dl_by_path().end()) { *out = hit->second; return 1; }
-        *out = __macapk_arm64_native_find_loaded_file(key.c_str());
-        if (*out) dl_libs().emplace(*out, GuestLib{});
-        return 1;
-    }
-    *out = load_tree(file, 0);
-    std::fprintf(stderr, "[arm64-shim] dlopen(\"%s\") -> %s through the Stage-6 loader\n",
-                 path, *out ? "guest ELF loaded" : "FAILED to load the ELF or a DT_NEEDED library");
-    std::fflush(stderr);
-    return 1;
-}
-
 // dlsym on a handle __macapk_elfexec_guest_dlopen returned: the library, then its DT_NEEDED
 // tree (bionic dlsym_handle_lookup's local-group walk). Returns 1 if `handle` is one of ours.
 int __macapk_elfexec_guest_dlsym(void* handle, const char* name, void** out) {
     *out = nullptr;
-    if ((!g_elfexec_process && !g_runtime_dl_used.load(std::memory_order_acquire)) || !handle) return 0;
+    if (!g_elfexec_process || !handle) return 0;
     std::lock_guard<std::mutex> lk(dl_mu());
     auto it = dl_libs().find(handle);
     if (it == dl_libs().end()) return 0;
@@ -705,7 +656,7 @@ int __macapk_elfexec_guest_dlsym(void* handle, const char* name, void** out) {
 // tracks references, so a guest image is never unmapped (Python never dlcloses its
 // extension modules either). 1 == the handle is ours (the caller returns 0, success).
 int __macapk_elfexec_guest_dlclose(void* handle) {
-    if ((!g_elfexec_process && !g_runtime_dl_used.load(std::memory_order_acquire)) || !handle) return 0;
+    if (!g_elfexec_process || !handle) return 0;
     std::lock_guard<std::mutex> lk(dl_mu());
     return dl_libs().count(handle) ? 1 : 0;
 }

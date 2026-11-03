@@ -3863,15 +3863,6 @@ void CocoaTakeHostUrls(std::vector<std::string>& out) {
     g_host_urls.clear();
 }
 
-void CocoaQueueHostUrl(const char* url) {
-    if (!url || !url[0]) return;
-    {
-        std::lock_guard<std::mutex> lk(g_host_url_mu);
-        if (g_host_urls.size() < 64) g_host_urls.emplace_back(url);
-    }
-    macapk_notify_host_url();
-}
-
 }  // namespace macapk -- the ObjC handler below must be at global scope
    // (same reason as the appearance observer further down); reopened after it.
 
@@ -10695,9 +10686,6 @@ static void install_window_delegate(NSWindow* w) {
 - (void)debugSyntheticTouchAction:(int)action atViewX:(CGFloat)vx Y:(CGFloat)vy;
 - (void)debugSyntheticKey:(int)keycode unicode:(int)uni;
 - (void)macapkMagnifyPhase:(int)phase magnification:(double)magnification at:(NSPoint)p;
-- (void)macapkRotatePhase:(int)phase rotation:(double)degrees at:(NSPoint)p;
-- (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)precise
-                 phase:(NSEventPhase)ph momentumPhase:(NSEventPhase)mph;
 - (void)macapkTrackpadReset;
 - (void)macapkTrackpadClaimForButton;
 - (void)macapkTrackpadContacts:(int)n ids:(const int*)ids phases:(const int*)phases
@@ -10947,8 +10935,6 @@ static bool MacApkGuestTextTargetActive() {
 
 @implementation MacApkMetalView {
     double _pinchSpan;   // synthesized finger separation for magnifyWithEvent: (view points)
-    double _pinchAngle;  // synthesized finger axis for rotateWithEvent: (radians, CCW, y up)
-    BOOL   _twoMag, _twoRot;  // which recognizer holds the synthesized two-finger stream open
     // Host trackpad contacts (MACAPK_TRACKPAD_MULTITOUCH, see touchesBeganWithEvent:).
     // The NSTouch.identity -> int map is PROCESS-global (MacapkTrackpadIds), not per view,
     // so a replaced view keeps the ids the mapper already tracks.
@@ -11031,39 +11017,6 @@ static bool MacApkGuestTextTargetActive() {
 // the mouse handlers above and the synthesized scroll-drag below. The
 // Java dispatch(IFFFF) scales by the backing factor and Y-flips into
 // Android pixel coords (origin top-left).
-// TouchDispatcher.dispatchWheel(x, y, viewW, viewH, vscroll, hscroll): YES when
-// the step went to a taken native input queue.
-- (BOOL)macapkWheelToQueueAt:(NSPoint)p v:(CGFloat)v h:(CGFloat)h {
-    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return NO;
-    JNIEnv* env = nullptr;
-    JavaVM* vm = macapk::g_touch_vm;
-    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
-    if (r == JNI_EDETACHED) {
-        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return NO;
-    } else if (r != JNI_OK || !env) return NO;
-    static jmethodID mid = nullptr;
-    static bool looked = false;
-    if (!looked) {
-        looked = true;
-        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
-        mid = env->GetMethodID(cls, "dispatchWheel", "(FFFFFF)Z");
-        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(cls);
-    }
-    if (!mid) return NO;
-    jboolean took = env->CallBooleanMethod(macapk::g_touch_dispatcher, mid,
-                                           (jfloat) p.x, (jfloat) p.y,
-                                           (jfloat) self.bounds.size.width,
-                                           (jfloat) self.bounds.size.height,
-                                           (jfloat) v, (jfloat) h);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        return NO;
-    }
-    return took ? YES : NO;
-}
-
 - (void)dispatchTouchAction:(int)action atPoint:(NSPoint)p {
     if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) {
         static dispatch_once_t warnToken;
@@ -11122,122 +11075,6 @@ static bool MacApkGuestTextTargetActive() {
     }
 }
 
-// HOST MOUSE as an Android mouse (MACAPK_MOUSE_POINTER, default ON; GitHub #21).
-// Every button event -- left, right and other -- updates the pressed-button set
-// and hands it, with the modifier meta state and the pointer, to
-// TouchDispatcher.dispatchHostMouse, which emits what AOSP's CursorInputMapper
-// emits (SOURCE_MOUSE / TOOL_TYPE_MOUSE, real buttonState, BUTTON_PRESS /
-// BUTTON_RELEASE, metaState). AppKit's buttonNumber 0..4 (left, right, middle,
-// back, forward) is AOSP's BUTTON_PRIMARY..BUTTON_FORWARD bit order, so the bit
-// is 1 << buttonNumber. =0 restores the finger path for the left button and
-// leaves right / other with super, the pre-change behaviour.
-static int g_host_mouse_buttons = 0;   // main thread only
-static bool MacApkMousePointerEnabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("MACAPK_MOUSE_POINTER");
-        return !(v && std::strcmp(v, "0") == 0);
-    }();
-    return on;
-}
-
-- (BOOL)macapkHostMouse:(NSEvent*)event press:(int)press {
-    if (!MacApkMousePointerEnabled()) return NO;
-    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return NO;
-    NSInteger n = [event buttonNumber];
-    int bit = (n >= 0 && n <= 4) ? (1 << n) : 0;
-    if (press > 0) g_host_mouse_buttons |= bit;
-    else if (press < 0) g_host_mouse_buttons &= ~bit;
-    JNIEnv* env = nullptr;
-    JavaVM* vm = macapk::g_touch_vm;
-    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
-    if (r == JNI_EDETACHED) {
-        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return NO;
-    } else if (r != JNI_OK || !env) return NO;
-    static jmethodID mid = nullptr;
-    static bool looked = false;
-    if (!looked) {
-        looked = true;
-        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
-        mid = env->GetMethodID(cls, "dispatchHostMouse", "(IIFFFF)V");
-        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(cls);
-    }
-    if (!mid) return NO;
-    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
-    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
-    // Keep the teardown CANCEL bookkeeping (macapk_cancel_active_touch) in step.
-    const bool down = (g_host_mouse_buttons & 0x7) != 0;
-    macapk::g_touch_is_down = down;
-    macapk::g_touch_last_x = p.x; macapk::g_touch_last_y = p.y;
-    macapk::g_touch_last_w = w;   macapk::g_touch_last_h = h;
-    const int meta = macapk::hostkey::PointerMetaState([event modifierFlags]);
-    macapk::MacApkInputPriorityBegin();
-    env->CallVoidMethod(macapk::g_touch_dispatcher, mid, (jint) g_host_mouse_buttons,
-                        (jint) meta, (jfloat) p.x, (jfloat) p.y, (jfloat) w, (jfloat) h);
-    macapk::MacApkInputPriorityEnd();
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-    return YES;
-}
-
-// HOVER (GitHub #25, MACAPK_HOVER_EVENTS default ON): AppKit sends mouseMoved: /
-// mouseExited: to a view only through a tracking area. Pointer movement with no
-// button held goes through macapkHostMouse:press:0 (an unchanged, empty button
-// set), which TouchDispatcher turns into a SOURCE_MOUSE HOVER_MOVE and, per
-// window, HOVER_ENTER / HOVER_EXIT; leaving the view exits the hovered window.
-// ActiveAlways: Android hovers whatever window is under the pointer, focused or
-// not, and so does a Mac app under the cursor.
-static bool MacApkHoverEnabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("MACAPK_HOVER_EVENTS");
-        return !(v && std::strcmp(v, "0") == 0);
-    }();
-    return on;
-}
-- (void)updateTrackingAreas {
-    [super updateTrackingAreas];
-    if (!MacApkHoverEnabled() || !MacApkMousePointerEnabled()) return;
-    for (NSTrackingArea* ta in [self.trackingAreas copy]) {
-        if (ta.owner == self && ta.userInfo[@"macapk.hover"]) [self removeTrackingArea:ta];
-    }
-    NSTrackingArea* ta = [[NSTrackingArea alloc]
-        initWithRect:NSZeroRect
-             options:(NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited
-                      | NSTrackingActiveAlways | NSTrackingInVisibleRect)
-               owner:self
-            userInfo:@{ @"macapk.hover": @YES }];
-    [self addTrackingArea:ta];
-}
-- (void)mouseMoved:(NSEvent*)event {
-    if (!MacApkHoverEnabled() || ![self macapkHostMouse:event press:0]) [super mouseMoved:event];
-}
-- (void)mouseExited:(NSEvent*)event {
-    if (!MacApkHoverEnabled() || !MacApkMousePointerEnabled()
-            || !macapk::g_touch_vm || !macapk::g_touch_dispatcher) { [super mouseExited:event]; return; }
-    JNIEnv* env = nullptr;
-    JavaVM* vm = macapk::g_touch_vm;
-    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
-    if (r == JNI_EDETACHED) {
-        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return;
-    } else if (r != JNI_OK || !env) return;
-    static jmethodID mid = nullptr;
-    static bool looked = false;
-    if (!looked) {
-        looked = true;
-        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
-        mid = env->GetMethodID(cls, "dispatchHostMouseExit", "(FFFF)V");
-        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(cls);
-    }
-    if (!mid) return;
-    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
-    env->CallVoidMethod(macapk::g_touch_dispatcher, mid, (jfloat) p.x, (jfloat) p.y,
-                        (jfloat) self.bounds.size.width, (jfloat) self.bounds.size.height);
-    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
-}
-
 - (void)mouseDown:(NSEvent*)event {
     // A click on our window that did not make it key (the owner's grey-traffic-
     // light report): AppKit normally activates the app and keys the window on
@@ -11250,13 +11087,9 @@ static bool MacApkHoverEnabled() {
         [w makeKeyAndOrderFront:nil];
         [NSApp activate];
     }
-    if ([self macapkHostMouse:event press:1]) return;
     [self dispatchMouseAction:0 atEvent:event];
 }
-- (void)mouseDragged:(NSEvent*)event {
-    if ([self macapkHostMouse:event press:0]) return;
-    [self dispatchMouseAction:2 atEvent:event];
-}
+- (void)mouseDragged:(NSEvent*)event { [self dispatchMouseAction:2 atEvent:event]; }
 
 // HOST TRACKPAD CONTACTS -> Android multi-pointer (MACAPK_TRACKPAD_MULTITOUCH, default ON).
 //
@@ -11339,18 +11172,8 @@ static int g_tpNextId = 0;
 // whatever is under the cursor (a "Delete" button, say). A button taking two fingers
 // cancels / suppresses them (TrackpadGestureMapper.claim); the responder-chain behaviour
 // of the click itself is unchanged ([super ...]).
-- (void)rightMouseDown:(NSEvent*)event {
-    [self macapkTrackpadClaimForButton];
-    if (![self macapkHostMouse:event press:1]) [super rightMouseDown:event];
-}
-- (void)otherMouseDown:(NSEvent*)event {
-    [self macapkTrackpadClaimForButton];
-    if (![self macapkHostMouse:event press:1]) [super otherMouseDown:event];
-}
-- (void)rightMouseDragged:(NSEvent*)event { if (![self macapkHostMouse:event press:0]) [super rightMouseDragged:event]; }
-- (void)otherMouseDragged:(NSEvent*)event { if (![self macapkHostMouse:event press:0]) [super otherMouseDragged:event]; }
-- (void)rightMouseUp:(NSEvent*)event { if (![self macapkHostMouse:event press:-1]) [super rightMouseUp:event]; }
-- (void)otherMouseUp:(NSEvent*)event { if (![self macapkHostMouse:event press:-1]) [super otherMouseUp:event]; }
+- (void)rightMouseDown:(NSEvent*)event { [self macapkTrackpadClaimForButton]; [super rightMouseDown:event]; }
+- (void)otherMouseDown:(NSEvent*)event { [self macapkTrackpadClaimForButton]; [super otherMouseDown:event]; }
 
 // Flatten one AppKit touch event: every indirect touch of the event (the ones
 // that just ended or were cancelled included, at their final position), a
@@ -11497,10 +11320,7 @@ static JNIEnv* MacapkTouchJniEnv() {
 }
 - (void)macapkTrackpadClaimForScroll { [self macapkTrackpadClaim:YES]; }
 - (void)macapkTrackpadClaimForButton { [self macapkTrackpadClaim:NO]; }
-- (void)mouseUp:(NSEvent*)event {
-    if ([self macapkHostMouse:event press:-1]) return;
-    [self dispatchMouseAction:1 atEvent:event];
-}
+- (void)mouseUp:(NSEvent*)event      { [self dispatchMouseAction:1 atEvent:event]; }
 
 // TRACKPAD PINCH -> a synthesized TWO-FINGER Android gesture.
 //
@@ -11525,80 +11345,18 @@ static JNIEnv* MacapkTouchJniEnv() {
     [self macapkMagnifyPhase:phase magnification:event.magnification at:p];
 }
 
-// TRACKPAD ROTATE (GitHub #22). macOS recognizes a two-finger twist as its own
-// gesture, NSEventTypeRotate, carrying `rotation` in degrees (counterclockwise
-// positive), just as it reports a pinch as magnify. Without this handler a twist
-// that starts the moment the fingers land reached the app as nothing: the
-// fingers MOVE before the 100 ms settle, so TrackpadGestureMapper leaves the
-// contact to the macOS recognizers (a scroll or a pinch), and nobody handled
-// the one that fired. Only a twist after a pause worked, through the hold.
-// It rides the synthesized pinch: the same two fingers around the cursor, with
-// their axis turned by the accumulated rotation. A twist that also spreads is
-// one stream that both recognizers feed (macOS sends magnify and rotate events
-// for the same contact), which is what a touchscreen app sees when two real
-// fingers twist and spread at once. AOSP's touchpad stack has no rotate
-// gesture (GestureConverter maps a two-finger swipe and a pinch only), so this
-// is the touchscreen contract, like the hold. A rotate with no phase (not a
-// trackpad gesture) has no end to close the stream with, so it is ignored.
-- (void)rotateWithEvent:(NSEvent*)event {
-    if (event.phase == NSEventPhaseNone) { [super rotateWithEvent:event]; return; }
-    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
-    const int phase = (event.phase & NSEventPhaseBegan) ? 0
-                    : (event.phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) ? 2 : 1;
-    [self macapkRotatePhase:phase rotation:event.rotation at:p];
-}
-
-// The bodies of magnifyWithEvent: / rotateWithEvent: below the NSEvent decode,
-// so the harness (CocoaDebugTrackpad kinds 1 and 3) runs exactly what a real
-// pinch or twist runs.
+// The body of magnifyWithEvent: below the NSEvent decode, so the harness
+// (CocoaDebugTrackpad kind 1) runs exactly what a real pinch runs.
 - (void)macapkMagnifyPhase:(int)phase magnification:(double)magnification at:(NSPoint)p {
-    [self macapkTwoFinger:0 phase:phase delta:magnification at:p];
-}
-- (void)macapkRotatePhase:(int)phase rotation:(double)degrees at:(NSPoint)p {
-    [self macapkTwoFinger:1 phase:phase delta:degrees at:p];
-}
-
-// One synthesized two-finger stream (DOWN, POINTER_DOWN, MOVE*, POINTER_UP, UP)
-// held open while either recognizer (0 magnify, 1 rotate) is live. A pinch
-// alone produces exactly what it always did.
-- (void)macapkTwoFinger:(int)which phase:(int)phase delta:(double)d at:(NSPoint)p {
-    BOOL& mine = which == 0 ? _twoMag : _twoRot;
     if (phase == 0) {
-        // A began for a recognizer already live means its end was lost: close
-        // that stream before starting a fresh one, never two DOWNs in a row.
-        if (mine) { _twoMag = _twoRot = NO; [self dispatchPinchPhase:2 at:p span:_pinchSpan]; }
-        const BOOL live = _twoMag || _twoRot;
-        mine = YES;
-        if (!live) {
-            _pinchSpan = 120.0;             // base finger separation in view points
-            _pinchAngle = 0.0;
-            [self dispatchPinchPhase:0 at:p span:_pinchSpan];
-        }
-        return;
+        _pinchSpan = 120.0;                 // base finger separation in view points
+    } else if (phase == 1) {
+        // A magnification of +1.0 doubles the span; clamp so a violent gesture cannot invert it.
+        _pinchSpan *= (1.0 + magnification);
+        if (_pinchSpan < 16.0) _pinchSpan = 16.0;
+        if (_pinchSpan > 4000.0) _pinchSpan = 4000.0;
     }
-    if (phase == 1) {
-        if (!(_twoMag || _twoRot)) {
-            // A change with no began (the harness, or a began this view never
-            // saw): open the stream first.
-            _pinchSpan = 120.0;
-            _pinchAngle = 0.0;
-            [self dispatchPinchPhase:0 at:p span:_pinchSpan];
-        }
-        mine = YES;
-        if (which == 0) {
-            // A magnification of +1.0 doubles the span; clamp so a violent gesture cannot invert it.
-            _pinchSpan *= (1.0 + d);
-            if (_pinchSpan < 16.0) _pinchSpan = 16.0;
-            if (_pinchSpan > 4000.0) _pinchSpan = 4000.0;
-        } else {
-            _pinchAngle += d * M_PI / 180.0;
-        }
-        [self dispatchPinchPhase:1 at:p span:_pinchSpan];
-        return;
-    }
-    if (!mine) return;                      // an end for a recognizer that never began
-    mine = NO;
-    if (!(_twoMag || _twoRot)) [self dispatchPinchPhase:2 at:p span:_pinchSpan];
+    [self dispatchPinchPhase:phase at:p span:_pinchSpan];
 }
 
 - (void)dispatchPinchPhase:(int)phase at:(NSPoint)p span:(double)span {
@@ -11612,13 +11370,13 @@ static JNIEnv* MacapkTouchJniEnv() {
     static jmethodID s_pinchMid = nullptr;
     if (!s_pinchMid) {
         jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
-        s_pinchMid = env->GetMethodID(cls, "dispatchTwoFinger", "(IFFFFFF)V");
+        s_pinchMid = env->GetMethodID(cls, "dispatchPinch", "(IFFFFF)V");
         env->DeleteLocalRef(cls);
         if (!s_pinchMid) { env->ExceptionClear(); return; }
     }
     NSSize sz = self.bounds.size;
     env->CallVoidMethod(macapk::g_touch_dispatcher, s_pinchMid, (jint)phase,
-                        (jfloat)p.x, (jfloat)p.y, (jfloat)span, (jfloat)_pinchAngle,
+                        (jfloat)p.x, (jfloat)p.y, (jfloat)span,
                         (jfloat)sz.width, (jfloat)sz.height);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
@@ -11644,29 +11402,13 @@ static JNIEnv* MacapkTouchJniEnv() {
 // The synthetic DOWN is held back until the gesture clears touch-slop, so a
 // tiny scroll never lands as a spurious tap/click on the target underneath.
 - (void)scrollWheel:(NSEvent*)event {
-    [self macapkScrollAt:[self convertPoint:[event locationInWindow] fromView:nil]
-                      dx:event.scrollingDeltaX dy:event.scrollingDeltaY
-                 precise:event.hasPreciseScrollingDeltas
-                   phase:event.phase momentumPhase:event.momentumPhase];
-}
-
-// The body of scrollWheel:, split out so the harness (CocoaDebugTrackpad kind
-// 2, inject verb `hostwheel`) runs exactly what a real wheel notch runs: a
-// background app cannot be sent a scroll event by pid.
-- (void)macapkScrollAt:(NSPoint)p dx:(CGFloat)dx dy:(CGFloat)dy precise:(BOOL)precise
-                 phase:(NSEventPhase)ph momentumPhase:(NSEventPhase)mph {
-    // A classic wheel step over a window whose input queue was taken
-    // (NativeActivity / GameActivity) goes there as the ACTION_SCROLL Android
-    // delivers (TouchDispatcher.dispatchWheel, MACAPK_WHEEL_SCROLL_EVENT): the
-    // drag below arrives inside one frame and a native app polling its pointer
-    // state never sees it. AOSP signs: AXIS_VSCROLL +1 = up (macOS deltaY > 0
-    // for a wheel turned away), AXIS_HSCROLL +1 = right (macOS deltaX > 0 is a
-    // scroll to the LEFT). Trackpad phases keep the drag.
-    if (!precise && ph == NSEventPhaseNone && mph == NSEventPhaseNone
-        && (dx != 0.0 || dy != 0.0)
-        && [self macapkWheelToQueueAt:p v:dy h:-dx]) {
-        return;
-    }
+    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
+    CGFloat dx = event.scrollingDeltaX;
+    CGFloat dy = event.scrollingDeltaY;
+    // Precise (trackpad) deltas are already in points; line-based (classic
+    // wheel) deltas are small integers -> amplify so a notch moves a usable
+    // distance that also clears touch slop.
+    if (!event.hasPreciseScrollingDeltas) { dx *= 16.0; dy *= 16.0; }
     // v1.0.569 trackpad-feel knobs (owner: two-finger lane-steering in
     // swipe games overshoots -- a natural flick travels 100-300 points +
     // a momentum tail, which a swipe-segmenting game reads as several
@@ -11677,41 +11419,24 @@ static JNIEnv* MacapkTouchJniEnv() {
     //    like a real touchscreen finger; Android-side flings still work
     //    because the guest's velocity tracker computes them from the
     //    drag's release velocity (on-device semantics).
-    // v1.0.570 picked scale 0.5 + no-momentum ON (the owner A/B'd both side
-    // by side for Subway steering, "100% better"). No-momentum stays the
-    // default. The scale is 1.0 for the TRACKPAD since GitHub #24: a precise
-    // delta is the distance the content moves under the fingers in macOS
-    // points, and the synthesized finger must travel that same distance or
-    // every direct-manipulation surface (a map, a list) pans at half the
-    // speed of the same app on the desktop. Android's own touchpad stack
-    // (GestureConverter::handleScroll, TWO_FINGER_SWIPE) moves its fake
-    // finger by the gesture's full delta, unscaled. The halving the owner
-    // liked mostly came from the momentum tail, which is still off.
-    // MACAPK_SCROLL_SCALE=0.5 restores the old travel for an A/B.
-    static const char* kScaleEnv = getenv("MACAPK_SCROLL_SCALE");
+    // v1.0.570 DEFAULTS: scale 0.5 + no-momentum ON -- the owner A/B'd
+    // both configs side by side (Subway steering) and picked this one
+    // ("100% better"). Override with MACAPK_SCROLL_SCALE=1 /
+    // MACAPK_SCROLL_NO_MOMENTUM=0 to restore the old feel.
     static const CGFloat kScrollScale = []{
-        double v = kScaleEnv ? atof(kScaleEnv) : 1.0;
-        return (CGFloat)((v >= 0.05 && v <= 4.0) ? v : 1.0);
+        const char* e = getenv("MACAPK_SCROLL_SCALE");
+        double v = e ? atof(e) : 0.5;
+        return (CGFloat)((v >= 0.05 && v <= 4.0) ? v : 0.5);
     }();
     static const bool kNoMomentum = []{
         const char* e = getenv("MACAPK_SCROLL_NO_MOMENTUM");
         return !e || e[0] != '0';
     }();
-    // Line-based (classic wheel) deltas are small integers -> amplify so a
-    // notch moves a usable distance. A notch keeps the travel it has had since
-    // v1.0.570 (16 pt per line x the then-global 0.5 = 8 pt; the 24 pt
-    // minimum below still applies): #24 is about the trackpad, and the wheel
-    // is not direct manipulation. An explicit MACAPK_SCROLL_SCALE still
-    // scales both, as before.
-    if (precise) {
-        dx *= kScrollScale;
-        dy *= kScrollScale;
-    } else {
-        const CGFloat wheel = 16.0 * (kScaleEnv ? kScrollScale : 0.5);
-        dx *= wheel;
-        dy *= wheel;
-    }
+    dx *= kScrollScale;
+    dy *= kScrollScale;
 
+    NSEventPhase ph  = event.phase;
+    NSEventPhase mph = event.momentumPhase;
     // Momentum-only events (fingers already lifted). With the knob set,
     // close any open drag at its current position and swallow the tail.
     if (kNoMomentum && ph == NSEventPhaseNone && mph != NSEventPhaseNone) {
@@ -11732,28 +11457,6 @@ static JNIEnv* MacapkTouchJniEnv() {
     // synthetic finger.
     if (ph == NSEventPhaseNone && mph == NSEventPhaseNone) {
         if (dx == 0.0 && dy == 0.0) return;
-        // "Past slop" has to be enforced, not assumed. A notch is a 1-line
-        // delta, and macOS wheel acceleration hands out FRACTIONAL lines
-        // (0.1..1.0) on slow turns, so after x16 x 0.5 a notch was a
-        // 0.8..8 pt drag. The guest's touch slop is 8dp (ViewConfiguration
-        // TOUCH_SLOP; 1dp is 1pt here, density follows the screen's backing
-        // scale), and a DOWN..UP that stays inside it is a TAP on Android:
-        // turning the wheel over a list clicked whatever row was under the
-        // pointer (measured 2026-10-19, Metrolist: a 1px drag on a song row
-        // started that song; the owner's own wheel notches logged 0.8, 1.0,
-        // 3.9 and 11.5 px drags). So a notch travels at least
-        // kWheelMinTravelPt (3x slop) in the direction it was turned.
-        // MACAPK_WHEEL_MIN_TRAVEL=0 restores the old travel.
-        static const bool kWheelMinTravel = []{
-            const char* e = getenv("MACAPK_WHEEL_MIN_TRAVEL");
-            return !e || e[0] != '0';
-        }();
-        static const CGFloat kWheelMinTravelPt = 24.0;
-        const CGFloat len = hypot(dx, dy);
-        if (kWheelMinTravel && len > 0.0 && len < kWheelMinTravelPt) {
-            dx *= kWheelMinTravelPt / len;
-            dy *= kWheelMinTravelPt / len;
-        }
         NSPoint b = NSMakePoint(p.x + dx, p.y - dy);
         [self dispatchTouchAction:0 atPoint:p];
         [self dispatchTouchAction:2 atPoint:b];
@@ -11799,20 +11502,9 @@ static JNIEnv* MacapkTouchJniEnv() {
     }
     if (ended && _scrollActive) {
         if (_scrollDownSent) {
-            // A scroll must never land as a tap. DOWN waits for 6pt of travel,
-            // but the guest's slop is 8dp (~8pt), so a short two-finger nudge
-            // that ended between the two lifted as a TAP on whatever was under
-            // the pointer. End such a gesture with CANCEL, which every Android
-            // gesture detector treats as "no click". MACAPK_WHEEL_MIN_TRAVEL=0
-            // restores the UP.
-            static const bool kScrollNoTap = []{
-                const char* e = getenv("MACAPK_WHEEL_MIN_TRAVEL");
-                return !e || e[0] != '0';
-            }();
-            const bool tapSized = hypot(_scrollAcc.x, _scrollAcc.y) < 12.0;
-            [self dispatchTouchAction:(kScrollNoTap && tapSized) ? 3 : 1
+            [self dispatchTouchAction:1
                 atPoint:NSMakePoint(_scrollAnchor.x + _scrollAcc.x,
-                                    _scrollAnchor.y + _scrollAcc.y)];  // UP (or CANCEL)
+                                    _scrollAnchor.y + _scrollAcc.y)];  // UP
         }
         _scrollActive = NO;
         _scrollDownSent = NO;
@@ -12274,8 +11966,7 @@ namespace macapk {
 // kind 0: a[2..] = (id, phase, nx, ny) per contact -- EVERY contact currently on the pad,
 // stationary ones included (phase 2), exactly as AppKit's touchesMatchingPhase:NSTouchPhaseAny
 // reports them: the mapper treats a tracked contact a frame does not name as lost.
-// kind 1: a[2] phase, a[3] mag.  kind 3: a[2] phase, a[3] rotation degrees.
-// kind 4: a precise (trackpad) scroll event, a[2] phase, a[3] dy, a[4] dx in points.
+// kind 1: a[2] phase, a[3] mag.
 bool CocoaDebugTrackpad(int kind, const float* a, int n) {
     if (n < 2) return false;
     std::vector<float> args(a, a + n);
@@ -12296,38 +11987,6 @@ bool CocoaDebugTrackpad(int kind, const float* a, int n) {
         if (kind == 1) {
             if (args.size() < 4) return;
             [mv macapkMagnifyPhase:(int)args[2] magnification:(double)args[3] at:p];
-            ok = true;
-            return;
-        }
-        if (kind == 3) {
-            // A trackpad twist: a[2] phase 0|1|2, a[3] rotation in degrees (CCW +).
-            if (args.size() < 4) return;
-            [mv macapkRotatePhase:(int)args[2] rotation:(double)args[3] at:p];
-            ok = true;
-            return;
-        }
-        if (kind == 4) {
-            // A two-finger trackpad scroll event: a[2] phase 0 began | 1 changed |
-            // 2 ended, a[3] scrollingDeltaY, a[4] scrollingDeltaX, in POINTS
-            // (hasPreciseScrollingDeltas), no momentum.
-            if (args.size() < 5) return;
-            const NSEventPhase ph = args[2] == 0 ? NSEventPhaseBegan
-                                  : args[2] == 1 ? NSEventPhaseChanged : NSEventPhaseEnded;
-            std::fprintf(stderr, "[wheel] harness trackpad phase=%d dy=%.2f dx=%.2f pt\n",
-                         (int)args[2], args[3], args[4]);
-            [mv macapkScrollAt:p dx:(CGFloat)args[4] dy:(CGFloat)args[3] precise:YES
-                         phase:ph momentumPhase:NSEventPhaseNone];
-            ok = true;
-            return;
-        }
-        if (kind == 2) {
-            // A classic (line) wheel notch: a[2] = scrollingDeltaY, a[3] =
-            // scrollingDeltaX, in lines, no phase -- the event a mouse wheel sends.
-            if (args.size() < 4) return;
-            std::fprintf(stderr, "[wheel] harness notch dy=%.2f dx=%.2f lines at (%.3f,%.3f)\n",
-                         args[2], args[3], args[0], args[1]);
-            [mv macapkScrollAt:p dx:(CGFloat)args[3] dy:(CGFloat)args[2] precise:NO
-                         phase:NSEventPhaseNone momentumPhase:NSEventPhaseNone];
             ok = true;
             return;
         }

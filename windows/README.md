@@ -1,0 +1,402 @@
+# Win.apk: the Windows x64 port
+
+Win.apk is an unofficial port of [Mac.apk](https://github.com/kksimp/Mac.apk) to
+Windows on Intel/AMD (x64). It is not affiliated with or endorsed by the Mac.apk
+project or Voltare. Win.apk's code lives in `windows/`; `runtime/` (the Android
+framework in Java and the shared native sources) comes from upstream and is kept
+close to it so that upstream fixes can still be merged. The macOS-only parts of
+upstream (the Swift launcher, the Mac build scripts, the prebuilt Mac libraries
+and the Mac documentation) are not in this repository.
+
+## Why x64 is a different problem from the Mac
+
+Mac.apk runs an app's native code as is, because Apple Silicon and Android phones
+are both arm64. An Intel/AMD CPU cannot execute arm64 code, so on x64 Android apps
+fall into three groups:
+
+| Apps | Plan |
+|---|---|
+| Java/Kotlin only (no `.so`) | Run on HotSpot like on the Mac. Needs only the host layer (window, input, ANGLE on D3D11, audio). |
+| Ship `lib/x86_64/*.so` | Load the x86_64 libraries natively with the loader in this directory. Full speed. |
+| ARM-only native code | `lib/arm64-v8a` is translated to x86-64 at install time (`winapk-aot`, see `include/winapk/arm64_aot.h`): integer code runs at about native speed, floating point and NEON at about 1.3x, calls into the host at about 2x. What the translation cannot follow runs through the arm64 JIT (dynarmic, 0BSD), about 2.6-6x; the interpreter (about 80x) checks both. 32-bit `armeabi-v7a` is not supported. |
+
+## What is here
+
+| Path | What it is |
+|---|---|
+| `include/winapk/elf64_defs.h` | ELF64 / x86-64 psABI layouts (Windows has no `<elf.h>`) |
+| `include/winapk/guest_abi.h` | `WINAPK_GUEST_ABI`: the boundary between System V and Microsoft x64 calls |
+| `src/elf_loader.cpp` | Android x86_64 ELF loader: segments, RELA/RELR/APS2 relocations, protections, RELRO, init/fini |
+| `src/elf_tls.cpp` | Dynamic ELF TLS for guest libraries: module ids, `__tls_get_addr`, a block per thread and module |
+| `src/fs_tls_patch.cpp` | Rewrites the Bionic stack guard `%fs:0x28` to `%gs:0x28` (`NT_TIB.ArbitraryUserPointer`) |
+| `src/mini_bionic.cpp`, `src/bionic/` | The Windows Bionic shim (sysv_abi functions over the UCRT and Win32): strings, printf, pthread, files, time, `mmap`, system properties and the environment, Android paths, pipes/eventfd/epoll, sockets on Winsock, `ALooper`, and `libz.so` on a statically linked zlib. `test/bionic_test.cpp` (`winapk-bionic-test`) checks it against `test/guest/bionic_guest.c` |
+| `tools/elfrun_main.cpp` | `winapk-elfrun`: loads `.so` files and runs the PoC checks |
+| `test/guest/poc_guest.c` | The Android x86_64 test library |
+| `include/winapk/abi_thunk.h`, `src/abi_thunk.cpp` | Runtime machine-code thunks for the JNI bridge: native-method thunks from Microsoft x64 callers to System V code (built per Java signature) and the System V variadic `va_list` entry stub |
+| `tools/gen_jni_slots.py`, `src/jni_slots.inc` | Generated `JNINativeInterface_` slot table (235 slots) the guest `JNIEnv` wrapper is built from |
+| `include/winapk/guest_jni.h`, `src/guest_jni.cpp` | The guest `JNIEnv`/`JavaVM` wrapper: per-thread guest env, a generic System V forwarder into HotSpot's table for every non-variadic slot, and `GetEnv`/`Attach`/`Detach`. Needs a JDK's `jni.h` at build time (`-DWINAPK_JNI_INCLUDE=$JAVA_HOME/include`) |
+| `include/winapk/jni_variadic.h`, `src/jni_variadic.cpp` | The variadic `Call<T>Method` / `...V` / `NewObject` bridge (31 families, one template keyed on the `...A` slot): reads the argument stream against the method signature and repacks it into the `jvalue[]` of HotSpot's A-form. Needs a `SignatureProvider` (JVMTI-backed in the real host, a map in tests) |
+| `include/winapk/linker.h`, `src/linker.cpp` | The guest linker: loads a library with its `DT_NEEDED` tree (bionic's lookup order, system libraries answered by the shim), keeps the registry of loaded images, and implements the guest's `dlopen`, `dlsym`, `dladdr`, `dlerror` and `dlclose`. `test/linker_test.cpp` (`winapk-linker-test`) checks it against `test/guest/link_guest.c` |
+| `include/winapk/jni_bind.h`, `src/jni_bind.cpp` | Binding guest natives into HotSpot: the guest `RegisterNatives` slot wraps each function in a thunk, and a JVMTI `NativeMethodBind` hook does the same for natives bound by name. Also the cached JVMTI signature provider |
+| `include/winapk/arm64_cpu.h`, `src/arm64/` | The arm64 track (M10): an AArch64 interpreter (`arm64_cpu.cpp` for integer, memory and branches, `arm64_simd.cpp` for FP and NEON) and its bridge to the host (`arm64_guest.cpp`, `include/winapk/arm64_guest.h`): AAPCS64 to System V calls into the shim, `va_list` conversion, host calls into guest code through an execute-fault handler, per-thread guest stacks and TLS. `ElfImage` loads arm64 libraries with it. `test/arm64_test.cpp` (`winapk-arm64-test`) checks the interpreter against the same C code built for the host, and the bridge against `test/guest/arm64_bridge_guest.c` |
+| `host/` | `winapk-runtime.exe`, the host that runs an APK: DEX conversion, the in-process JVM, the host natives (window and input, `NativeOs`, `NativeLooper`, `NativeImageCodec` with libwebp and WIC, `NativeAudio` on WASAPI; the rest are still stubs), app native libraries (`guest_libs.cpp`), and `Boot.run`. `test/audio_test.cpp` (`winapk-audio-test`) checks the audio backend |
+| `scripts/` | `build_java.sh` (upstream's Java runtime with a stock JDK), `build_framework_res.sh` (the platform resource APK) and `stage_runtime.sh` (a runnable `bin/` + `lib/` folder) |
+| `tools/jvmrun_main.cpp` | `winapk-jvm-run`: the real-JVM end-to-end test. Creates a HotSpot JVM, loads an Android x86_64 `.so` through the guest linker, runs its `JNI_OnLoad` (which registers a native itself), binds a second native through the `NativeMethodBind` hook, and calls both from Java; one of them calls back into Java through the guest `JNIEnv`. `test/guest/jni_guest.c` and `test/java/WinApkJniTest.java` are its inputs; `test/build_e2e.sh` builds them and `test/run_e2e_wine.sh` runs it under Wine |
+
+What the PoC checks: int/double/stack arguments across the ABI boundary, RELATIVE,
+`R_X86_64_64`, GLOB_DAT/JUMP_SLOT, RELR and Android APS2 relocations, `DT_INIT_ARRAY`,
+calls from guest code into the shim, host callbacks into guest code, and stack-protected guest code
+on the main thread and on new threads.
+
+## Build and run
+
+On Windows ([MSYS2](https://www.msys2.org/), CLANG64 shell):
+
+```sh
+pacman -S mingw-w64-clang-x86_64-{clang,cmake,ninja,zlib}
+cmake -S windows -B build -G Ninja && cmake --build build
+./build/winapk-elfrun.exe path/to/libwinapk_poc_guest.so
+```
+
+The guest libraries are built with plain clang + lld, so no NDK is needed:
+`windows/test/build_guest.sh`.
+
+On Linux (cross-compile, run under Wine): `windows/test/run_poc_wine.sh`.
+
+The JNI library and its tests (`winapk-jni-test`, `winapk-jni-variadic-test`,
+`winapk-jvm-run`) build only when CMake is given a JDK's include directory:
+`-DWINAPK_JNI_INCLUDE=$JAVA_HOME/include`.
+The real-JVM test runs under Wine with `windows/test/run_e2e_wine.sh`; see
+`PORTING.md`, section 9, for the full local setup.
+
+CI: `.github/workflows/windows-poc.yml` builds the guests on Ubuntu and runs all
+tests on a real `windows-latest` runner.
+
+Toolchain: clang only. MSVC cannot emit System V calls, and mingw GCC 13 emits
+broken SEH unwind data for `sysv_abi` functions.
+
+## Trying it
+
+Download `Win.apk-Setup.exe` (or `Win.apk-windows-x64.zip`) from the
+repository's Releases page. The installer puts Win.apk in the Start menu for
+the current user and opens `.apk` files with it. `Win.apk.exe` is the app
+library (`launcher/launcher_main.cpp`, the counterpart of upstream's
+`launcher/`):
+
+- **Adding an app:** drop an APK on it to install the app. The APK is copied into
+  `%LOCALAPPDATA%\Win.apk\library`, installed and converted once by
+  `winapk-runtime --install-only` (which also renders the app's icon and
+  resolves its name), and given Start menu and desktop shortcuts with its own
+  icon.
+- **Running and managing:** double-click an app to run it; right-click for Get
+  Info, shortcuts, its files and log, updating it from a newer APK,
+  reinstalling or removing it. Typing searches the library.
+- **Hebrew:** the library is in Hebrew, laid out right to left, when Windows
+  is; the settings can pick English or Hebrew instead.
+- **Settings** (the gear): language, light or dark theme, the default app for `.apk`
+  files, the phone's screen size and orientation, desktop shortcuts, and the
+  logs and app data folders.
+
+The package holds the runtime, a Java runtime, ANGLE and `README.txt`, which
+says what works, where app data and logs are, and what to attach to a bug
+report. Every CI run on
+`windows-latest` also uploads the same folder as the `winapk-preview`
+artifact.
+
+A release is made by running the "Windows release" workflow
+(`.github/workflows/windows-release.yml`) by hand with a tag such as
+`v0.1.0-preview`: it builds on Windows, packages `windows/package/` with the
+staged runtime, boots an APK from the package as a smoke test, builds the
+installer with Inno Setup, and publishes both as a GitHub pre-release with
+`windows/package/RELEASE_NOTES.md`.
+
+## Running an APK
+
+```sh
+windows/scripts/stage_runtime.sh build runtime     # after building with CMake
+runtime/bin/winapk-runtime.exe --apk app.apk --jdk "$JAVA_HOME"
+```
+
+`--apk` also takes a split bundle (`.apkm`, `.xapk` or `.apks`), installed once
+as `base.apk` plus `split_*.apk` under `%LOCALAPPDATA%\Win.apk\app`. The app
+opens in its own window, with its own icon, and takes mouse, wheel and keyboard input
+(Escape is Android's Back). Java-only apps work this way, including OpenGL
+from Java (`GLSurfaceView`, libGDX) on ANGLE, and so do apps that draw with
+OpenGL ES from their own native code through a SurfaceView (SDL games);
+`NativeActivity` apps and native audio (OpenSL ES, AAudio) are not there yet. App data goes to `%LOCALAPPDATA%\Win.apk`.
+
+The runtime and the app data may live in folders with names in any language,
+whatever "Language for non-Unicode programs" is set to: the runtime's manifest
+makes its ANSI code page UTF-8 (Windows 10 1903 and later), which is how the
+JVM gets such paths whole, and the steps that run in a separate JVM (install,
+DEX conversion) run in a child of `winapk-runtime.exe` rather than `java.exe`.
+Older Windows ignores the manifest; there the runtime passes the JVM 8.3 short
+names, which covers the app data, but the runtime's own folder needs plain
+letters (the JDK loads its DLLs by their long names).
+
+The app sees a 360x800 dp phone, the most common phone screen.
+`WINAPK_PHONE_SIZE=412x915` sets another size, in dp. The window shows the
+phone at the monitor's scale. When the whole window, title bar included, would
+not fit the monitor's work area (the screen without the taskbar), the app gets
+a lower density instead, so it keeps its dp size and still draws at the
+window's own pixel size. The window is fitted again when it moves to another
+monitor or the taskbar changes. `WINAPK_DENSITY` (a dpi) overrides the density.
+A window maximized or resized to another shape keeps the app's size and
+shows the phone at the largest size with its own aspect, centred, with black
+bars around it, as upstream's letterbox container does: a portrait app
+maximized on a wide screen is a phone in the middle, scaled to the screen
+height. Clicks on the bars go nowhere. `MACAPK_LETTERBOX=0` stretches the
+phone over the whole window instead, as before.
+
+An app runs once at a time, as on the Mac: starting it again (a shortcut, the
+library) brings the running app's window forward, and updating it while it
+runs is refused until it is closed. `WINAPK_ALLOW_SECOND_INSTANCE=1` turns the
+check off.
+
+### Web content (WebView2)
+
+Web pages an app shows run in Microsoft Edge WebView2, the counterpart of
+upstream's WKWebView. It needs the WebView2 Runtime, which Windows 11 and most
+Windows 10 machines already have; `WebView2Loader.dll`, the SDK's
+redistributable loader, sits next to `winapk-runtime.exe`
+(`windows/scripts/fetch_webview2.sh`). Without the runtime, without the loader,
+headless, or with `WINAPK_WEBVIEW2=0`, web links open in the system browser as
+before, and the log says so once.
+
+- A Custom Tab or Trusted Web Activity launch (androidx.browser's
+  `CustomTabsIntent`, AppAuth's sign-in, a TWA launcher) opens a tab window over
+  the app: close, back and the URL on a toolbar, the page title as the window
+  title. As in a Custom Tab on a phone, every navigation is checked against the
+  app's own manifest: a page that goes to a URL the app handles (an OAuth or
+  sign-in callback, as a custom scheme or an `https` App Link) is not loaded but
+  delivered to the app as the browser's `ACTION_VIEW` intent, and the tab
+  closes. Other pages keep loading in the tab. The browser row the
+  PackageManager lists (`com.macapk.host`) answers androidx.browser's Custom
+  Tabs service, so apps that look for one choose a Custom Tab.
+- A plain link (an "open in browser", a Privacy Policy link) still opens in the
+  system browser: on a phone that is the user's browser app too.
+- An app's own `android.webkit.WebView`s show the page in the app window, at
+  the view's place, behind the app's views drawn over it: upstream's Java
+  WebView runs unchanged on WebView2 (`native_webview.cpp`), with
+  `WebViewClient`, `WebChromeClient`, `evaluateJavascript`,
+  `addJavascriptInterface` (a synchronous call, as on a device),
+  `CookieManager`, `loadData` and `loadDataWithBaseURL`.
+- Cookies and storage are the app's own, in `app_webview2` in its data
+  directory, kept between runs; the browser tab has a profile of its own
+  there.
+
+Shared storage is the user's own folders, as on a phone: `/sdcard/Download`,
+`Pictures`, `Documents`, `Music` and `Movies` are junctions to Windows'
+Downloads, Pictures, Documents, Music and Videos (wherever they are
+redirected), made before the app starts; what an app had saved there moves in
+first, never over a file of the user's (a clash comes in as
+`name (from Android).ext`; every move is logged in
+`android\data\system\storage\usermap-journal.tsv`). DCIM stays the
+volume's own. Only for the library in `%LOCALAPPDATA%\Win.apk`, never with
+`--data`. Settings > App data > "Use my Windows folders" (`UserFolders`) off
+turns each folder back into an empty one of the volume, files left in place;
+`MACAPK_USER_FOLDERS=0` changes nothing either way.
+
+For tests, `WINAPK_TEST_WORKAREA=1366x728` stands in for the work area, in
+pixels (`1366x728-0+0` puts it at the top right of the real one;
+`@file` reads the value from a file at every fit),
+`WINAPK_HEADLESS=1` runs without a window,
+`WINAPK_HEADLESS_FRAME=frame.bmp` saves the last frame the app drew, and
+`WINAPK_HEADLESS_EXIT_AFTER_FRAMES=30` exits that many display frames after the
+first one the app presents (an idle app counts too). On
+Linux, `windows/test/run_app_wine.sh` boots an APK headless under Wine.
+
+## Status and next steps
+
+The goal is the whole of Mac.apk on Windows x64: every Mac piece ported or
+replaced with its Windows counterpart (PORTING.md section 4 lists them one by
+one), then x86_64 apps at full speed, then ARM-only apps through translation
+(arm64-v8a is supported: translated ahead of time, with a JIT fallback;
+32-bit armeabi-v7a is not).
+
+Done so far:
+
+- The loader, linker, ELF TLS and the JNI bridge for Android x86_64 libraries.
+- arm64-v8a libraries, when an app has no x86_64 build (apps install with
+  the ABIs `x86_64,arm64-v8a`; `WINAPK_ABIS` overrides): the same loader,
+  linker and JNI bridge, checked in CI against the host and in a real JVM.
+  In the background (`prepare_arm64` and `winapk-runtime --aot-translate`
+  in `host/runtime_main.cpp`; nothing waits for it) `winapk-aot` turns each
+  `lib/arm64/*.so` into C, in parts, and clang (`WINAPK_AOT_CLANG`,
+  `<install>\clang\bin\clang.exe` or the PATH; the launcher also finds an
+  LLVM or MSYS2 clang) compiles the parts in parallel with
+  `-O1 -march=native` into `<lib>.so.aot.dll`. A library of more than 400K
+  instructions is translated only where the JIT's profile
+  (`<lib>.so.aot.profile`) says code ran, and again as that grows; a
+  translation finished while the app runs is loaded at once (see
+  `include/winapk/arm64_aot.h`, "Profiles"). Functions of more than 4000
+  instructions are compiled unoptimized (clang's time on them grows far
+  faster than their size), and whole translations are shared between apps
+  through `<data>\aot-cache`, keyed by the library's code. Code without a
+  translation runs through a JIT (dynarmic) backed by an interpreter. CMake option
+  `-DWINAPK_ARM64_JIT=ON` (CI and releases) fetches dynarmic;
+  `WINAPK_ARM64_ENGINE=interp` forces the interpreter, and
+  `WINAPK_ARM64_STATS=1` prints at exit where the guest's time went (host
+  functions versus arm64 code, transitions, interpreter fallbacks).
+- The Bionic shim: about 520 libc functions (threads, files, sockets,
+  epoll, `ALooper`, printf and scanf), on the UCRT and Win32.
+- The host: the window and input, `NativeOs`, `NativeLooper`, images (libwebp,
+  WIC), audio (WASAPI), clipboard, file pickers, game controllers, ICU,
+  SQLite.
+- OpenGL ES on ANGLE, from Java and from app native code (`ANativeWindow`,
+  EGL window surfaces), plus libandroid's assets.
+- The app library (`Win.apk.exe`) with shortcuts per app, the installer
+  (`package/winapk.iss`) and the release workflow.
+
+Next, in order: OpenSL ES and AAudio for native sound, `NativeActivity`,
+`NativeMedia` (MediaPlayer and video on Media Foundation), WebView2, the
+camera and location, signals through vectored exception handling, then the
+launcher (M8). ARM code (M10) is translated ahead of time, with the JIT as
+the fallback.
+
+`PORTING.md` holds the design decisions, the technical findings, the known
+gaps, and the milestone plan up to a production release.
+
+## Keeping up with upstream
+
+```sh
+git remote add upstream https://github.com/kksimp/Mac.apk.git   # once
+git fetch upstream
+git merge upstream/main
+```
+
+Upstream's macOS-only files were removed here, so a merge that touches them
+stops with a modify/delete conflict: keep them deleted (`git rm` the file).
+Files in `runtime/` are changed only where a Windows hook is unavoidable, and
+every such change is listed here:
+
+- `runtime/java/android/content/res/Resources.java`: `getIntArray` resolves the
+  items of a typed `<array>` (for example a list of color references) instead
+  of returning an empty array. Not Windows-specific; worth offering upstream.
+- `runtime/java/android/view/ViewPropertyAnimator.java`: starts by itself on
+  the next frame when the app never calls `start()`, as on Android. Not
+  Windows-specific; worth offering upstream.
+- `runtime/java/android/widget/RatingBar.java` and `ProgressBar.java`: a rating
+  bar reads `numStars`, `rating`, `stepSize` and `isIndicator` from XML and
+  measures one row of stars, as AOSP does. Not Windows-specific.
+- `runtime/java/android/database/sqlite/SQLiteDatabase.java`: `BEGIN`,
+  `COMMIT` and `ROLLBACK` given to `execSQL` nest in the transaction stack, as
+  AOSP's `SQLiteSession.executeSpecial` does. Not Windows-specific.
+- `runtime/java/android/view/LayoutInflater.java`: a `<merge>` layout inflated
+  without a parent merges into a `FrameLayout` instead of being dropped, so
+  `setContentView` of a `<merge>` layout works. Not Windows-specific.
+- `runtime/java/com/macapk/loader/ActivityHost.java`: an activity that calls
+  `finish()` in its own `onCreate` is torn down after `onCreate` returns, as on
+  AOSP, not in the middle of it. Not Windows-specific.
+- `runtime/java/com/macapk/loader/FragmentInflaterFactory.java`: a fragment in
+  a layout is hosted by the activity the inflater belongs to, which also works
+  during the first activity's `onCreate`. Not Windows-specific.
+- `runtime/java/android/security/keystore/AndroidKeyStoreKeyFactorySpi.java`:
+  delegates to the other providers only, instead of recursing into itself
+  until the stack overflows. Not Windows-specific.
+- `runtime/java/android/os/Build.java`, `dalvik/system/VMRuntime.java`,
+  `com/macapk/loader/Boot.java` (`os.arch`), `InstalledSplits.java` and
+  `MacApkPackageManager.java`: the device ABI is the host's, so x86_64 on
+  Windows x64, and the native library directory includes `lib/x86_64`. On the
+  Mac nothing changes. `Boot.java` also looks for `bin/macapk-translator.exe`.
+  On an x86_64 host `Build.SUPPORTED_ABIS` also lists arm64-v8a, which is
+  translated to x86-64 (ahead of time, with a JIT fallback), as an x86_64
+  Android device with an ARM translator reports it.
+- `runtime/java/android/content/Context.java`: `getDatabasePath` also takes a
+  drive-letter path as absolute, so a database named by its full path is not
+  nested inside `databases\`.
+- `runtime/java/com/macapk/loader/CameraBridge.java`: when the capture natives
+  are unbound or report no device (no webcam, or camera access is off in
+  Windows privacy settings; the webcams themselves come from
+  `windows/host/native_camera.cpp`), one virtual back camera delivers
+  dark-grey frames, so screens built around a preview open and their other
+  controls work. `MACAPK_VIRTUAL_CAMERA=0` turns it off. A real camera always
+  wins.
+- `runtime/java/android/view/SurfaceView.java`: a SurfaceView laid out larger
+  than its window (a center-cropped camera preview) whose holder has no GL
+  consumer yet (no renderer, not a `GLSurfaceView`, not the native-window
+  owner) reports the view's size and gets `surfaceChanged` for it, as AOSP
+  always does. Apps that start their camera preview only after that
+  `surfaceChanged` waited forever. `MACAPK_SV_OVERSIZE_HOLDER=0` turns it off.
+  Not Windows-specific.
+- `runtime/java/com/macapk/loader/HostRadios.java` (new), with
+  `android/net/wifi/WifiManager.java`, `WifiInfo.java`,
+  `android/bluetooth/BluetoothAdapter.java`, `BluetoothDevice.java` and
+  `MacApkPackageManager.java`: the host's Wi-Fi (state, connection, scan
+  results, `SCAN_RESULTS_AVAILABLE_ACTION`) and Bluetooth radio (on/off, name,
+  paired devices; no connections) reach the app, from
+  `windows/host/native_radios.cpp`; `android.hardware.bluetooth` is declared
+  when there is a radio. A host without these natives (the Mac) keeps the old
+  answers.
+- `runtime/java/com/macapk/loader/ActivityHost.java` and
+  `MacApkPackageManager.java`: a Custom Tab launch opens in
+  `HostBrowserTab` (new, with `HostCustomTabsService`) when the host has a
+  browser tab of its own, and the host browser row then answers the Custom Tabs
+  service; its PackageInfo carries `signingInfo`. On the Mac, which has no such
+  tab, nothing changes but the `signingInfo`.
+- `runtime/java/android/webkit/WebView.java`: with a modal window above a
+  WebView, the occluder rects sent to the engine add that window's bounds
+  after the whole-view rect, so an engine that shows the page over the canvas
+  (Windows) can keep the dialog visible. The union, which the Mac's hit test
+  uses, is unchanged.
+- `runtime/java/android/widget/TextView.java`: the protected `onTextChanged`
+  hook is called on every text change (constructor, `setText`, typing,
+  `append`, in-place edits), with or without `TextWatcher`s, as AOSP does. It
+  was declared but never called, so custom fields that keep their state there
+  (an SMS-code `PinView`) drew nothing and ignored typing. Also
+  `setText(text, BufferType.SPANNABLE)` stores a `Spannable`, and the type
+  sticks for later `setText` calls, so `(Spannable) getText()` works. Not
+  Windows-specific; worth offering upstream.
+- `runtime/java/android/view/Window.java`: the eight activity-transition
+  getters and setters keep their values and default to the theme's
+  transitions (`windowActivityTransitions`), as AOSP `PhoneWindow` does,
+  instead of always returning null; apps that add a listener to
+  `getSharedElementEnterTransition()` no longer crash in `onCreate`. Not
+  Windows-specific.
+- `runtime/java/android/content/res/TypedArray.java` and `Resources.java`:
+  `getDimensionPixelSize` (and a drawable's `<stroke android:width>` /
+  `<size>`) round and keep a non-zero size at least 1 px, as AOSP does, so
+  0.5dp hairlines and borders are drawn; `getDimensionPixelOffset` still
+  truncates. Not Windows-specific.
+- `runtime/java/com/macapk/loader/SharedStorage.java`,
+  `android/provider/MediaStoreProvider.java`,
+  `android/app/usage/StorageStatsManager.java` and
+  `com/macapk/loader/HostDocumentsProvider.java`: the volume's Download,
+  Pictures, Documents, Music and Movies are junctions to the user's Windows
+  folders, made by the host (`windows/host/user_folders.cpp`, named in
+  `WINAPK_USER_FOLDER_TARGETS`). Java sees a junction as a plain directory, so
+  these recognise it (`isJunction`, `isHostFolderMapping`, `isLink`): MediaStore
+  keeps upstream's privacy filter and walk cache for them and indexes at most
+  10,000 files per folder, breadth first (`walkHostFolder`); no walk, size or
+  delete follows a junction inside a folder; and `mapUserFolders` stays off when
+  the host maps, since it would merge a junction into itself. On the Mac nothing
+  changes.
+- `runtime/java/com/macapk/loader/Manifest.java`: the components of installed
+  feature splits (`isFeatureSplit="true"`) are merged into the package, as
+  AOSP `parseSplitApplication` does. Chrome keeps its launcher alias and
+  `ChromeTabbedActivity` in `split_chrome.apk`, and was rejected with "no
+  launchable activity". `MACAPK_MANIFEST_FEATURE_SPLITS=0` reads the base alone.
+  Not Windows-specific.
+- `runtime/java/android/app/HandoffActivityData.java`,
+  `HandoffActivityDataRequestInfo.java` (new, API 37 type-only placeholders)
+  and `com/macapk/loader/ActivityHost.java`: an activity overriding a newer-API
+  callback no longer fails every lifecycle call with `NoClassDefFoundError`;
+  a class whose methods cannot be resolved is skipped in favour of the
+  superclass declaration, which still dispatches to the override
+  (`MACAPK_LIFECYCLE_SKIP_UNLINKABLE=0` turns that off). Not Windows-specific.
+- `runtime/java/android/app/Application.java` (`AppBaseContext`): has the
+  `mClassLoader` field of AOSP `ContextImpl`, and `getClassLoader` returns it
+  when set; Chromium sets it reflectively for isolated splits
+  (`MACAPK_CONTEXT_MCLASSLOADER=0` ignores it). Not Windows-specific.
+- `runtime/java/android/app/Application.java`, `Activity.java` and
+  `com/macapk/loader/ActivityHost.java`: `onActivityPreCreated` goes out before
+  `onCreate`, `onActivityCreated` from `Activity.onCreate` (or after it when
+  the override skips super), and `onActivityPostCreated` before a `finish()` in
+  `onCreate` tears the activity down, as AOSP does. Chromium's
+  `ApplicationStatus` depends on it. `MACAPK_LIFECYCLE_CREATED_ORDER=0` restores
+  the old order. Not Windows-specific.
+
+## License
+
+AGPL-3.0, like Mac.apk (see `LICENSE`). The Mac.apk name and logo belong to the
+upstream project (see `TRADEMARKS.md`).

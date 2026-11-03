@@ -4065,48 +4065,6 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 // the liblog path, reached through __android_log_assert / std::abort.
 static void macapk_liblog_write_line(const char* line, int n);
 static int macapk_diag_fd();
-// ---------------------------------------------------------------------------
-// Guest image table for the abort diagnostic below.
-//
-// backtrace_symbols_fd() can only name host images. An abort() raised inside
-// guest native code appears in the host backtrace as a bare address, because
-// our loader maps those ELF images itself and dyld knows nothing about them:
-// the log says "??? 0x48fc0c000+0x151cb4" and turning that into a file offset
-// needs a vmmap taken from the SAME run (ASLR moves every mapping on the next
-// one). The loader records each image's [base, base+span) here so the abort log
-// can print "libfoo.so+0x151cb4" next to the frame.
-//
-// Names are copied: an Image can be unloaded while the log still refers to it.
-// Later mappings win on lookup (a relayout re-registers under the same name).
-struct MacapkGuestImage {
-    uintptr_t base;
-    size_t    span;
-    char      name[96];
-};
-static MacapkGuestImage g_macapk_guest_images[512];
-static std::atomic<int> g_macapk_guest_image_count{0};
-
-extern "C" void macapk_diag_note_guest_image(uintptr_t base, size_t span, const char* name) {
-    if (!base || !span || !name || !*name) return;
-    const int i = g_macapk_guest_image_count.load(std::memory_order_relaxed);
-    if (i < 0 || i >= (int)(sizeof(g_macapk_guest_images) / sizeof(g_macapk_guest_images[0])))
-        return;
-    MacapkGuestImage& im = g_macapk_guest_images[i];
-    im.base = base;
-    im.span = span;
-    std::snprintf(im.name, sizeof(im.name), "%s", name);
-    g_macapk_guest_image_count.store(i + 1, std::memory_order_release);
-}
-
-static const MacapkGuestImage* macapk_diag_lookup_guest_image(uintptr_t addr) {
-    const int n = g_macapk_guest_image_count.load(std::memory_order_acquire);
-    for (int i = n - 1; i >= 0; --i) {
-        const MacapkGuestImage& im = g_macapk_guest_images[i];
-        if (addr >= im.base && addr < im.base + im.span) return &im;
-    }
-    return nullptr;
-}
-
 static void macapk_abort_log() {
     void* frames[64];
     int n = backtrace(frames, 64);
@@ -4117,19 +4075,6 @@ static void macapk_abort_log() {
     if (hn > 0) macapk_liblog_write_line(head, hn >= (int)sizeof(head) ? (int)sizeof(head) - 1 : hn);
     const int fd = macapk_diag_fd();
     backtrace_symbols_fd(frames, n, fd);
-    // Name the guest frames. backtrace_symbols_fd only resolves host images, so
-    // a crash inside guest native code otherwise prints as "??? 0x48fc0c000+...",
-    // which cannot be turned into a file offset without a vmmap from the same run.
-    for (int i = 0; i < n; ++i) {
-        const MacapkGuestImage* im = macapk_diag_lookup_guest_image((uintptr_t)frames[i]);
-        if (!im) continue;
-        char gline[224];
-        const int gn = std::snprintf(gline, sizeof(gline), "  [guest] #%-2d %p  %s+0x%zx\n",
-                                     i, frames[i], im->name,
-                                     (size_t)((uintptr_t)frames[i] - im->base));
-        if (gn > 0)
-            macapk_liblog_write_line(gline, gn >= (int)sizeof(gline) ? (int)sizeof(gline) - 1 : gn);
-    }
     static const char tail[] = "=== end backtrace; re-raising SIGABRT ===\n";
     macapk_liblog_write_line(tail, (int)sizeof(tail) - 1);
     if (fd == STDERR_FILENO) std::fflush(stderr);
@@ -30173,12 +30118,8 @@ extern "C" int __macapk_arm64_pthread_cond_wait(int32_t* c, int32_t* m) {
     __macapk_arm64_pthread_mutex_lock(m);       // re-acquire before return
     return 0;
 }
-// clock_slot: 0 = the cond's own clock (its pthread_condattr_setclock stamp,
-// c[kCondClockSlot]); otherwise the clock this call names, as clock_id + 1 (the
-// same encoding as the stamp: 1 REALTIME, 2 MONOTONIC), for
-// pthread_cond_timedwait_monotonic_np and pthread_cond_clockwait.
-static int macapk_arm64_cond_timedwait_clock(int32_t* c, int32_t* m,
-                                             const void* abstime, int clock_slot) {
+extern "C" int __macapk_arm64_pthread_cond_timedwait(int32_t* c, int32_t* m,
+                                                       const void* abstime) {
     if (!c || !m) return 22;
     if (!macapk_arm64_cond_ensure_valid(c)) return 22;
     if (!macapk_arm64_mutex_ensure_valid(m)) return 22;
@@ -30204,8 +30145,7 @@ static int macapk_arm64_cond_timedwait_clock(int32_t* c, int32_t* m,
         // PTHREAD_COND_INITIALIZER cond, which still falls back to the
         // magnitude heuristic.
         rel = macapk_abstime_to_rel_ns(
-            abstime, clock_slot ? clock_slot
-                                : __atomic_load_n(&c[kCondClockSlot], __ATOMIC_RELAXED));
+            abstime, __atomic_load_n(&c[kCondClockSlot], __ATOMIC_RELAXED));
         // Deadline already in the past: per POSIX return ETIMEDOUT with the
         // mutex still held (we never released it).
         if (rel == 0) return 110;  // ETIMEDOUT (Bionic)
@@ -30262,30 +30202,6 @@ static int macapk_arm64_cond_timedwait_clock(int32_t* c, int32_t* m,
     __macapk_arm64_pthread_mutex_lock(m);
     if (r < 0) return infinite_clamped ? 0 : 110;   // -1 == deadline (errno-neutral helper)
     return 0;
-}
-extern "C" int __macapk_arm64_pthread_cond_timedwait(int32_t* c, int32_t* m,
-                                                       const void* abstime) {
-    return macapk_arm64_cond_timedwait_clock(c, m, abstime, 0);
-}
-// Bionic pthread_cond.cpp (main): pthread_cond_timedwait_monotonic_np waits against
-// CLOCK_MONOTONIC whatever the cond's attr said; pthread_cond_clockwait (API 30)
-// switches on the clock: CLOCK_MONOTONIC -> timedwait_monotonic_np,
-// CLOCK_REALTIME -> the realtime wait, anything else EINVAL. Bionic clock ids:
-// CLOCK_REALTIME 0, CLOCK_MONOTONIC 1 (Linux uapi/linux/time.h; macOS's own
-// CLOCK_MONOTONIC is 6, so the guest's value is never handed to libSystem).
-// MEASURED need: iiSU's libdiscord_jni.so imports pthread_cond_clockwait
-// ("unresolved external 'pthread_cond_clockwait'"), which bound to the panic stub.
-extern "C" int __macapk_arm64_pthread_cond_timedwait_monotonic_np(int32_t* c, int32_t* m,
-                                                                  const void* abstime) {
-    return macapk_arm64_cond_timedwait_clock(c, m, abstime, 2);
-}
-extern "C" int __macapk_arm64_pthread_cond_clockwait(int32_t* c, int32_t* m, int clock,
-                                                     const void* abstime) {
-    switch (clock) {
-        case 1: return macapk_arm64_cond_timedwait_clock(c, m, abstime, 2);   // MONOTONIC
-        case 0: return macapk_arm64_cond_timedwait_clock(c, m, abstime, 1);   // REALTIME
-        default: return 22;                                                   // EINVAL
-    }
 }
 
 // Bionic pthread_rwlock_t is 56 bytes (LP64: `int32_t __private[14]`,
@@ -34254,12 +34170,6 @@ static rt_write_short_fn g_rt_write_s  = nullptr;
 static rt_write_float_fn g_rt_write_f  = nullptr;
 static rt_void_fn        g_rt_play = nullptr, g_rt_stop = nullptr, g_rt_release = nullptr;
 static rt_int_fn         g_rt_buffered = nullptr;
-// The track's frameCount / buffer size (MACAPK_AUDIO_AOSP_FRAMECOUNT in
-// audio_backend.mm). Optional: an older runtime lacks them, and AAudio then
-// keeps answering from its own fields.
-typedef int     (*rt_set_int_fn)(int64_t, int);
-static rt_int_fn         g_rt_capacity = nullptr, g_rt_bufsize = nullptr;
-static rt_set_int_fn     g_rt_set_bufsize = nullptr;
 static bool aaudio_rt_ready() {
     // C++11 magic-static init is thread-safe.
     static bool ok = []{
@@ -34270,9 +34180,6 @@ static bool aaudio_rt_ready() {
         g_rt_stop    = (rt_void_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_stop");
         g_rt_release = (rt_void_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_release");
         g_rt_buffered = (rt_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_buffered");
-        g_rt_capacity = (rt_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_buffer_capacity");
-        g_rt_bufsize  = (rt_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_buffer_size");
-        g_rt_set_bufsize = (rt_set_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_set_buffer_size");
         return g_rt_create && g_rt_write_s && g_rt_write_f
             && g_rt_play && g_rt_stop && g_rt_release;
     }();
@@ -34565,20 +34472,7 @@ extern "C" int  macapk_AAudioStreamBuilder_openStream(void* b, void** stream) {
     // stays 0 and the honest-open branch below answers as a device would.
     if (aaudio_rt_ready()) {
         int enc = (s->format == 2) ? 4 /*ENC_PCM_FLOAT*/ : 2 /*ENC_PCM_16BIT*/;
-        // The builder's capacity, or 0 when the app set none: AOSP
-        // AudioStreamTrack::open passes "size_t frameCount =
-        // (size_t)builder.getBufferCapacity();" (0 = unspecified) to the
-        // AudioTrack, and AudioFlinger raises it to the platform minimum.
-        // The stream's capacity is then what the track got
-        // (getBufferCapacityFromDevice = mAudioTrack->frameCount()). Passing
-        // our 2048 default here is what used to queue ~340 ms of audio ahead
-        // of the speaker in write mode (MACAPK_AUDIO_AOSP_FRAMECOUNT).
-        s->handle = g_rt_create(s->sample_rate, s->channels, enc,
-                                bld->buffer_capacity > 0 ? bld->buffer_capacity : 0);
-        if (s->handle && g_rt_capacity) {
-            int cap = g_rt_capacity(s->handle);
-            if (cap > 0) s->buffer_capacity = cap;
-        }
+        s->handle = g_rt_create(s->sample_rate, s->channels, enc, s->buffer_capacity);
     }
     if (s->handle == 0 && macapk_audio_honest_open()) {
         // No engine stream: answer like AAudioStreamBuilder_openStream on a
@@ -34618,16 +34512,7 @@ extern "C" int  macapk_AAudioStream_close(void* st) {
     return 0;
 }
 extern "C" int  macapk_AAudioStream_getBufferCapacityInFrames(void* st) { return st ? ((AAudioStreamImpl*)st)->buffer_capacity : 2048; }
-extern "C" int  macapk_AAudioStream_getBufferSizeInFrames(void* st) {
-    AAudioStreamImpl* s = (AAudioStreamImpl*)st;
-    if (!s) return 2048;
-    // AudioStreamTrack::getBufferSize = mAudioTrack->getBufferSizeInFrames().
-    if (aaudio_rt_ready() && s->handle && g_rt_bufsize) {
-        int n = g_rt_bufsize(s->handle);
-        if (n > 0) return n;
-    }
-    return s->buffer_capacity;
-}
+extern "C" int  macapk_AAudioStream_getBufferSizeInFrames(void* st) { return st ? ((AAudioStreamImpl*)st)->buffer_capacity : 2048; }
 extern "C" int  macapk_AAudioStream_getChannelCount(void* st) { return st ? ((AAudioStreamImpl*)st)->channels : 2; }
 extern "C" int  macapk_AAudioStream_getFormat(void* st) { return st ? ((AAudioStreamImpl*)st)->format : 1; }
 extern "C" int  macapk_AAudioStream_getFramesPerBurst(void* st) { return st ? ((AAudioStreamImpl*)st)->frames_per_burst : 256; }
@@ -34664,22 +34549,7 @@ extern "C" int  macapk_AAudioStream_requestStop(void* st) {
     std::fprintf(stderr, "[aaudio] requestStop h=%lld\n", (long long)s->handle);
     return 0;
 }
-// AOSP AudioStreamTrack::setBufferSize (media/libaaudio/src/legacy/
-// AudioStreamTrack.cpp:470-481): "// Do not ask for less than one burst.
-// if (requestedFrames < getFramesPerBurst()) requestedFrames =
-// getFramesPerBurst(); ssize_t result =
-// mAudioTrack->setBufferSizeInFrames(requestedFrames);" -- the size the track
-// adopted, clipped to its frameCount. This is the call an app makes to get low
-// latency (Oboe's tuner does it), so it now really resizes the fill.
-extern "C" int  macapk_AAudioStream_setBufferSizeInFrames(void* st, int n) {
-    AAudioStreamImpl* s = (AAudioStreamImpl*)st;
-    if (!s) return n;
-    if (aaudio_rt_ready() && s->handle && g_rt_set_bufsize) {
-        int req = n < s->frames_per_burst ? s->frames_per_burst : n;
-        return g_rt_set_bufsize(s->handle, req);
-    }
-    return s->buffer_capacity;
-}
+extern "C" int  macapk_AAudioStream_setBufferSizeInFrames(void* st, int n) { return st ? ((AAudioStreamImpl*)st)->buffer_capacity : n; }
 
 extern "C" void macapk_AAudioStreamBuilder_setChannelCount(void* b, int c) { if (b) ((AAudioBuilder*)b)->channels = c; }
 extern "C" void macapk_AAudioStreamBuilder_setDeviceId(void*, int) {}
@@ -35515,13 +35385,7 @@ static SLresult sl_obj_Realize(void* self, SLuint32) {
     o->realized = 1;
     if (o->type == SLOBJ_PLAYER && o->handle == 0 && aaudio_rt_ready()) {
         int enc = (o->format == 2) ? 4 : 2;
-        // frameCount 0, as AOSP's OpenSL ES player creates its AudioTrack
-        // (frameworks/wilhelm src/android/AudioPlayer_to_android.cpp:1650,
-        // "0, // frameCount"): AudioFlinger then gives it the platform
-        // minimum, and the app's own queued buffers are the rest of its
-        // buffering. This used to be 4096, which the runtime floored to
-        // ~340 ms of queued audio (MACAPK_AUDIO_AOSP_FRAMECOUNT).
-        o->handle = g_rt_create(o->sample_rate, o->channels, enc, 0);
+        o->handle = g_rt_create(o->sample_rate, o->channels, enc, 4096);
         if (sl_trace())
             std::fprintf(stderr, "[opensl] player Realize -> stream h=%lld\n",
                          (long long)o->handle);
@@ -35864,8 +35728,6 @@ extern "C" int __macapk_arm64_dladdr(const void* addr, Dl_info* info) {
 extern "C" int __macapk_elfexec_guest_dlopen(const char* path, int bionic_flag, void** out);
 extern "C" int __macapk_elfexec_guest_dlsym(void* handle, const char* name, void** out);
 extern "C" int __macapk_elfexec_guest_dlclose(void* handle);
-extern "C" int __macapk_runtime_guest_dlopen(const char* path, int bionic_flag, void** out);
-static std::string macapk_arm64_remap_path(const char* p);
 static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path);  // MACAPK_WRAPPER_DATA_DLSYM
 extern "C" void* __macapk_arm64_dlopen(const char* path, int flag) {
     // Stage-6 guests are LP64.
@@ -36045,15 +35907,6 @@ extern "C" void* __macapk_arm64_dlopen(const char* path, int flag) {
         // loader, never host dyld (bionic_shim_elfexec.cpp). A no-op in the runtime process.
         void* elf_handle = nullptr;
         if (__macapk_elfexec_guest_dlopen(path, flag, &elf_handle)) return elf_handle;
-        // In the runtime process, a request that names a file holding an arm64 ELF the
-        // cases above did not claim (one the app downloaded or unpacked itself, e.g. a
-        // libretro core) is loaded by the Stage-6 loader rather than sent to dyld, which
-        // cannot load it (bionic_shim_elfexec.cpp, MACAPK_RUNTIME_ELF_DLOPEN).
-        if (std::strchr(path, '/') != nullptr) {
-            const std::string host_path = macapk_arm64_remap_path(path);
-            if (__macapk_runtime_guest_dlopen(host_path.c_str(), flag, &elf_handle))
-                return elf_handle;
-        }
     }
     return dlopen(path, mac_flag);
 }
@@ -37094,44 +36947,6 @@ static void macapk_swap_trace_add(MacapkSwapTraceBatch* b, double dur_s, double 
 }
 static thread_local double t_swap_trace_entry = 0.0;
 
-// Java EGL14 windows reached through the NATIVE libEGL (GitHub #16). An app may
-// create a window with EGL14.eglCreateWindowSurface on a SurfaceTexture and hand
-// the handles to C++ that makes it current and swaps it here (MapLibre Native's
-// Android GL backend, Rive). That window is a pbuffer the runtime reads back and
-// queues into the SurfaceTexture at each swap (runtime/src/egl14_bridges.inc,
-// "EGL14 window surfaces"), and only its Java eglSwapBuffers did so: on a device
-// both APIs are one libEGL, so a native swap presents the same frame. The
-// runtime exports the two halves; resolved once, null in a process without them
-// (the swap is then the plain forward it always was):
-//   int   __macapk_egl14_window_swap(dpy, surf)    -1 not an EGL14 window, else
-//                                                  the readback + queue ran
-//   void* __macapk_egl14_window_resolve(dpy, surf) the pbuffer now behind the
-//                                                  app's handle (a resize replaces
-//                                                  it); any other surface as is
-// BISECT GATE: MACAPK_EGL14_NATIVE_WINDOW=0 skips both lookups, so the native
-// swap / make-current / query are the plain ANGLE forwards they were before.
-using MacapkEgl14SwapFn = int (*)(void*, void*);
-using MacapkEgl14ResolveFn = void* (*)(void*, void*);
-static bool macapk_egl14_native_window_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("MACAPK_EGL14_NATIVE_WINDOW");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    return on;
-}
-static MacapkEgl14SwapFn macapk_egl14_window_swap_fn() {
-    static const auto f = macapk_egl14_native_window_on()
-        ? reinterpret_cast<MacapkEgl14SwapFn>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_swap"))
-        : nullptr;
-    return f;
-}
-static void* macapk_egl14_window_resolve(void* dpy, void* surf) {
-    static const auto f = macapk_egl14_native_window_on()
-        ? reinterpret_cast<MacapkEgl14ResolveFn>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_resolve"))
-        : nullptr;
-    return (f && surf) ? f(dpy, surf) : surf;
-}
-
 extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
     using SwapFn = unsigned (*)(void*, void*);
     static SwapFn real =
@@ -37695,13 +37510,6 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
             }
         }
     }
-    // An EGL14 window: queue the frame to its SurfaceTexture, then swap the
-    // pbuffer now behind the handle, exactly as EGL14_eglSwapBuffers does (a
-    // pbuffer swap is only an implicit flush, but its error is the one the app
-    // reads).
-    if (MacapkEgl14SwapFn egl14Swap = macapk_egl14_window_swap_fn()) {
-        if (egl14Swap(dpy, surf) >= 0) surf = macapk_egl14_window_resolve(dpy, surf);
-    }
     if (macapk_swap_trace_on() && real) {
         const double t0 = macapk_swap_trace_uptime_s();
         const unsigned rc = real(dpy, surf);
@@ -37773,21 +37581,7 @@ extern "C" unsigned __macapk_arm64_eglMakeCurrent(void* dpy, void* draw,
     using McFn = unsigned (*)(void*, void*, void*, void*);
     static McFn real =
         reinterpret_cast<McFn>(dlsym(RTLD_DEFAULT, "eglMakeCurrent"));
-    // A Java EGL14 window's handle names the pbuffer behind it now (GitHub #16;
-    // see macapk_egl14_window_resolve), as EGL14_eglMakeCurrent translates it.
-    return real ? real(dpy, macapk_egl14_window_resolve(dpy, draw),
-                       macapk_egl14_window_resolve(dpy, read), ctx) : 0;
-}
-
-// eglQuerySurface: a forward to ANGLE that names a Java EGL14 window's current
-// pbuffer (GitHub #16), so native code sizing its viewport from EGL_WIDTH /
-// EGL_HEIGHT sees the window's size after a resize, as the Java bridge does.
-extern "C" unsigned __macapk_arm64_eglQuerySurface(void* dpy, void* surf,
-                                                     int32_t attribute, int32_t* value) {
-    using QsFn = unsigned (*)(void*, void*, int32_t, int32_t*);
-    static QsFn real =
-        reinterpret_cast<QsFn>(dlsym(RTLD_DEFAULT, "eglQuerySurface"));
-    return real ? real(dpy, macapk_egl14_window_resolve(dpy, surf), attribute, value) : 0;
+    return real ? real(dpy, draw, read, ctx) : 0;
 }
 
 // (Tombstone: macapk_unity_present_if_current, the flush/finish/clear-time
@@ -38974,14 +38768,11 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
         return reinterpret_cast<void*>(&__macapk_arm64_eglGetProcAddress);
     if (std::strcmp(name, "eglMakeCurrent") == 0)
         return reinterpret_cast<void*>(&__macapk_arm64_eglMakeCurrent);
-    if (std::strcmp(name, "eglQuerySurface") == 0)
-        return reinterpret_cast<void*>(&__macapk_arm64_eglQuerySurface);
     // (The MACAPK_UNITY_PRESENT / MACAPK_TRACE_GL route of glFlush / glFinish /
     // glClear / glBindFramebuffer / glBlitFramebuffer to our shims is DELETED with
-    // the present injection; see __macapk_arm64_eglMakeCurrent. The EGL routes
-    // above are unconditional and stay: the decouple ring and the present pacer
-    // live in __macapk_arm64_eglSwapBuffers, and eglSwapBuffers / eglMakeCurrent /
-    // eglQuerySurface name a Java EGL14 window's current pbuffer, GitHub #16.)
+    // the present injection; see __macapk_arm64_eglMakeCurrent. The three EGL
+    // routes above are unconditional and stay: the decouple ring and the present
+    // pacer live in __macapk_arm64_eglSwapBuffers.)
     if (macapk_gl_trace_enabled()) {
         if (std::strcmp(name, "glDrawElements") == 0)
             return reinterpret_cast<void*>(&__macapk_arm64_glDrawElements);
@@ -42342,31 +42133,6 @@ static std::string macapk_arm64_remap_path_unguarded(const char* p) {
                 && s[rr.size() - 1] == '/')
                 return macapk_arm64_remap_path_unguarded(("/" + s).c_str());
         }
-    }
-    // MACAPK_HIDE_HOST_OS_VERSION (default ON; =0 lets the guest read the host's
-    // files again). /System/Library/CoreServices holds the files that NAME the host
-    // OS (SystemVersion.plist, SystemVersionCompat.plist, ServerVersion.plist), and
-    // no Android device has that directory. An unrecognised absolute path otherwise
-    // reaches the host unchanged, so a guest that probes for macOS found it: CPython's
-    // platform.mac_ver() reads SystemVersion.plist, and Ren'Py (renpy/__init__.py)
-    // tests mac_ver() BEFORE ANDROID_PRIVATE, so every Ren'Py 7/8 APK decided it was
-    // on a Mac, never registered its assets/x-game prefixes and quit (GitHub #38).
-    // The path is rebased under the android root, where nothing lives, so every
-    // shim that goes through this remap (open, fopen, stat, access, opendir, ...)
-    // answers ENOENT the way a device does. The match is case-insensitive because
-    // the host volume is.
-    {
-        static const bool hide_on = [] {
-            const char* e = std::getenv("MACAPK_HIDE_HOST_OS_VERSION");
-            return !(e && e[0] == '0');
-        }();
-        static const char kCore[] = "/System/Library/CoreServices";
-        const size_t kl = sizeof(kCore) - 1;
-        const char* r0 = __macapk_get_android_root();
-        if (hide_on && r0 && *r0 && s.size() >= kl
-            && strncasecmp(s.c_str(), kCore, kl) == 0
-            && (s.size() == kl || s[kl] == '/'))
-            return std::string(r0) + s;
     }
     // Android's system CA store (/system/etc/security/cacerts, and the Android 14+
     // conscrypt APEX copy), served from the Mac's own trusted roots. A native TLS
@@ -59389,11 +59155,8 @@ extern "C" void __macapk_install_jni_bare_ellipsis_bridge(void* vtable);
 //     int ret = _stack_offset;
 //     _stack_offset += NOT_MACOS(wordSize) MACOS_ONLY(elem_size);   // <-- !
 //     return ret; }
-// pass_byte (Z/B) -> 1, pass_short (C/S) -> 2, pass_int / pass_float -> 4,
-// pass_long/object/double -> 8 (NativeSignatureIterator::do_type in
-// runtime/signature.hpp picks the pass_* per type). CORRECTED 2026-10-19:
-// this said Z/B/C/S were "widened to int" by pass_int, which is false for
-// stack args and mis-placed every arg after a stack boolean.
+// pass_int -> next_stack_offset(sizeof(jint)=4) (also for Z/B/C/S, widened
+// to int); pass_float -> 4; pass_long/object/double -> 8.
 //
 // Concrete failure that motivated this (Reddit / libcronet, the Chromium net
 // stack): org.chromium.base.AndroidInfo.fillFields(String x13, int sdkInt,
@@ -59540,14 +59303,6 @@ void* macapk_alloc_exec(const void* code, size_t len) {
 // uncertainty (fail safe -> passthrough). is_static is irrelevant: a static
 // method's jclass and an instance method's `this` each consume exactly one int
 // register (x1) after env (x0), so java args always begin at x2 either way.
-bool macapk_nmb_subint_as_int() {
-    static const bool v = [] {
-        const char* e = std::getenv("MACAPK_NMB_SUBINT_AS_INT");
-        return e && e[0] == '1';
-    }();
-    return v;
-}
-
 void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
     if (!sig || !real_fn) return nullptr;
     const char* p = std::strchr(sig, '(');
@@ -59576,24 +59331,9 @@ void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
                 case 'J': size = 8; align = 8; break;
                 case 'D': size = 8; align = 8; is_fp = true; break;
                 case 'F': size = 4; align = 4; is_fp = true; break;
-                // Sub-int stack args keep their NATURAL size on macOS. jdk21u
-                // runtime/signature.hpp NativeSignatureIterator::do_type routes
-                // T_BYTE/T_BOOLEAN to pass_byte() and T_CHAR/T_SHORT to
-                // pass_short(), and interpreterRT_aarch64.cpp stores them with
-                // strb/strh at next_stack_offset(sizeof(jbyte)=1 / jshort=2).
-                // (The compiled native wrapper never handles these: on
-                // __APPLE__ c_calling_convention_priv returns -1 for any
-                // sub-word int/float stack arg, so the interpreter's handler
-                // always does.) They used to be modelled as 4 bytes here, which
-                // shifted every later stack arg: LibretroDroid.create's four
-                // trailing booleans put the ImmersiveMode object at the
-                // language jstring's slot. MACAPK_NMB_SUBINT_AS_INT=1 restores
-                // the old 4-byte model for bisection.
-                case 'Z': case 'B':
-                    size = align = macapk_nmb_subint_as_int() ? 4 : 1; break;
-                case 'C': case 'S':
-                    size = align = macapk_nmb_subint_as_int() ? 4 : 2; break;
-                case 'I': size = 4; align = 4; break;
+                // Z/B/C/S are widened to int by HotSpot's pass_int -> 4 bytes.
+                case 'I': case 'S': case 'B': case 'C': case 'Z':
+                    size = 4; align = 4; break;
                 default: return nullptr;   // V or unknown -> bail (passthrough)
             }
             ++p;

@@ -210,65 +210,6 @@ public class HorizontalScrollView extends FrameLayout {
         return mIsBeingDragged;
     }
 
-    /** AOSP HorizontalScrollView.onGenericMotionEvent (android14-release
-     *  HorizontalScrollView.java:861-923): AXIS_HSCROLL (or -AXIS_VSCROLL with
-     *  Shift held) x the horizontal scroll factor, clamped, not while a drag is
-     *  in progress; a MOUSE never overscrolls. WheelScroll.VIEWS=0: not handled. */
-    @Override public boolean onGenericMotionEvent(android.view.MotionEvent event) {
-        if (com.macapk.loader.WheelScroll.VIEWS
-                && event.getAction() == android.view.MotionEvent.ACTION_SCROLL && !mIsBeingDragged) {
-            final float axisValue;
-            if (event.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER)) {
-                if ((event.getMetaState() & android.view.KeyEvent.META_SHIFT_ON) != 0) {
-                    axisValue = -event.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL);
-                } else {
-                    axisValue = event.getAxisValue(android.view.MotionEvent.AXIS_HSCROLL);
-                }
-            } else if (event.isFromSource(android.view.InputDevice.SOURCE_ROTARY_ENCODER)) {
-                axisValue = event.getAxisValue(android.view.MotionEvent.AXIS_SCROLL);
-            } else {
-                axisValue = 0;
-            }
-            final float factor = android.view.ViewConfiguration.get(getContext())
-                    .getScaledHorizontalScrollFactor();
-            final int delta = Math.round(axisValue * factor);
-            if (delta != 0) {
-                final int range = macapkScrollRangeX();
-                int oldScrollX = getScrollX();
-                int newScrollX = oldScrollX + delta;
-                final int overscrollMode = getOverScrollMode();
-                boolean canOverscroll = !event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
-                        && (overscrollMode == OVER_SCROLL_ALWAYS
-                        || (overscrollMode == OVER_SCROLL_IF_CONTENT_SCROLLS && range > 0));
-                boolean absorbed = false;
-                if (newScrollX < 0) {
-                    if (canOverscroll) {
-                        mEdgeGlowLeft.onPullDistance(-(float) newScrollX / getWidth(), 0.5f);
-                        mEdgeGlowLeft.onRelease();
-                        invalidate();
-                        absorbed = true;
-                    }
-                    newScrollX = 0;
-                } else if (newScrollX > range) {
-                    if (canOverscroll) {
-                        mEdgeGlowRight.onPullDistance(
-                                (float) (newScrollX - range) / getWidth(), 0.5f);
-                        mEdgeGlowRight.onRelease();
-                        invalidate();
-                        absorbed = true;
-                    }
-                    newScrollX = range;
-                }
-                if (newScrollX != oldScrollX) {
-                    super.scrollTo(newScrollX, getScrollY());
-                    return true;
-                }
-                if (absorbed) return true;
-            }
-        }
-        return super.onGenericMotionEvent(event);
-    }
-
     @Override public boolean onTouchEvent(android.view.MotionEvent ev) {
         initVelocityTrackerIfNotExists();
         boolean handled = true;

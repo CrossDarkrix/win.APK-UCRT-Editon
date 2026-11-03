@@ -6,7 +6,6 @@
 // same main thread.
 
 #include "macapk/jvm_loader.h"
-#include "macapk/jit_wx_guard.h"
 
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
@@ -105,24 +104,6 @@ void LogCriticalReleaseSemantics(JNIEnv* env, const std::string& gc) {
                  SystemProperty(env, "java.vm.version").c_str(), spec.c_str(),
                  SystemProperty(env, "java.home").c_str(),
                  gc.empty() ? "ergonomic" : gc.c_str(), sem);
-}
-
-// Android resolves the PBE crypto family to BC (Conscrypt has none of it); the
-// host's SunJCE would answer first with different semantics (Pocket Casts died on
-// "Salt must be 8 bytes long", issue #7). android.security.MacApkProviderPreference
-// sets the JDK's jdk.security.provider.preferred property, which is read ONCE when
-// the first ProviderList is built -- so it has to run here, before any Java of ours
-// can touch a provider. Non-fatal: a JVM without the framework jar keeps the JDK order.
-void InstallAndroidProviderPreference(JNIEnv* env) {
-    jclass c = env->FindClass("android/security/MacApkProviderPreference");
-    jmethodID m = c ? env->GetStaticMethodID(c, "install", "()V") : nullptr;
-    if (m) env->CallStaticVoidMethod(c, m);
-    if (env->ExceptionCheck()) {
-        std::fprintf(stderr, "[jvm] provider preference not installed (PBE stays on SunJCE):\n");
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-    if (c) env->DeleteLocalRef(c);
 }
 
 // ---- JDK selection + AOT cache (docs/jdk25-move-and-aot-cache_2026-09-26.md) ----
@@ -774,11 +755,6 @@ void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
         }
     }
 
-    // macOS 27 with hardware TPRO (seen with SIP disabled) resets the JIT
-    // write bit inside dlopen, and HotSpot's code-cache writes in create_vm
-    // then fault. Must be in place before the VM's first WX switch.
-    InstallJvmJitWxGuard();
-
     *out_vm  = nullptr;
     *out_env = nullptr;
     jint rc = JNI_CreateJavaVM(out_vm, reinterpret_cast<void**>(out_env), &vm_args);
@@ -788,9 +764,7 @@ void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
                      static_cast<int>(rc));
         std::abort();
     }
-    LogJvmJitWxGuardStats();
     LogCriticalReleaseSemantics(*out_env, SelectedCollector(owned_options));
-    InstallAndroidProviderPreference(*out_env);
     if (aot.active && !aot.recording) {
         // Did it MAP? java.vm.info carries "sharing" exactly when an archive (the AOT
         // cache or the JDK's default CDS archive) is in use, so this one line is the

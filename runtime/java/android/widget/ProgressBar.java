@@ -38,68 +38,16 @@ public class ProgressBar extends View {
         super(context, attrs, 0);
         macapkApplyAttrs(attrs);
         macapkApplyStyledDrawables(context, attrs, macapkDefaultStyleAttr(), 0);
-        macapkApplyStyledSize(context, attrs, macapkDefaultStyleAttr(), 0);
     }
     public ProgressBar(Context context, AttributeSet attrs, int defStyleAttr) {
         super(context, attrs, defStyleAttr);
         macapkApplyAttrs(attrs);
         macapkApplyStyledDrawables(context, attrs, defStyleAttr, 0);
-        macapkApplyStyledSize(context, attrs, defStyleAttr, 0);
     }
     public ProgressBar(Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
         super(context, attrs, defStyleAttr);
         macapkApplyAttrs(attrs);
         macapkApplyStyledDrawables(context, attrs, defStyleAttr, defStyleRes);
-        macapkApplyStyledSize(context, attrs, defStyleAttr, defStyleRes);
-    }
-
-    /** android.R.attr maxWidth / maxHeight / indeterminate / indeterminateOnly /
-     *  minWidth / minHeight (SDK-36 public ids, ascending). */
-    private static final int[] MACAPK_STYLED_SIZE_ATTRS =
-        { 0x0101011f, 0x01010120, 0x01010139, 0x0101013a, 0x0101013f, 0x01010140 };
-
-    /** AOSP ProgressBar constructor (android14 :298-301, :330-336): the min/max
-     *  size clamp and indeterminate[Only] come from the STYLE as much as from the
-     *  XML. Never read, so a bar built as `new ProgressBar(ctx, null,
-     *  progressBarStyleLarge)` (leanback's ProgressBarManager, SmartTube's player
-     *  spinner) had neither its 76dp clamp nor its indeterminate mode. */
-    private void macapkApplyStyledSize(Context context, AttributeSet attrs,
-                                       int defStyleAttr, int defStyleRes) {
-        if (context == null) return;
-        android.content.res.TypedArray a = null;
-        try {
-            a = context.obtainStyledAttributes(attrs, MACAPK_STYLED_SIZE_ATTRS, defStyleAttr, defStyleRes);
-            mMaxWidth = a.getDimensionPixelSize(0, mMaxWidth);
-            mMaxHeight = a.getDimensionPixelSize(1, mMaxHeight);
-            mMinWidth = a.getDimensionPixelSize(4, mMinWidth);
-            mMinHeight = a.getDimensionPixelSize(5, mMinHeight);
-            boolean only = a.getBoolean(3, false);
-            boolean ind = only || a.getBoolean(2, indeterminate);
-            if (ind != indeterminate) setIndeterminate(ind);
-        } catch (Throwable t) {
-            // An unreadable style must never break construction.
-        } finally {
-            if (a != null) try { a.recycle(); } catch (Throwable ignored) {}
-        }
-    }
-
-    /** AOSP ProgressBar.onMeasure (android14 :2187-2205): the current drawable's
-     *  intrinsic size clamped into [min, max], plus padding, resolved against the
-     *  spec. There was no override, so a wrap_content bar took View's default
-     *  (the whole AT_MOST size): SmartTube's player spinner filled the window as
-     *  a stretched ellipse. */
-    @Override
-    protected synchronized void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        int dw = 0, dh = 0;
-        final android.graphics.drawable.Drawable d = mCurrentDrawable;
-        if (d != null) {
-            dw = Math.max(mMinWidth, Math.min(mMaxWidth, d.getIntrinsicWidth()));
-            dh = Math.max(mMinHeight, Math.min(mMaxHeight, d.getIntrinsicHeight()));
-        }
-        dw += getPaddingLeft() + getPaddingRight();
-        dh += getPaddingTop() + getPaddingBottom();
-        setMeasuredDimension(resolveSizeAndState(dw, widthMeasureSpec, 0),
-                resolveSizeAndState(dh, heightMeasureSpec, 0));
     }
 
     // ---- the styled drawables (MACAPK_PROGRESS_STYLED_DRAWABLES) -------------
@@ -618,6 +566,9 @@ public class ProgressBar extends View {
     private int mMinWidth = 24, mMaxWidth = 48, mMinHeight = 24, mMaxHeight = 48;
     private android.view.animation.Interpolator mInterpolator;
     private int mSampleWidth = 0;
+    /** AOSP keeps mSampleWidth package-visible for RatingBar.onMeasure: the
+     *  width of one tile of the progress drawable, i.e. one star. */
+    int macapkSampleWidth() { return mSampleWidth; }
 
     /** AOSP :1478 -- whichever of the progress/indeterminate drawables is
      *  currently being painted. */
@@ -719,8 +670,12 @@ public class ProgressBar extends View {
     }
 
     // ---- min/max size -------------------------------------------------
-    // AOSP :439-497. These feed onMeasure, which clamps the drawable's
-    // intrinsic size into [min,max] (and AbsSeekBar's, which adds the thumb).
+    // AOSP :439-497. These feed AOSP's onMeasure, which clamps the drawable's
+    // intrinsic size into [min,max]. This port does not override onMeasure at
+    // all (the bar sizes from its layout params / background), so setting one
+    // of these does not resize anything here -- the values round-trip exactly
+    // as AOSP's do, and the measurement gap is tracked separately rather than
+    // fixed by a guess inside a getter.
     public void setMinWidth(int minWidth)   { mMinWidth = minWidth;   requestLayout(); }
     public int  getMinWidth()               { return mMinWidth; }
     public void setMaxWidth(int maxWidth)   { mMaxWidth = maxWidth;   requestLayout(); }

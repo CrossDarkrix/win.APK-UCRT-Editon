@@ -772,22 +772,140 @@ public abstract class Window {
     // purely cosmetic; their absence doesn't change WHICH content shows).
     public void setSharedElementsUseOverlay(boolean sharedElementsUseOverlay) {}
     public boolean getSharedElementsUseOverlay() { return true; }
-    public void setEnterTransition(android.transition.Transition transition) {}
-    public void setReturnTransition(android.transition.Transition transition) {}
-    public void setExitTransition(android.transition.Transition transition) {}
-    public void setReenterTransition(android.transition.Transition transition) {}
-    public android.transition.Transition getEnterTransition() { return null; }
-    public android.transition.Transition getReturnTransition() { return null; }
-    public android.transition.Transition getExitTransition() { return null; }
-    public android.transition.Transition getReenterTransition() { return null; }
-    public void setSharedElementEnterTransition(android.transition.Transition transition) {}
-    public void setSharedElementReturnTransition(android.transition.Transition transition) {}
-    public void setSharedElementExitTransition(android.transition.Transition transition) {}
-    public void setSharedElementReenterTransition(android.transition.Transition transition) {}
-    public android.transition.Transition getSharedElementEnterTransition() { return null; }
-    public android.transition.Transition getSharedElementReturnTransition() { return null; }
-    public android.transition.Transition getSharedElementExitTransition() { return null; }
-    public android.transition.Transition getSharedElementReenterTransition() { return null; }
+    // The eight activity-transition slots, as AOSP PhoneWindow keeps them
+    // (android14-release PhoneWindow.java: fields ~:250-270, getters ~:4080-4150,
+    // installDecor's getTransition loads ~:2790-2840). They were set-nothing /
+    // return-null stubs, but a Material/AppCompat theme gives every window
+    // windowActivityTransitions=true and windowSharedElementEnterTransition=
+    // @transition/move, so on a device getSharedElementEnterTransition() is
+    // never null and apps call addListener on it unguarded. Measured 2026-10-28
+    // on Paz Yellow's SmsVerificationActivity: that NPE aborted onCreate before
+    // it attached the code field's TextWatcher, so a complete code did nothing.
+    // Nothing runs the transitions (cosmetic, see above); the objects exist so
+    // the app's own code around them completes. MACAPK_WINDOW_TRANSITIONS=0
+    // restores the null stubs.
+    static final boolean MACAPK_WINDOW_TRANSITIONS =
+            !"0".equals(System.getenv("MACAPK_WINDOW_TRANSITIONS"));
+    /** PhoneWindow.USE_DEFAULT_TRANSITION: "return falls back to enter". */
+    private static final android.transition.Transition USE_DEFAULT_TRANSITION =
+            new android.transition.TransitionSet();
+    private android.transition.Transition mEnterTransition = null;
+    private android.transition.Transition mReturnTransition = USE_DEFAULT_TRANSITION;
+    private android.transition.Transition mExitTransition = null;
+    private android.transition.Transition mReenterTransition = USE_DEFAULT_TRANSITION;
+    private android.transition.Transition mSharedElementEnterTransition = null;
+    private android.transition.Transition mSharedElementReturnTransition = USE_DEFAULT_TRANSITION;
+    private android.transition.Transition mSharedElementExitTransition = null;
+    private android.transition.Transition mSharedElementReenterTransition = USE_DEFAULT_TRANSITION;
+    private boolean mMacapkTransitionsLoaded;
+
+    /** installDecor's theme load, done on first use instead: AOSP loads in
+     *  installDecor (setContentView), before any app code can read these. Only
+     *  a slot the app has not set yet takes the theme's value. */
+    private void macapkLoadTransitions() {
+        if (mMacapkTransitionsLoaded || !MACAPK_WINDOW_TRANSITIONS) return;
+        mMacapkTransitionsLoaded = true;
+        final android.content.res.TypedArray a;
+        try { a = getWindowStyle(); } catch (Throwable t) { return; }
+        if (a == null || mContext == null) return;
+        // PhoneWindow.generateLayout: windowActivityTransitions requests
+        // FEATURE_ACTIVITY_TRANSITIONS, and installDecor loads only then.
+        final int act = macapkWindowStyleableIndex(mContext, "windowActivityTransitions");
+        boolean on = false;
+        try { on = act >= 0 && a.getBoolean(act, false); } catch (Throwable ignored) {}
+        if (!on && !hasFeature(FEATURE_ACTIVITY_TRANSITIONS)) return;
+        mEnterTransition = macapkThemeTransition(a, mEnterTransition, null,
+                "windowEnterTransition");
+        mReturnTransition = macapkThemeTransition(a, mReturnTransition, USE_DEFAULT_TRANSITION,
+                "windowReturnTransition");
+        mExitTransition = macapkThemeTransition(a, mExitTransition, null,
+                "windowExitTransition");
+        mReenterTransition = macapkThemeTransition(a, mReenterTransition, USE_DEFAULT_TRANSITION,
+                "windowReenterTransition");
+        mSharedElementEnterTransition = macapkThemeTransition(a, mSharedElementEnterTransition,
+                null, "windowSharedElementEnterTransition");
+        mSharedElementReturnTransition = macapkThemeTransition(a, mSharedElementReturnTransition,
+                USE_DEFAULT_TRANSITION, "windowSharedElementReturnTransition");
+        mSharedElementExitTransition = macapkThemeTransition(a, mSharedElementExitTransition,
+                null, "windowSharedElementExitTransition");
+        mSharedElementReenterTransition = macapkThemeTransition(a, mSharedElementReenterTransition,
+                USE_DEFAULT_TRANSITION, "windowSharedElementReenterTransition");
+    }
+
+    /** PhoneWindow.getTransition(currentValue, defaultValue, id): keep a value
+     *  the app set; otherwise inflate the theme's resource, where @null and
+     *  @transition/no_transition mean "none". */
+    private android.transition.Transition macapkThemeTransition(android.content.res.TypedArray a,
+            android.transition.Transition current, android.transition.Transition def, String attr) {
+        if (current != def) return current;
+        final int idx = macapkWindowStyleableIndex(mContext, attr);
+        int resId = -1;
+        try { if (idx >= 0) resId = a.getResourceId(idx, -1); } catch (Throwable ignored) {}
+        if (resId == -1 || resId == 0) return def;
+        try {
+            if ("no_transition".equals(mContext.getResources().getResourceEntryName(resId))) return def;
+        } catch (Throwable ignored) {}
+        try {
+            android.transition.Transition t =
+                    android.transition.TransitionInflater.from(mContext).inflateTransition(resId);
+            return t != null ? t : def;
+        } catch (Throwable t) { return def; }
+    }
+
+    public void setEnterTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mEnterTransition = transition;
+    }
+    public void setReturnTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mReturnTransition = transition;
+    }
+    public void setExitTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mExitTransition = transition;
+    }
+    public void setReenterTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mReenterTransition = transition;
+    }
+    public android.transition.Transition getEnterTransition() {
+        macapkLoadTransitions(); return mEnterTransition;
+    }
+    public android.transition.Transition getReturnTransition() {
+        macapkLoadTransitions();
+        return mReturnTransition == USE_DEFAULT_TRANSITION ? getEnterTransition() : mReturnTransition;
+    }
+    public android.transition.Transition getExitTransition() {
+        macapkLoadTransitions(); return mExitTransition;
+    }
+    public android.transition.Transition getReenterTransition() {
+        macapkLoadTransitions();
+        return mReenterTransition == USE_DEFAULT_TRANSITION ? getExitTransition() : mReenterTransition;
+    }
+    public void setSharedElementEnterTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mSharedElementEnterTransition = transition;
+    }
+    public void setSharedElementReturnTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mSharedElementReturnTransition = transition;
+    }
+    public void setSharedElementExitTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mSharedElementExitTransition = transition;
+    }
+    public void setSharedElementReenterTransition(android.transition.Transition transition) {
+        macapkLoadTransitions(); mSharedElementReenterTransition = transition;
+    }
+    public android.transition.Transition getSharedElementEnterTransition() {
+        macapkLoadTransitions(); return mSharedElementEnterTransition;
+    }
+    public android.transition.Transition getSharedElementReturnTransition() {
+        macapkLoadTransitions();
+        return mSharedElementReturnTransition == USE_DEFAULT_TRANSITION
+                ? getSharedElementEnterTransition() : mSharedElementReturnTransition;
+    }
+    public android.transition.Transition getSharedElementExitTransition() {
+        macapkLoadTransitions(); return mSharedElementExitTransition;
+    }
+    public android.transition.Transition getSharedElementReenterTransition() {
+        macapkLoadTransitions();
+        return mSharedElementReenterTransition == USE_DEFAULT_TRANSITION
+                ? getSharedElementExitTransition() : mSharedElementReenterTransition;
+    }
     public void setAllowEnterTransitionOverlap(boolean allow) {}
     public boolean getAllowEnterTransitionOverlap() { return true; }
     public void setAllowReturnTransitionOverlap(boolean allow) {}

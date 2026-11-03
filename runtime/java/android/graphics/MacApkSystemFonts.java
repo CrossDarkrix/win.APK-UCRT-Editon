@@ -17,9 +17,6 @@
 // and Boot hands that directory to the bionic shim (NativeCocoa
 // .setSystemFontsDir), whose path remap serves /system/etc/fonts.xml and
 // /system/fonts/<file> from it (bionic_shim.cpp macapk_system_fonts_remap).
-// The device file's CJK families (zh-Hans, zh-Hant, ja, ko) are backed by the
-// Mac's own faces, linked in by MacApkHostFonts; without them Flutter drew every
-// Chinese character as a box (GitHub issue #27).
 //
 // THE KEY is a digest of the generated XML and each face's jar entry (name,
 // size, CRC-32 from the central directory, no font bytes read), so a warm launch
@@ -68,23 +65,12 @@ public final class MacApkSystemFonts {
      *  it on first use; null when disabled or when it cannot be built, in which
      *  case /system/fonts stays absent exactly as before. Never throws. */
     public static String materialize() {
-        return materialize(null);
-    }
-
-    /** As materialize(), plus the host's CJK faces (MacApkHostFonts) found
-     *  through hostFontFile (PostScript name -> file path, CoreText's answer;
-     *  null for none). They are LINKED into the directory, never copied: the
-     *  bytes stay the Mac's, and the key carries each file's path, size and
-     *  mtime so a macOS update that moves one publishes a new directory. */
-    public static String materialize(java.util.function.Function<String, String> hostFontFile) {
         if (!ENABLED) return null;
         try {
-            List<MacApkHostFonts.Family> host = MacApkHostFonts.resolve(hostFontFile);
-            String baseXml = MacApkFontFamilies.systemFontsXml();
+            String xml = MacApkFontFamilies.systemFontsXml();
             List<String> files = MacApkFontFamilies.systemFontFiles();
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            md.update(baseXml.getBytes(StandardCharsets.UTF_8));
-            md.update(MacApkHostFonts.identity(host).getBytes(StandardCharsets.UTF_8));
+            md.update(xml.getBytes(StandardCharsets.UTF_8));
             for (String f : files) {
                 URL u = MacApkSystemFonts.class.getResource("/fonts/" + f);
                 if (u == null) continue;   // not bundled: fonts.xml names it, Skia skips it
@@ -106,19 +92,6 @@ public final class MacApkSystemFonts {
                     writeForced(new File(part, f).toPath(), in.readAllBytes());
                 }
             }
-            // Host faces: index each in its collection (reads only headers and
-            // name tables), then one symlink per host file under an ASCII name.
-            MacApkHostFonts.indexAll(host);
-            java.util.Set<String> linked = new java.util.HashSet<>();
-            for (MacApkHostFonts.Family fam : host) {
-                for (MacApkHostFonts.Face f : fam.faces) {
-                    if (linked.add(f.linkName)) {
-                        Files.createSymbolicLink(new File(part, f.linkName).toPath(),
-                                                 f.file.toPath());
-                    }
-                }
-            }
-            String xml = host.isEmpty() ? baseXml : MacApkFontFamilies.systemFontsXml(host);
             writeForced(new File(part, "fonts.xml").toPath(), xml.getBytes(StandardCharsets.UTF_8));
             try {
                 Files.move(part.toPath(), dir.toPath(), StandardCopyOption.ATOMIC_MOVE);

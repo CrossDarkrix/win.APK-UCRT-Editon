@@ -821,14 +821,6 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  clear the previously-focused branch, and propagate to the parent so the
      *  whole root->leaf chain points at the new focus. */
     @Override public void requestChildFocus(View child, View focused) {
-        // AOSP ViewGroup.requestChildFocus (android14): a blocking group ignores
-        // the request, and a group that held focus ITSELF gives it up
-        // (super.unFocus) once a descendant takes it. Without the unFocus a
-        // RecyclerView that had focus kept mIsFocused=true under its newly
-        // focused child, so findFocus() stopped at the RecyclerView and every
-        // D-pad key went to it rather than to the focused card.
-        if (getDescendantFocusability() == FOCUS_BLOCK_DESCENDANTS) return;
-        super.unFocus(focused);
         if (mFocused != child) {
             if (mFocused != null) mFocused.unFocus(focused);  // clear the old focused branch
             mFocused = child;
@@ -844,52 +836,6 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     /** AOSP ViewGroup.hasFocus: this view or any descendant along mFocused. */
     @Override public boolean hasFocus() {
         return mIsFocused || (mFocused != null && mFocused.hasFocus());
-    }
-    /** AOSP ViewGroup.hasFocusable(boolean, boolean) (android14 :1266-1288) +
-     *  hasFocusableChild (:1290-1306): a VISIBLE group is "focusable" when it is
-     *  itself, or, unless it blocks descendants, when any child is.
-     *
-     *  ⚠ ViewGroup inherited View's self-only answer, so a non-focusable wrapper
-     *  around a focusable view reported "nothing focusable here". RecyclerView /
-     *  leanback GridLayoutManager.onAddFocusables skip every child whose
-     *  hasFocusable() is false, so in leanback's headers sidebar (each header is a
-     *  focusable view inside a plain NoOverlappingFrameLayout wrapper) a D-pad
-     *  Down found 0 focusables and the selection never moved. */
-    @Override
-    boolean hasFocusable(boolean allowAutoFocus, boolean dispatchExplicit) {
-        if (getVisibility() != VISIBLE) return false;
-        if ((allowAutoFocus || getFocusable() != FOCUSABLE_AUTO) && isFocusable()) return true;
-        if (getDescendantFocusability() != FOCUS_BLOCK_DESCENDANTS) {
-            for (int i = 0; i < children.size(); i++) {
-                View child = children.get(i);
-                if (child == null) continue;
-                if (dispatchExplicit ? child.hasExplicitFocusable() : child.hasFocusable()) return true;
-            }
-        }
-        return false;
-    }
-
-    /** AOSP ViewGroup.handleFocusGainInternal (android14 :841-848): a group that
-     *  takes focus ITSELF first unfocuses the descendant branch it was holding.
-     *  Without it the old focused child kept mIsFocused under a focused parent:
-     *  leanback's HeadersSupportFragment.onTransitionStart calls
-     *  listView.requestFocus() on its headers grid while a header holds focus,
-     *  and every later focus move "succeeded" on the stale header while
-     *  findFocus() kept answering the grid, so the arrows stopped moving. */
-    @Override
-    void handleFocusGainInternal(int direction, android.graphics.Rect previouslyFocusedRect) {
-        if (mFocused != null) {
-            mFocused.unFocus(this);
-            mFocused = null;
-        }
-        super.handleFocusGainInternal(direction, previouslyFocusedRect);
-    }
-
-    /** AOSP ViewGroup.dispatchUnhandledMove: pass the focus move that found no
-     *  target down the mFocused chain, so the focused view (a ViewPager, a
-     *  leanback grid) gets the last chance to act on the D-pad key. */
-    @Override public boolean dispatchUnhandledMove(View focused, int direction) {
-        return mFocused != null && mFocused.dispatchUnhandledMove(focused, direction);
     }
     /** AOSP ViewGroup.findFocus: walk the mFocused chain to the focused leaf. */
     @Override public View findFocus() {
@@ -3237,7 +3183,6 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  ViewGroup overrides it to recurse so the whole departing subtree
      *  detaches. */
     private void macapkFinishRemoval(View child) {
-        if (View.HOVER_VIEWS && mFirstHoverTarget != null) cancelHoverTarget(child);
         child.setParent(null);
         child.macapkDispatchDetachedFromWindow();
         try { onViewRemoved(child); } catch (Throwable ignored) {}
@@ -3486,7 +3431,7 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  touchscreen -- except when it is a keyboard-navigation cluster that
      *  already holds focus, or is not the top-most cluster of its subtree, in
      *  which case cluster navigation may enter it and move freely inside. */
-    boolean shouldBlockFocusForTouchscreen() {
+    private boolean shouldBlockFocusForTouchscreen() {
         if (!getTouchscreenBlocksFocus()) return false;
         boolean hasTouchscreen = true;
         try {
@@ -3947,253 +3892,19 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         return false;
     }
 
-    /** AOSP ViewGroup.dispatchGenericPointerEvent (android14-release
-     *  ViewGroup.java:2534-2563): a pointer generic event (a mouse wheel's
-     *  ACTION_SCROLL) goes to the child UNDER THE POINTER, top-most first, in the
-     *  child's own coordinates (dispatchTransformedGenericPointerEvent
-     *  :2589-2604); if none handles it, this group's own View half runs (its
-     *  listener, then onGenericMotionEvent), which is how a list nested in a
-     *  scroller hands a wheel step it cannot use to the scroller around it.
-     *  WheelScroll.VIEWS=0 keeps the old walk: every child in turn, untransformed,
-     *  whatever the pointer position. */
+    /** AOSP ViewGroup.dispatchGenericPointerEvent (:2534-2563) sends a pointer
+     *  event to the child UNDER the pointer. Ours still walks every child,
+     *  top-most first, which is what this class's dispatchGenericMotionEvent
+     *  did for every source before 2026-10-02. Nothing in Mac.apk produces a
+     *  SOURCE_CLASS_POINTER generic event yet (the host mouse is delivered as
+     *  touch, and its wheel is not delivered), so the hit test is left for the
+     *  change that adds one. */
     @Override protected boolean dispatchGenericPointerEvent(MotionEvent event) {
-        if (!com.macapk.loader.WheelScroll.VIEWS) {
-            for (int i = children.size() - 1; i >= 0; i--) {
-                View c = children.get(i);
-                if (c != null && c.dispatchGenericMotionEvent(event)) return true;
-            }
-            return super.dispatchGenericPointerEvent(event);
-        }
-        final int childrenCount = children.size();
-        if (childrenCount != 0) {
-            final float x = event.getX();
-            final float y = event.getY();
-            final java.util.ArrayList<View> preorderedList = buildOrderedChildList();
-            final boolean customOrder = preorderedList == null
-                    && isChildrenDrawingOrderEnabled();
-            try {
-                for (int i = childrenCount - 1; i >= 0; i--) {
-                    final int childIndex =
-                            getAndVerifyPreorderedIndex(childrenCount, i, customOrder);
-                    final View child = getAndVerifyPreorderedView(preorderedList, childIndex);
-                    if (child == null || !child.canReceivePointerEvents()
-                            || !isTransformedTouchPointInView(x, y, child, null)) {
-                        continue;
-                    }
-                    if (dispatchTransformedGenericPointerEvent(event, child)) return true;
-                }
-            } finally {
-                if (preorderedList != null) preorderedList.clear();
-            }
+        for (int i = children.size() - 1; i >= 0; i--) {
+            View c = children.get(i);
+            if (c != null && c.dispatchGenericMotionEvent(event)) return true;
         }
         return super.dispatchGenericPointerEvent(event);
-    }
-
-    // ------------------------------------------------------------------
-    // HOVER (GitHub #25, MACAPK_HOVER_EVENTS). AOSP ViewGroup.dispatchHoverEvent
-    // (android14-release ViewGroup.java:2113-2300), ported: the group keeps a
-    // list of hovered children (HoverTarget), sends a hover to the child under
-    // the pointer top-most first, SYNTHESIZES an ENTER from a MOVE for a child
-    // that was not hovered and an EXIT for each child the pointer has left, and
-    // hovers itself only when no child handled the event. View.dispatchHoverEvent
-    // used to answer false and this group had no override, so a hover never
-    // reached any view.
-    // ------------------------------------------------------------------
-    private static final class HoverTarget {
-        View child;
-        HoverTarget next;
-        HoverTarget(View child) { this.child = child; }
-    }
-    private HoverTarget mFirstHoverTarget;
-    private boolean mHoveredSelf;
-
-    @Override public boolean dispatchHoverEvent(MotionEvent event) {
-        if (!View.HOVER_VIEWS) return super.dispatchHoverEvent(event);
-        final int action = event.getAction();
-        final boolean interceptHover = onInterceptHoverEvent(event);
-        event.setAction(action);   // restore in case it was changed
-        MotionEvent eventNoHistory = event;
-        boolean handled = false;
-
-        HoverTarget firstOldHoverTarget = mFirstHoverTarget;
-        mFirstHoverTarget = null;
-        if (!interceptHover && action != MotionEvent.ACTION_HOVER_EXIT) {
-            final float x = event.getX();
-            final float y = event.getY();
-            final int childrenCount = children.size();
-            if (childrenCount != 0) {
-                final java.util.ArrayList<View> preorderedList = buildOrderedChildList();
-                final boolean customOrder = preorderedList == null
-                        && isChildrenDrawingOrderEnabled();
-                HoverTarget lastHoverTarget = null;
-                try {
-                    for (int i = childrenCount - 1; i >= 0; i--) {
-                        final int childIndex =
-                                getAndVerifyPreorderedIndex(childrenCount, i, customOrder);
-                        final View child = getAndVerifyPreorderedView(preorderedList, childIndex);
-                        if (child == null || !child.canReceivePointerEvents()
-                                || !isTransformedTouchPointInView(x, y, child, null)) {
-                            continue;
-                        }
-                        // Reuse the child's target from the old list if it was hovered.
-                        HoverTarget hoverTarget = firstOldHoverTarget;
-                        final boolean wasHovered;
-                        for (HoverTarget predecessor = null; ;) {
-                            if (hoverTarget == null) {
-                                hoverTarget = new HoverTarget(child);
-                                wasHovered = false;
-                                break;
-                            }
-                            if (hoverTarget.child == child) {
-                                if (predecessor != null) predecessor.next = hoverTarget.next;
-                                else firstOldHoverTarget = hoverTarget.next;
-                                hoverTarget.next = null;
-                                wasHovered = true;
-                                break;
-                            }
-                            predecessor = hoverTarget;
-                            hoverTarget = hoverTarget.next;
-                        }
-                        if (lastHoverTarget != null) lastHoverTarget.next = hoverTarget;
-                        else mFirstHoverTarget = hoverTarget;
-                        lastHoverTarget = hoverTarget;
-
-                        if (action == MotionEvent.ACTION_HOVER_ENTER) {
-                            if (!wasHovered) {
-                                handled |= dispatchTransformedGenericPointerEvent(event, child);
-                            }
-                        } else if (action == MotionEvent.ACTION_HOVER_MOVE) {
-                            if (!wasHovered) {
-                                // Synthesize an enter from a move.
-                                eventNoHistory = noHistory(eventNoHistory);
-                                eventNoHistory.setAction(MotionEvent.ACTION_HOVER_ENTER);
-                                handled |= dispatchTransformedGenericPointerEvent(eventNoHistory, child);
-                                eventNoHistory.setAction(action);
-                                handled |= dispatchTransformedGenericPointerEvent(eventNoHistory, child);
-                            } else {
-                                handled |= dispatchTransformedGenericPointerEvent(event, child);
-                            }
-                        }
-                        if (handled) break;
-                    }
-                } finally {
-                    if (preorderedList != null) preorderedList.clear();
-                }
-            }
-        }
-
-        // Exit every previously hovered child that is no longer hovered.
-        while (firstOldHoverTarget != null) {
-            final View child = firstOldHoverTarget.child;
-            if (action == MotionEvent.ACTION_HOVER_EXIT) {
-                handled |= dispatchTransformedGenericPointerEvent(event, child);
-            } else {
-                // Synthesize an exit from a move or enter; the result is ignored
-                // because hover focus has moved to a different view.
-                if (action == MotionEvent.ACTION_HOVER_MOVE) {
-                    final boolean hoverExitPending = event.isHoverExitPending();
-                    event.setHoverExitPending(true);
-                    dispatchTransformedGenericPointerEvent(event, child);
-                    event.setHoverExitPending(hoverExitPending);
-                }
-                eventNoHistory = noHistory(eventNoHistory);
-                eventNoHistory.setAction(MotionEvent.ACTION_HOVER_EXIT);
-                dispatchTransformedGenericPointerEvent(eventNoHistory, child);
-                eventNoHistory.setAction(action);
-            }
-            firstOldHoverTarget = firstOldHoverTarget.next;
-        }
-
-        // Hover the group itself only when no child took the event and the group
-        // is not itself being exited.
-        final boolean newHoveredSelf = !handled
-                && action != MotionEvent.ACTION_HOVER_EXIT && !event.isHoverExitPending();
-        if (newHoveredSelf == mHoveredSelf) {
-            if (newHoveredSelf) handled |= super.dispatchHoverEvent(event);
-        } else {
-            if (mHoveredSelf) {
-                if (action == MotionEvent.ACTION_HOVER_EXIT) {
-                    handled |= super.dispatchHoverEvent(event);
-                } else {
-                    if (action == MotionEvent.ACTION_HOVER_MOVE) super.dispatchHoverEvent(event);
-                    eventNoHistory = noHistory(eventNoHistory);
-                    eventNoHistory.setAction(MotionEvent.ACTION_HOVER_EXIT);
-                    super.dispatchHoverEvent(eventNoHistory);
-                    eventNoHistory.setAction(action);
-                }
-                mHoveredSelf = false;
-            }
-            if (newHoveredSelf) {
-                if (action == MotionEvent.ACTION_HOVER_ENTER) {
-                    handled |= super.dispatchHoverEvent(event);
-                    mHoveredSelf = true;
-                } else if (action == MotionEvent.ACTION_HOVER_MOVE) {
-                    eventNoHistory = noHistory(eventNoHistory);
-                    eventNoHistory.setAction(MotionEvent.ACTION_HOVER_ENTER);
-                    handled |= super.dispatchHoverEvent(eventNoHistory);
-                    eventNoHistory.setAction(action);
-                    handled |= super.dispatchHoverEvent(eventNoHistory);
-                    mHoveredSelf = true;
-                }
-            }
-        }
-        return handled;
-    }
-    /** AOSP obtainMotionEventNoHistoryOrSelf: a private copy the synthesized
-     *  enter/exit actions can be written into without touching the caller's. */
-    private static MotionEvent noHistory(MotionEvent e) {
-        return e.macapkIsHoverCopy ? e : MotionEvent.macapkHoverCopy(e);
-    }
-    @Override protected boolean hasHoveredChild() {
-        return View.HOVER_VIEWS && mFirstHoverTarget != null;
-    }
-    @Override protected boolean pointInHoveredChild(MotionEvent event) {
-        return mFirstHoverTarget != null
-                && isTransformedTouchPointInView(event.getX(), event.getY(), mFirstHoverTarget.child, null);
-    }
-    /** AOSP cancelHoverTarget (android14 :2311): a removed child that was hovered
-     *  gets one HOVER_EXIT and leaves the list. */
-    private void cancelHoverTarget(View view) {
-        HoverTarget predecessor = null;
-        HoverTarget target = mFirstHoverTarget;
-        while (target != null) {
-            final HoverTarget next = target.next;
-            if (target.child == view) {
-                if (predecessor == null) mFirstHoverTarget = next; else predecessor.next = next;
-                final long now = android.os.SystemClock.uptimeMillis();
-                MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_EXIT, 0f, 0f, 0);
-                event.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN);
-                try { view.dispatchHoverEvent(event); } catch (Throwable ignored) {}
-                return;
-            }
-            predecessor = target;
-            target = next;
-        }
-    }
-
-    /** AOSP :2589-2604, with the same child-offset rules as
-     *  dispatchTransformedTouchEvent (macapkSkipOffset, the inverse matrix). */
-    private boolean dispatchTransformedGenericPointerEvent(MotionEvent event, View child) {
-        if (!child.macapkHasTransform()) {
-            if (macapkSkipOffset(child)) return child.dispatchGenericMotionEvent(event);
-            final float offsetX = getScrollX() - child.getLeft();
-            final float offsetY = getScrollY() - child.getTop();
-            event.offsetLocation(offsetX, offsetY);
-            try { return child.dispatchGenericMotionEvent(event); }
-            finally { event.offsetLocation(-offsetX, -offsetY); }
-        }
-        final MotionEvent transformedEvent = MotionEvent.obtain(event);
-        try {
-            if (!macapkSkipOffset(child)) {
-                transformedEvent.offsetLocation(getScrollX() - child.getLeft(),
-                                                getScrollY() - child.getTop());
-            }
-            android.graphics.Matrix inv = macapkChildInverseMatrix(child);
-            if (inv != null) transformedEvent.transform(inv);
-            return child.dispatchGenericMotionEvent(transformedEvent);
-        } finally {
-            transformedEvent.recycle();
-        }
     }
 
     /** AOSP ViewGroup.getOverlay covariantly returns a ViewGroupOverlay. Apps
@@ -4228,9 +3939,58 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     public void suppressLayout(boolean suppress) { mLayoutSuppressed = suppress; }
     public boolean isLayoutSuppressed() { return mLayoutSuppressed; }
 
+    // AOSP ViewGroup FLAG_ADD_STATES_FROM_CHILDREN (android14 ViewGroup.java):
+    //     public void setAddStatesFromChildren(boolean addsStates) {
+    //         if (addsStates) mGroupFlags |= FLAG_ADD_STATES_FROM_CHILDREN;
+    //         else mGroupFlags &= ~FLAG_ADD_STATES_FROM_CHILDREN;
+    //         refreshDrawableState(); }
+    //     protected int[] onCreateDrawableState(int extraSpace) {
+    //         if ((mGroupFlags & FLAG_ADD_STATES_FROM_CHILDREN) == 0)
+    //             return super.onCreateDrawableState(extraSpace);
+    //         int need = 0; for each child: need += child.getDrawableState().length;
+    //         int[] state = super.onCreateDrawableState(extraSpace + need);
+    //         for each child: state = mergeDrawableStates(state, child.getDrawableState());
+    //         return state; }
+    //     public void childDrawableStateChanged(View child) {
+    //         if ((mGroupFlags & FLAG_ADD_STATES_FROM_CHILDREN) != 0) refreshDrawableState(); }
+    // The flag was stored and never read, so a TextInputLayout never saw its
+    // EditText's state_focused: the outline stayed the idle grey and the
+    // label kept the idle color while the field had focus. AOSP forbids a
+    // duplicateParentState child under such a group (it throws); we skip
+    // those children instead, which also keeps the two mirrors from recursing.
     private boolean mAddStatesFromChildren;
-    public void setAddStatesFromChildren(boolean addsStates) { mAddStatesFromChildren = addsStates; }
+    private boolean mMacapkInChildStateChange;
+    public void setAddStatesFromChildren(boolean addsStates) {
+        mAddStatesFromChildren = addsStates;
+        refreshDrawableState();
+    }
     public boolean addStatesFromChildren() { return mAddStatesFromChildren; }
+    @Override protected int[] onCreateDrawableState(int extraSpace) {
+        if (!mAddStatesFromChildren || !android.os.Looper.MACAPK_REAL_LOOPER) {
+            return super.onCreateDrawableState(extraSpace);
+        }
+        final int n = children.size();
+        int need = 0;
+        int[][] childStates = new int[n][];
+        for (int i = 0; i < n; i++) {
+            View c = children.get(i);
+            if (c == null || c.isDuplicateParentStateEnabled()) continue;
+            int[] cs = c.getDrawableState();
+            childStates[i] = cs;
+            if (cs != null) need += cs.length;
+        }
+        int[] state = super.onCreateDrawableState(extraSpace + need);
+        for (int i = 0; i < n; i++) {
+            if (childStates[i] != null) state = mergeDrawableStates(state, childStates[i]);
+        }
+        return state;
+    }
+    @Override public void childDrawableStateChanged(View child) {
+        if (!mAddStatesFromChildren || mMacapkInChildStateChange) return;
+        if (child != null && child.isDuplicateParentStateEnabled()) return;
+        mMacapkInChildStateChange = true;
+        try { refreshDrawableState(); } finally { mMacapkInChildStateChange = false; }
+    }
 
     private boolean mTouchscreenBlocksFocus;
     public void setTouchscreenBlocksFocus(boolean touchscreenBlocksFocus) {
@@ -4238,55 +3998,10 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     }
     public boolean getTouchscreenBlocksFocus() { return mTouchscreenBlocksFocus; }
 
-    /** AOSP ViewGroup.requestFocus(int, Rect) (android14 :3309-3341): dispatch
-     *  on descendantFocusability -- BLOCK: this group only; BEFORE: this group,
-     *  then its descendants; AFTER: descendants first, then this group.
-     *
-     *  ⚠ ViewGroup inherited View's leaf-only requestFocus, so asking a
-     *  container for focus never reached a child: root.restoreDefaultFocus()
-     *  (what leaving touch mode and an unfocused D-pad press call), a
-     *  RecyclerView's or leanback grid's requestFocus(), and every app's
-     *  `container.requestFocus()` returned false with nothing focused. Tab
-     *  worked only because FocusFinder hands focus to a LEAF directly. */
-    @Override
-    public boolean requestFocus(int direction, android.graphics.Rect previouslyFocusedRect) {
-        switch (getDescendantFocusability()) {
-            case FOCUS_BLOCK_DESCENDANTS:
-                return super.requestFocus(direction, previouslyFocusedRect);
-            case FOCUS_AFTER_DESCENDANTS: {
-                final boolean took = onRequestFocusInDescendants(direction, previouslyFocusedRect);
-                return took || super.requestFocus(direction, previouslyFocusedRect);
-            }
-            case FOCUS_BEFORE_DESCENDANTS:
-            default: {
-                final boolean took = super.requestFocus(direction, previouslyFocusedRect);
-                return took || onRequestFocusInDescendants(direction, previouslyFocusedRect);
-            }
-        }
-    }
-
-    /** AOSP ViewGroup.onRequestFocusInDescendants (android14 :3355-3381): offer
-     *  focus to each VISIBLE child in order (reverse order unless the direction
-     *  carries FOCUS_FORWARD's bit, which FOCUS_DOWN does), first taker wins.
-     *  Subclasses (RecyclerView, ScrollView, leanback's BrowseFrameLayout and
-     *  grids) override it. It returned false, the "do not intercept" reading of
-     *  a hook whose base implementation IS the descent. */
+    /** AOSP default: subclasses that want to intercept a descendant focus
+     *  request override this; the base returns false (do not intercept). */
     protected boolean onRequestFocusInDescendants(int direction,
             android.graphics.Rect previouslyFocusedRect) {
-        final int count = children.size();
-        int index, increment, end;
-        if ((direction & FOCUS_FORWARD) != 0) {
-            index = 0; increment = 1; end = count;
-        } else {
-            index = count - 1; increment = -1; end = -1;
-        }
-        for (int i = index; i != end; i += increment) {
-            View child = (i < children.size()) ? children.get(i) : null;
-            if (child != null && child.getVisibility() == VISIBLE
-                    && child.requestFocus(direction, previouslyFocusedRect)) {
-                return true;
-            }
-        }
         return false;
     }
 

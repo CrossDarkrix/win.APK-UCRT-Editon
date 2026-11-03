@@ -710,10 +710,10 @@ public class AnimatorInflater {
         return (type >= TypedValue.TYPE_FIRST_COLOR_INT) && (type <= TypedValue.TYPE_LAST_COLOR_INT);
     }
 
-    /** AOSP tests `peekValue(...) != null` for presence. TypedArray.peekValue
-     *  returns null for a TYPE_NULL slot since v1.0.2269 (it used to answer a
-     *  TYPE_NULL record); the type check stays so a subclass that still answers
-     *  a record cannot read as present. */
+    /** AOSP tests `peekValue(...) != null` for presence. Our TypedArray.peekValue
+     *  deliberately never returns null (v1.0.98: callers chain .type/.data and
+     *  would NPE), expressing "absent" as a TYPE_NULL record instead -- so the
+     *  presence test has to be written against that contract, not against null. */
     private static boolean present(TypedValue v) {
         return v != null && v.type != TypedValue.TYPE_NULL;
     }

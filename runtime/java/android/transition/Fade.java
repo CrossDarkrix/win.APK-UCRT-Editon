@@ -2,8 +2,8 @@
 // disappear). The default member of AutoTransition for added/removed views, and a
 // very common explicit transition (dialog/sheet content swaps, Fragment
 // FADE transitions). Was absent. Mirrors
-// frameworks/base/core/java/android/transition/Fade.java: it animates the view's
-// TRANSITION alpha (0->1 on appear, captured->0 on disappear), never View.alpha.
+// frameworks/base/core/java/android/transition/Fade.java: onAppear animates alpha
+// 0->1, onDisappear animates the captured alpha->0.
 package android.transition;
 
 import android.util.AttributeSet;
@@ -40,71 +40,38 @@ public class Fade extends Visibility {
         setMode(fadingMode);
     }
 
-    static final String PROPNAME_TRANSITION_ALPHA = "android:fade:transitionAlpha";
-
-    /** AOSP Fade.captureStartValues (android14 :110-114): the view's
-     *  TRANSITION alpha, so an interrupted fade resumes from where it was. */
-    @Override
-    public void captureStartValues(TransitionValues transitionValues) {
-        super.captureStartValues(transitionValues);
-        if (transitionValues != null && transitionValues.view != null) {
-            transitionValues.values.put(PROPNAME_TRANSITION_ALPHA,
-                    transitionValues.view.getTransitionAlpha());
-        }
-    }
-
-    /** AOSP Fade.onAppear (:141-154): transitionAlpha from the captured start
-     *  (0 when none, or when it was already fully in) to 1.
-     *
-     *  ⚠ Ours animated the view's OWN alpha from 0 to "whatever alpha it had
-     *  now". An interrupted fade leaves alpha mid-way, so the next appear
-     *  animated 0 -> that fraction and parked there for good: leanback's
-     *  headers sidebar (lb_browse_headers_in/out both carry Fades, run on every
-     *  show/hide) drew every header at alpha ~0.05, i.e. a blank panel. AOSP
-     *  never touches View.alpha here; transitionAlpha is a separate multiplier
-     *  (ViewGroup draws alpha * transitionAlpha) that always ends at 1. */
     @Override
     public Animator onAppear(ViewGroup sceneRoot, View view, TransitionValues startValues,
             TransitionValues endValues) {
         if (view == null) return null;
-        float startAlpha = getStartAlpha(startValues, 0f);
-        if (startAlpha == 1f) startAlpha = 0f;
-        return createAnimation(view, startAlpha, 1f);
+        final float endAlpha = view.getAlpha();
+        view.setAlpha(0f);
+        return createFadeAnimation(view, 0f, endAlpha <= 0f ? 1f : endAlpha);
     }
 
-    /** AOSP Fade.onDisappear (:157-161): transitionAlpha from the captured
-     *  start (1 when none) to 0; the listener puts it back to 1 at the end. */
     @Override
     public Animator onDisappear(ViewGroup sceneRoot, View view, TransitionValues startValues,
             TransitionValues endValues) {
         if (view == null) return null;
-        return createAnimation(view, getStartAlpha(startValues, 1f), 0f);
-    }
-
-    private static float getStartAlpha(TransitionValues startValues, float fallbackValue) {
-        if (startValues != null) {
-            Object f = startValues.values.get(PROPNAME_TRANSITION_ALPHA);
-            if (f instanceof Float) return (Float) f;
+        final float startAlpha = view.getAlpha();
+        final Animator anim = createFadeAnimation(view, startAlpha, 0f);
+        if (anim != null) {
+            // AOSP restores the view's alpha after the disappear so a re-used view
+            // is not left invisible.
+            final View target = view;
+            final float restore = startAlpha;
+            anim.addListener(new AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(Animator animation) {
+                    target.setAlpha(restore);
+                }
+            });
         }
-        return fallbackValue;
+        return anim;
     }
 
-    /** AOSP Fade.createAnimation (:119-139). */
-    private Animator createAnimation(final View view, float startAlpha, float endAlpha) {
+    private Animator createFadeAnimation(View view, float startAlpha, float endAlpha) {
         if (startAlpha == endAlpha) return null;
-        view.setTransitionAlpha(startAlpha);
-        final ObjectAnimator anim = ObjectAnimator.ofFloat(view, "transitionAlpha", startAlpha, endAlpha);
-        anim.addListener(new AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(Animator animation) {
-                view.setTransitionAlpha(1f);
-            }
-        });
-        addListener(new TransitionListenerAdapter() {
-            @Override public void onTransitionEnd(Transition transition) {
-                view.setTransitionAlpha(1f);
-                transition.removeListener(this);
-            }
-        });
-        return anim;
+        view.setAlpha(startAlpha);
+        return ObjectAnimator.ofFloat(view, "alpha", startAlpha, endAlpha);
     }
 }

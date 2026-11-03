@@ -119,13 +119,6 @@ bool IsCodeArtifactName(const std::string& name);
 // No-op unless app_dir lives under <root>/.macapk/code.
 void MirrorInstallMetadata(const std::string& app_dir);
 
-// Code-dir name of the launcher icon's density RASTER when the icon id also has
-// an anydpi XML row (adaptive / vector), which Android prefers at every density.
-// WriteAppMetadata keeps the raster here instead of in icon.png; the install
-// path promotes it to icon.png only when the framework rasterizer produced none.
-// The ".macapk" prefix marks it as ours to every code-dir scanner.
-inline constexpr const char* kIconRasterFallback = ".macapk-icon-raster";
-
 // --peek-manifest: print {"package","versionCode","versionName","label"}
 // for an APK or bundle to stdout as one JSON line. Returns the process
 // exit code (0 on success). Lives in apk_unpacker.cpp so it can reuse

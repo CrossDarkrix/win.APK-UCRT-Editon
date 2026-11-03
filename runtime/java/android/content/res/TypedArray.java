@@ -1583,8 +1583,20 @@ public class TypedArray implements AutoCloseable {
                 return android.util.TypedValue.complexToDimensionPixelSize(rec.data, macapkMetrics());
             }
         }
-        return px != null ? (int) (float) px : def;
+        if (px == null) return def;
+        // AOSP getDimensionPixelSize = TypedValue.complexToDimensionPixelSize:
+        // round to nearest, and a non-zero size never collapses to 0 px. This
+        // truncated, so every sub-pixel literal (0.5dp hairline dividers,
+        // borders, stroke widths at 1x) became 0 and was not drawn, and 1.5dp
+        // came out 1 px instead of 2. getDimensionPixelOffset (truncation) is a
+        // separate method. MACAPK_DIM_PIXEL_SIZE=0 restores the truncation.
+        if (!MACAPK_DIM_PIXEL_SIZE) return (int) (float) px;
+        int res = (int) (px + (px >= 0 ? 0.5f : -0.5f));
+        if (res != 0) return res;
+        return px == 0f ? 0 : (px > 0f ? 1 : -1);
     }
+    static final boolean MACAPK_DIM_PIXEL_SIZE =
+            !"0".equals(System.getenv("MACAPK_DIM_PIXEL_SIZE"));
 
     /** MACAPK_TA_ATTR_DIMEN (default ON). A style item that is a THEME
      *  REFERENCE to a dimension ("?android:actionBarSize", the minHeight of
@@ -1625,9 +1637,10 @@ public class TypedArray implements AutoCloseable {
      *  references (resolved through the ResourceIndex's raw dimen
      *  table -- previously these parsed as the literal "@..." and
      *  every @dimen margin silently became the caller default) and
-     *  unit literals, converted with this array's Resources metrics
-     *  (AOSP TypedValue.applyDimension). Returns null when unparseable. */
-    private Float macapkParseDimenToPx(String v) {
+     *  unit literals. dp/dip/sp scale by the device density
+     *  (DisplayMetrics.macapkDeviceDensity); px/raw pass
+     *  through. Returns null when unparseable. */
+    private static Float macapkParseDimenToPx(String v) {
         if (v == null || v.isEmpty()) return null;
         // lane layout, 2026-08-01: chase dimen->dimen REFERENCE CHAINS, not
         // just one hop. Material3 tokens are routinely aliases-of-aliases
@@ -1645,52 +1658,19 @@ public class TypedArray implements AutoCloseable {
         if (v.startsWith("@") || v.startsWith("?")) {
             return null;  // other refs unsupported here
         }
-        // The metrics of the Resources this array reads through, as AOSP's
-        // mMetrics (see macapkParseDimenLiteral below for the SmartTube
-        // case that a fixed device density got wrong).
-        return macapkParseDimenLiteral(v, macapkMetrics());
-    }
-    /** A literal dimension ("16dp", "14sp", "9pt", "12px", "3") to pixels the
-     *  way AOSP TypedValue.applyDimension does, against `dm` -- the metrics of
-     *  the Resources the value is read through. AOSP converts every dimension
-     *  (Resources.getDimension, TypedArray.getDimension*, drawable XML) with
-     *  that object's mMetrics, so an app that rewrites its own Resources'
-     *  DisplayMetrics (SmartTube's MotherActivity.initDpi sets density to scale
-     *  its UI to a 1080p layout) sees ONE density everywhere. These static
-     *  parsers used the fixed device density instead, while the inflater and
-     *  Resources.getDimension followed the app's metrics: leanback's headers
-     *  sidebar came out 540 px wide (270dp at the app's 2.0) but was pushed off
-     *  screen by only 265 px (265dp at the device's 1.0), so a blank 275 px
-     *  panel sat over the rows. Null for a reference or an unparseable value;
-     *  `dm` null falls back to the device density. */
-    static Float macapkParseDimenLiteral(String v, android.util.DisplayMetrics dm) {
-        if (v == null) return null;
-        v = v.trim();
-        if (v.isEmpty() || v.startsWith("@") || v.startsWith("?")) return null;
         int unitEnd = v.length();
         for (int i = 0; i < v.length(); i++) {
             if (Character.isLetter(v.charAt(i))) { unitEnd = i; break; }
         }
+        String unit = v.substring(unitEnd);
         try {
             float n = Float.parseFloat(v.substring(0, unitEnd));
-            String unit = v.substring(unitEnd);
-            float density = (dm != null && dm.density > 0f) ? dm.density
-                    : android.util.DisplayMetrics.macapkDeviceDensity();
-            float scaled = (dm != null && dm.scaledDensity > 0f) ? dm.scaledDensity : density;
-            float xdpi = (dm != null && dm.xdpi > 0f) ? dm.xdpi : density * 160f;
             switch (unit) {
-                case "dp": case "dip": return n * density;
-                case "sp":             return n * scaled;
-                case "pt":             return n * xdpi * (1.0f / 72f);
-                case "in":             return n * xdpi;
-                case "mm":             return n * xdpi * (1.0f / 25.4f);
-                default:               return n;
+                case "dp": case "dip": case "sp": return n * android.util.DisplayMetrics.macapkDeviceDensity();
+                default: return n;  // px or bare number
             }
-        } catch (NumberFormatException ex) {
-            return null;
-        }
+        } catch (NumberFormatException e) { return null; }
     }
-
     private static String macapkLookupRaw(String method, String name) {
         try {
             Object ri = Resources.macapkGetResourceIndex();
@@ -1701,7 +1681,24 @@ public class TypedArray implements AutoCloseable {
             return v == null ? null : v.toString();
         } catch (Throwable t) { return null; }
     }
-    public int getDimensionPixelOffset(int index, int def){ return getDimensionPixelSize(index, def); }
+    /** AOSP getDimensionPixelOffset = complexToDimensionPixelOffset: TRUNCATE.
+     *  It used to share getDimensionPixelSize, which was itself truncating;
+     *  now that Size rounds (MACAPK_DIM_PIXEL_SIZE), Offset keeps its own
+     *  truncation, exactly the answer it always gave. */
+    public int getDimensionPixelOffset(int index, int def) {
+        if (!MACAPK_DIM_PIXEL_SIZE) return getDimensionPixelSize(index, def);
+        String v = macapkRawValueAt(index);
+        if (v == null) return def;
+        Float px = macapkParseDimenToPx(v);
+        if (px == null) {
+            android.util.TypedValue rec = macapkAttrDimenRecord(index, v);
+            if (rec != null) {
+                return android.util.TypedValue.complexToDimensionPixelOffset(rec.data, macapkMetrics());
+            }
+            return def;
+        }
+        return (int) (float) px;
+    }
     public float getDimension(int index, float def)       {
         String v = macapkRawValueAt(index);
         if (v == null) return def;
@@ -1712,71 +1709,42 @@ public class TypedArray implements AutoCloseable {
         }
         return px != null ? px : def;
     }
-    /** AOSP TypedArray.getLayoutDimension(int, int) (android14-release): an
-     *  INT-typed slot answers its data, a TYPE_DIMENSION slot answers
-     *  complexToDimensionPixelSize, anything else the default. The int case is
-     *  what makes MATCH_PARENT / WRAP_CONTENT work: aapt compiles the enum names
-     *  of a `dimension|enum` attr (layout_width, leanback's rowHeight,
-     *  columnWidth, ...) to TYPE_INT_DEC -1 / -2.
-     *
-     *  ⚠ This forwarded to getDimensionPixelSize, and our AttributeSet hands
-     *  those enum values back as their NAMES ("wrap_content"), which no
-     *  dimension parse accepts, so every such read answered the default.
-     *  Measured on SmartTube: lb_list_row.xml sets `lb:rowHeight="wrap_content"`
-     *  on androidx.leanback's HorizontalGridView, setRowHeight got the default
-     *  0 instead of -2, GridLayoutManager took the fixed-row path with a 0 px
-     *  row, and every browse row measured 0 tall with its cards bound inside.
-     *  (MACAPK_TRACE_ATTR=rowHeight shows the raw: setValue=wrap_content.) */
-    public int getLayoutDimension(int index, int def) {
-        Integer v = macapkLayoutDimension(index);
-        return v != null ? v : def;
-    }
-    /** AOSP getLayoutDimension(int, String): the same answer, and an
-     *  UnsupportedOperationException when the slot is neither an int nor a
-     *  dimension ("You must supply a layout_width attribute."). It returned a
-     *  constant 0, which made every app LayoutParams.setBaseAttributes override
-     *  read width = height = 0. */
-    public int getLayoutDimension(int index, String name) {
-        Integer v = macapkLayoutDimension(index);
-        if (v != null) return v;
-        throw new UnsupportedOperationException(getPositionDescription()
-                + ": You must supply a " + name + " attribute.");
-    }
-    private Integer macapkLayoutDimension(int index) {
+    /** AOSP getLayoutDimension: an INT value (the layout_width/height enum, so
+     *  MATCH_PARENT -1 / WRAP_CONTENT -2, or a plain integer) is returned AS IS;
+     *  a dimension is converted to pixels. Our values are the decoded spelling,
+     *  so "match_parent" / "wrap_content" reached the dimension parser, failed,
+     *  and the caller's default came back: ConstraintSet read every
+     *  <Constraint android:layout_width="match_parent"> as 0 (MATCH_CONSTRAINT),
+     *  so a MotionLayout's children solved to zero height -- WhatsApp's Settings
+     *  header, back arrow included, never appeared. The String-named overload
+     *  answered 0 for everything, which is what setBaseAttributes reads. */
+    private static final Integer MACAPK_LAYOUT_DIM_NONE = null;
+    private Integer macapkLayoutDimensionKeyword(int index) {
         String v = macapkRawValueAt(index);
-        if (v == null) return null;
-        Integer e = macapkLayoutEnumOrInt(v);
-        if (e != null) return e;
-        if (macapkParseDimenToPx(v.trim()) != null) return getDimensionPixelSize(index, 0);
-        // A reference (?attr / @ref) whose resolved record is an int or a
-        // dimension: AOSP resolves it before the getter looks at the type.
-        android.util.TypedValue rec = macapkRecordAt(index);
-        if (rec != null) {
-            if (rec.type >= android.util.TypedValue.TYPE_FIRST_INT
-                    && rec.type <= android.util.TypedValue.TYPE_LAST_INT) return rec.data;
-            if (rec.type == android.util.TypedValue.TYPE_DIMENSION) {
-                return android.util.TypedValue.complexToDimensionPixelSize(rec.data, macapkMetrics());
+        if (v == null) return MACAPK_LAYOUT_DIM_NONE;
+        String t = v.trim();
+        if (t.equals("match_parent") || t.equals("fill_parent")) return -1;
+        if (t.equals("wrap_content")) return -2;
+        if (!t.isEmpty() && (Character.isDigit(t.charAt(0)) || t.charAt(0) == '-')) {
+            boolean digits = true;
+            for (int i = (t.charAt(0) == '-') ? 1 : 0; i < t.length(); i++) {
+                if (!Character.isDigit(t.charAt(i))) { digits = false; break; }
+            }
+            if (digits && t.length() > (t.charAt(0) == '-' ? 1 : 0)) {
+                try { return Integer.parseInt(t); } catch (NumberFormatException ignored) { }
             }
         }
-        return null;
+        return MACAPK_LAYOUT_DIM_NONE;
     }
-    /** The INT-typed spellings a layout dimension can arrive in from our
-     *  AttributeSet: the attrs.xml enum names aapt compiles to -1 / -2, and an
-     *  integer literal (decimal, or 0x hex as TYPE_INT_HEX). Null otherwise. */
-    static Integer macapkLayoutEnumOrInt(String raw) {
-        if (raw == null) return null;
-        String t = raw.trim();
-        switch (t) {
-            case "match_parent": case "fill_parent": return -1;
-            case "wrap_content": return -2;
-            default: break;
-        }
-        try {
-            if (t.startsWith("0x") || t.startsWith("0X")) return (int) Long.parseLong(t.substring(2), 16);
-            return Integer.parseInt(t);
-        } catch (NumberFormatException e) {
-            return null;
-        }
+    public int getLayoutDimension(int index, int def) {
+        Integer k = macapkLayoutDimensionKeyword(index);
+        return k != null ? k : getDimensionPixelSize(index, def);
+    }
+    public int getLayoutDimension(int index, String name) {
+        // AOSP throws when the attribute is missing; the old stub answered 0,
+        // and that tolerance is kept so a missing value cannot crash a ctor.
+        Integer k = macapkLayoutDimensionKeyword(index);
+        return k != null ? k : getDimensionPixelSize(index, 0);
     }
     /** AOSP getFraction: value "15%" multiplies `base`; "15%p"
      *  multiplies `pbase`; resolves `@fraction/X` refs first.
@@ -2234,32 +2202,12 @@ public class TypedArray implements AutoCloseable {
         outValue.string = rec.string;
         return true;
     }
-    /** AOSP TypedArray.peekValue (android14-release :1214-1228): the value
-     *  at index, or NULL when the slot holds no value. getValueAt (:1372-1377)
-     *  returns false for ANY TYPE_NULL slot -- absent, @null and @empty alike --
-     *  so null is the device's answer for all three, and only hasValueOrEmpty
-     *  tells @empty apart.
-     *
-     *  ⚠ This returned a TYPE_NULL record instead of null (the v1.0.98
-     *  never-null stub contract), and the commonest AndroidX presence test is
-     *  exactly `peekValue(i) != null` (androidx.leanback's
-     *  HorizontalGridView.setRowHeight / VerticalGridView.setColumnWidth,
-     *  AppCompat and Material readers), so every UNSET attribute read as
-     *  present and the app then applied the getter's default as if it had been
-     *  declared. Found while bringing up SmartTube. Our own framework callers
-     *  that want the never-null record (TextView's appearance read) use
-     *  {@link #macapkPeekRecord} instead. AOSP returns its internal mValue;
-     *  we return a COPY so a caller mutating it cannot corrupt the cache. */
     public android.util.TypedValue peekValue(int index) {
-        android.util.TypedValue v = macapkPeekRecord(index);
-        return v.type == android.util.TypedValue.TYPE_NULL ? null : v;
-    }
-    /** Mac.apk-internal, never null: peekValue's record with "no value"
-     *  expressed as TYPE_NULL. Its data carries what the device's internal
-     *  record holds, so it cannot contradict hasValueOrEmpty:
-     *  DATA_NULL_EMPTY for @empty (aapt2 MakeEmpty), DATA_NULL_UNDEFINED (0)
-     *  for @null and absent. Not AOSP API; app code never sees it. */
-    public android.util.TypedValue macapkPeekRecord(int index) {
+        // v1.0.913: answer the real record. AOSP returns its internal
+        // TypedValue; we return a COPY so a caller mutating it cannot
+        // corrupt the cache. The v1.0.98 never-null contract stays for the
+        // absent case (callers chain .type/.data and would NPE), which a
+        // TYPE_NULL record expresses honestly.
         android.util.TypedValue rec = macapkRecordAt(index);
         android.util.TypedValue v = new android.util.TypedValue();
         if (rec != null) {
@@ -2269,6 +2217,14 @@ public class TypedArray implements AutoCloseable {
             v.string = rec.string;
         } else {
             v.type = android.util.TypedValue.TYPE_NULL;
+            // Cluster A2: this TYPE_NULL copy is OUR v1.0.98 never-null
+            // convention, not AOSP's answer. AOSP's peekValue returns null for
+            // ANY TYPE_NULL slot (getValueAt :1372-1377, android14-release, is
+            // false for it), so on a device only hasValueOrEmpty can tell an
+            // explicit @empty from @null / absent. The copy carries the data
+            // the device's internal record holds, so it cannot contradict
+            // hasValueOrEmpty: DATA_NULL_EMPTY for @empty (aapt2 MakeEmpty),
+            // DATA_NULL_UNDEFINED (0) for @null and absent.
             if (macapkRecordState != null && index >= 0 && index < macapkRecordState.length
                     && macapkRecordState[index] == 3) {
                 v.data = android.util.TypedValue.DATA_NULL_EMPTY;

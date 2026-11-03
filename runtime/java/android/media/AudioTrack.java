@@ -72,10 +72,6 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     // getBufferSizeInFrames disagree the way they do on a real device.
     private final int bufferSizeInFrames;
     private int effectiveBufferInFrames;
-    // The native track's frameCount: bufferSizeInFrames raised to the
-    // platform minimum (see the constructor). bufferSizeInFrames stays the
-    // app's request, which is what bounds a MODE_STATIC buffer.
-    private int capacityInFrames;
     // AOSP's mDataLoadMode. Recorded because setPlaybackHeadPosition's very
     // first branch is `if (mDataLoadMode == MODE_STREAM || ...) return
     // ERROR_INVALID_OPERATION` -- without the field there is nothing to be
@@ -148,22 +144,6 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
             h = 0;
         }
         this.handle = h;
-        // AOSP: the track's frameCount is the request raised to the platform
-        // minimum (AudioFlinger PlaybackThread::createTrack_l), and both
-        // getBufferCapacityInFrames and the initial getBufferSizeInFrames
-        // report it. The native side owns that answer; an older backend (or a
-        // test double) without the method leaves the request as the answer.
-        int cap = bufFrames;
-        if (h != 0) {
-            try {
-                int c = com.macapk.loader.NativeAudio.nativeGetBufferCapacity(h);
-                if (c > 0) cap = c;
-            } catch (Throwable t) {
-                // keep the request
-            }
-        }
-        this.capacityInFrames = cap;
-        this.effectiveBufferInFrames = cap;
     }
 
     private static int normalizeEncoding(int fmt) {
@@ -221,11 +201,11 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     public int getSampleRate()      { return sampleRate; }
     public int getChannelCount()    { return channels; }
     public int getAudioFormat()     { return encoding; }
-    // The fill threshold: the native frameCount at construction, then
-    // whatever setBufferSizeInFrames adopted. AOSP's getBufferSizeInFrames()
-    // calls through to a native query that can reflect a post-creation route
-    // adjustment; Mac.apk has no HAL that resizes the buffer behind the app's
-    // back, so the last adopted value is always the current value.
+    // The actual allocated buffer size, computed once at construction from
+    // bufferSizeInBytes. AOSP's getBufferSizeInFrames() calls through to a
+    // native query that can reflect a post-creation route adjustment; Mac.apk
+    // has no HAL that resizes the buffer after creation, so the construction-
+    // time value is always the current value.
     public int getBufferSizeInFrames() { return effectiveBufferInFrames; }
 
     /**
@@ -234,12 +214,13 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
      * (frameworks/base/media/java/android/media/AudioTrack.java, main, L2302).
      *
      * A REAL answer. AOSP documents the capacity as ">= the bufferSizeInBytes
-     * given at construction, converted to frames" for a streaming track: the
-     * request raised to the platform minimum, which is what the native track
-     * reports (see the constructor). Our backend never enlarges the buffer
-     * after creation, so that frame count IS the capacity.
+     * given at construction, converted to frames" for a streaming track, and
+     * exactly that for a static one. Our backend never enlarges the buffer
+     * after creation (see getBufferSizeInFrames above for why), so the
+     * construction-time frame count IS the capacity -- a legal, self-consistent
+     * device, not a placeholder.
      */
-    public int getBufferCapacityInFrames() { return capacityInFrames; }
+    public int getBufferCapacityInFrames() { return bufferSizeInFrames; }
 
     /**
      * Limit the effective buffer size the app may fill. API 24. AOSP
@@ -248,10 +229,13 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
      * otherwise the ACTUAL size adopted, which may differ from the request and
      * is capped at getBufferCapacityInFrames().
      *
-     * Implemented for real: the native track lowers the amount a blocking
-     * write may queue ahead of the speaker, so an app that shrinks its buffer
-     * to cut latency gets lower latency, and getBufferSizeInFrames reports the
-     * size that was adopted.
+     * Implemented for real against the same field getBufferSizeInFrames reads,
+     * including the cap, so an app that shrinks its buffer to cut latency and
+     * then re-reads the size sees a coherent, believable device. The one thing
+     * the return value cannot promise is lower latency: our backend was created
+     * with the original frame count and is not re-opened here, so this changes
+     * the number the app is told, not the audio path. A backend that can
+     * genuinely resize should do so here and return what it achieved.
      */
     public int setBufferSizeInFrames(int bufferSizeInFrames) {
         if (handle == 0) {
@@ -260,17 +244,8 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         if (bufferSizeInFrames < 0) {
             return ERROR_BAD_VALUE;
         }
-        // AOSP: "return native_set_buffer_size_frames(bufferSizeInFrames);",
-        // which clips to [16, frameCount] (ClientProxy::setBufferSizeInFrames)
-        // and lowers the fill threshold blocking writes wait on, so a smaller
-        // size really is lower latency. The native side does both.
-        int adopted = Math.min(bufferSizeInFrames, getBufferCapacityInFrames());
-        try {
-            adopted = com.macapk.loader.NativeAudio.nativeSetBufferSize(handle, bufferSizeInFrames);
-        } catch (Throwable t) {
-            // older backend: report the clipped size only
-        }
-        this.effectiveBufferInFrames = adopted;
+        this.effectiveBufferInFrames =
+                Math.min(bufferSizeInFrames, getBufferCapacityInFrames());
         return this.effectiveBufferInFrames;
     }
 
@@ -428,21 +403,20 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     /** @deprecated in AOSP since API 21; superseded by setVolume(float). */
     @Deprecated
     public int setStereoVolume(float left, float right) {
-        // AOSP (frameworks/base main, AudioTrack.java:2714-2717): "if (mState
-        // == STATE_UNINITIALIZED) { return ERROR_INVALID_OPERATION; }" before
-        // touching the volume state at all (see HONEST_OPEN above).
         if (honestUninitialized()) return ERROR_INVALID_OPERATION;
-        mBaseVolL = left; mBaseVolR = right;
+        if (left < 0.0f || left > 1.0f || right < 0.0f || right > 1.0f) return ERROR_BAD_VALUE;
+        float session = Math.max(left, right);
+        // Put common attenuation in the Windows session. Keep only stereo balance
+        // in the stream so equal L/R gain is not multiplied twice.
+        mBaseVolL = session > 0.0f ? left / session : 1.0f;
+        mBaseVolR = session > 0.0f ? right / session : 1.0f;
         pushVolume();
+        com.macapk.loader.NativeAudio.nativeSetSessionMute(session <= 0.0f);
+        com.macapk.loader.NativeAudio.nativeSetSessionVolume(session);
         return SUCCESS;
     }
     public int setVolume(float gain) {
-        // AOSP's setVolume(float) is "return setStereoVolume(gain, gain);"
-        // (:2746-2747), so it inherits the same STATE_UNINITIALIZED check.
-        if (honestUninitialized()) return ERROR_INVALID_OPERATION;
-        mBaseVolL = gain; mBaseVolR = gain;
-        pushVolume();
-        return SUCCESS;
+        return setStereoVolume(gain, gain);
     }
 
     public static int getMinBufferSize(int sampleRateInHz, int channelConfig, int audioFormat) {
@@ -482,33 +456,10 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     // wrapping roughly every 27:03:11 at 44.1 kHz. The native side tracks full
     // 64-bit precision; this (int) narrowing reproduces AOSP's 32-bit wrap
     // exactly (low 32 bits, same as a real HAL position overflowing uint32_t).
-    /** MACAPK_AUDIO_CLOCK_TRACE=1: the playback clock as a player sees it.
-     *  offset = reported position - host time; a steady clock keeps it
-     *  constant, so its spread is the clock's jitter. kind 0 = head position,
-     *  1 = getTimestamp (plus how stale its nanoTime is). Every 200 reads. */
-    static final boolean CLOCK_TRACE = "1".equals(System.getenv("MACAPK_AUDIO_CLOCK_TRACE"));
-    private final long[][] mClk = new long[2][200]; private final long[] mStale = new long[200];
-    private final int[] mClkN = new int[2];
-    private synchronized void clockTrace(int kind, long offsetNs, long staleNs) {
-        int i = mClkN[kind]++;
-        mClk[kind][i] = offsetNs;
-        if (kind == 1) mStale[i] = staleNs;
-        if (mClkN[kind] == 200) {
-            long[] a = mClk[kind].clone(); java.util.Arrays.sort(a);
-            String extra = "";
-            if (kind == 1) { long[] b = mStale.clone(); java.util.Arrays.sort(b);
-                extra = String.format(" stale p50=%.1fms p95=%.1f max=%.1f", b[100] / 1e6, b[190] / 1e6, b[199] / 1e6); }
-            com.macapk.loader.NativeLog.i("AudioTrack", String.format("clock %s: offset spread p5..p95=%.1fms (p50-p5=%.1f, p95-p50=%.1f) max-min=%.1f%s",
-                kind == 0 ? "headPosition" : "getTimestamp", (a[190] - a[10]) / 1e6, (a[100] - a[10]) / 1e6, (a[190] - a[100]) / 1e6,
-                (a[199] - a[0]) / 1e6, extra));
-            mClkN[kind] = 0;
-        }
-    }
     public int getPlaybackHeadPosition() {
         if (handle == 0) return 0;
         int pos = (int) com.macapk.loader.NativeAudio.nativeGetPlaybackHeadPosition(handle);
         com.macapk.loader.AudioTrace.hit("AudioTrack.getPlaybackHeadPosition", "pos=" + pos);
-        if (CLOCK_TRACE && sampleRate > 0) clockTrace(0, (long) pos * 1_000_000_000L / sampleRate - System.nanoTime(), 0);
         return pos;
     }
     // AOSP's native_get_timestamp-backed poll: fills (framePosition, nanoTime)
@@ -554,8 +505,6 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         // the two sees the same wrapped value for the same instant.
         timestamp.framePosition = out[0] & 0xFFFFFFFFL;
         timestamp.nanoTime = out[1];
-        if (CLOCK_TRACE && sampleRate > 0) clockTrace(1, timestamp.framePosition * 1_000_000_000L / sampleRate - timestamp.nanoTime,
-            System.nanoTime() - timestamp.nanoTime);
         com.macapk.loader.AudioTrace.hit("AudioTrack.getTimestamp",
             "true framePosition=" + timestamp.framePosition + " nanoTime=" + timestamp.nanoTime);
         return true;
@@ -994,19 +943,7 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         }
     }
 
-    /** AOSP: "return native_get_underrun_count();" -- underrun episodes the
-     *  mixer counted on this track since creation (ERROR_INVALID_OPERATION on
-     *  an uninitialized track is not reachable from Java there either, so 0
-     *  without a native side). The backend counts each starved render cycle
-     *  run once, as AudioFlinger does. */
-    public int getUnderrunCount() {
-        if (handle == 0) return 0;
-        try {
-            return com.macapk.loader.NativeAudio.nativeGetUnderrunCount(handle);
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
+    public int getUnderrunCount() { return 0; }
 
     /**
      * AOSP (frameworks/base .../AudioTrack.java, setPlaybackHeadPosition):
@@ -1118,8 +1055,13 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
      *  output here, so a request naming it succeeds, a request for anything else
      *  cannot be honoured, and null ("no preference") always succeeds. */
     @Override public boolean setPreferredDevice(AudioDeviceInfo deviceInfo) {
-        if (deviceInfo == null) { mPreferredDevice = null; return true; }
-        if (!deviceInfo.isSink()) return false;
+        if (deviceInfo != null && !deviceInfo.isSink()) return false;
+        String endpointId = deviceInfo == null ? null : deviceInfo.getAddress();
+        if (deviceInfo != null && (endpointId == null || endpointId.length() == 0)) return false;
+        boolean applied;
+        try { applied = com.macapk.loader.NativeAudio.nativeSetAudioOutputDevice(endpointId); }
+        catch (Throwable ignored) { applied = false; }
+        if (!applied) return false;
         mPreferredDevice = deviceInfo;
         return true;
     }
@@ -1127,7 +1069,8 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     /** AOSP: the device audio is ACTUALLY going to while the track is
      *  initialized, null otherwise. Ours is the single CoreAudio output. */
     @Override public AudioDeviceInfo getRoutedDevice() {
-        return (getState() == STATE_UNINITIALIZED) ? null : new AudioDeviceInfo();
+        if (getState() == STATE_UNINITIALIZED) return null;
+        return mPreferredDevice != null ? mPreferredDevice : new AudioDeviceInfo();
     }
 
     // ---- VolumeAutomation ------------------------------------------------

@@ -102,10 +102,6 @@ public class Button extends TextView {
             if (mh > 0) setMinHeight(mh);
             int mw = macapkStyleDimenPx(resolve.invoke(ri, styleName, "minWidth"), dm);
             if (mw > 0) setMinWidth(mw);
-            // Widget.Button's focusable / clickable (styles.xml): what lets a
-            // button built in code take D-pad / Tab focus, as on a device.
-            if ("true".equals(resolve.invoke(ri, styleName, "focusable"))) setFocusable(true);
-            if ("true".equals(resolve.invoke(ri, styleName, "clickable"))) setClickable(true);
         } catch (Throwable ignored) {}
     }
 

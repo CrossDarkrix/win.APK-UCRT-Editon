@@ -31,6 +31,10 @@ public final class NativeMedia {
     public static native int  nativeDemuxAdvance(long h);      // 1 = new current, 0 = EOS
     public static native void nativeDemuxSeek(long h, long us);
     public static native void nativeDemuxClose(long h);
+    public static native long nativeMetadataOpen(String path);
+    public static native String nativeMetadataGetString(long h, String key);
+    public static native byte[] nativeMetadataGetPicture(long h);
+    public static native void nativeMetadataClose(long h);
 
     // ---- Decoder (backs MediaCodec): AudioToolbox AudioConverter ----
     /** Opens a decoder for (formatId, sampleRate, channels, csd-0); handle or 0. */

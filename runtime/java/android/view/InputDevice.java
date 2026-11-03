@@ -37,8 +37,6 @@ public final class InputDevice implements android.os.Parcelable {
     public static final int SOURCE_MOUSE_RELATIVE = 0x00020004;
     public static final int SOURCE_TOUCHPAD    = 0x00100008;
     public static final int SOURCE_TOUCH_NAVIGATION = 0x00200000;
-    // AOSP InputDevice.SOURCE_ROTARY_ENCODER = 0x00400000 | SOURCE_CLASS_NONE.
-    public static final int SOURCE_ROTARY_ENCODER = 0x00400000;
     public static final int SOURCE_JOYSTICK    = 0x01000010;
     public static final int SOURCE_HDMI        = 0x02000001;
     public static final int SOURCE_ANY         = 0xffffff00;

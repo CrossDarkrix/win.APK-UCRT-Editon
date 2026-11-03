@@ -399,15 +399,14 @@ public class Paint {
         if (fm == null) {
             base = text.length() * textSize * 0.55f;  // fallback
         } else if (MacApkFont.firstSpecial(text, fm.getFont()) < 0
-                   && !Float.isNaN(MacApkFont.quantizedWidth(scaled, text,
-                                                             MacApkFont.ligaFor(letterSpacing)))) {
+                   && !Float.isNaN(MacApkFont.quantizedWidth(scaled, text))) {
             // ⚠ v1.0.937: sum of INTEGER-QUANTIZED per-glyph advances, which is
             // what Skia produces under Android's default hinting-on /
             // subpixel-off Paint. Measured 8/9 against the golden where the
             // whole-string float sum below scored 4/9 -- see
             // MacApkFont.GLYPH_QUANTIZE for the table and the one case it
             // trades away. The draw path steps by the SAME GlyphVector.
-            base = MacApkFont.quantizedWidth(scaled, text, MacApkFont.ligaFor(letterSpacing));
+            base = MacApkFont.quantizedWidth(scaled, text);
         } else if (MacApkFont.firstSpecial(text, fm.getFont()) < 0) {
             // ⚠ v1.0.932: getStringBounds, NOT stringWidth. `FontMetrics.stringWidth`
             // sums INTEGER per-character advances, so it accumulates up to half a
@@ -447,28 +446,15 @@ public class Paint {
         // emoji is one cluster of two codepoints; a base+combining pair is one
         // cluster of two codepoints too -- codePointCount got that second case
         // right by accident and the first case wrong).
-        //
-        // v1.0.2239: on the single-font path the gaps are counted on the SHAPED
-        // run (MacApkFont.spacingClusterCount), because minikin spaces HarfBuzz
-        // output clusters and a ligature is one of them -- Material Symbols'
-        // "home" is one rlig glyph and takes one gap, not four. Without a
-        // ligature the count equals the grapheme count above.
-        int gaps = 0;
         if (letterSpacing != 0f && !text.isEmpty()) {
-            gaps = -1;
-            if (fm != null && MacApkFont.firstSpecial(text, fm.getFont()) < 0) {
-                gaps = MacApkFont.spacingClusterCount(scaled, text,
-                                                      MacApkFont.ligaFor(letterSpacing));
-            }
-            if (gaps < 0) gaps = macapkClusterCount(text);
-            base += gaps * letterSpacing * textSize;
+            base += macapkClusterCount(text) * letterSpacing * textSize;
         }
         // The letter-spacing term IS still scaled here: minikin computes
         // `letterSpace = letterSpacing * size * scaleX`, so the gap scales even
         // though the glyph advances were already scaled by the font transform
         // above. Scaling `base` as a whole would double-scale them.
         if (textScaleX_ != 1f && letterSpacing != 0f && !text.isEmpty()) {
-            base += gaps * letterSpacing * textSize
+            base += macapkClusterCount(text) * letterSpacing * textSize
                     * (textScaleX_ - 1f);
         }
         return base;
@@ -530,8 +516,7 @@ public class Paint {
                 scaled = scaled.deriveFont(java.awt.geom.AffineTransform
                             .getScaleInstance(textScaleX_, 1.0));
             }
-            MacApkFont.Quantized q = MacApkFont.quantize(scaled, text,
-                                                         MacApkFont.ligaFor(letterSpacing));
+            MacApkFont.Quantized q = MacApkFont.quantize(scaled, text);
             if (q == null) return null;
             final int n = text.length();
             final float[] perChar = new float[n];
@@ -542,17 +527,6 @@ public class Paint {
                 float a = (float) (q.glyphs.getGlyphPosition(g + 1).getX()
                                    - q.glyphs.getGlyphPosition(g).getX());
                 perChar[ci] += a;
-            }
-            // Which graphemes begin a letter-spacing cluster: those holding a
-            // glyph of their own. A grapheme a ligature swallowed has none, so it
-            // takes no gap -- the same rule measureText counts by
-            // (MacApkFont.spacingClusterCount), or the two would disagree by a
-            // gap per swallowed character.
-            final boolean[] ownsGlyph = new boolean[n];
-            final boolean shapedGaps = MacApkFont.SHAPED_SPACING;
-            for (int g = 0; g < ng; g++) {
-                int ci = q.glyphs.getGlyphCharIndex(g);
-                if (ci >= 0 && ci < n) ownsGlyph[ci] = true;
             }
             // Fold each cluster's chars onto its BASE index, AOSP's attribution.
             final float[] out = new float[n];
@@ -566,9 +540,7 @@ public class Paint {
                 for (int k = a0; k < b && k < n; k++) sum += perChar[k];
                 // One letter-space gap per CLUSTER, matching the n-not-n-1 rule
                 // macapkRawAdvance documents above.
-                boolean starts = !shapedGaps;
-                for (int k = a0; !starts && k < b && k < n; k++) starts = ownsGlyph[k];
-                if (letterSpacing != 0f && starts) sum += letterSpacing * textSize;
+                if (letterSpacing != 0f) sum += letterSpacing * textSize;
                 out[a0] = sum;
             }
             return out;
@@ -666,10 +638,7 @@ public class Paint {
             if (rm != null) {
                 // Same quantized model as the fast path -- a mixed-font string
                 // must not measure by a different rule than a single-font one.
-                // liga OFF: Canvas.macapkDrawStringRuns paints these runs with
-                // Graphics2D.drawString, which forms no optional ligature, and
-                // measure must charge what draw paints.
-                float qw = MacApkFont.quantizedWidth(rm.getFont(), run, false);
+                float qw = MacApkFont.quantizedWidth(rm.getFont(), run);
                 w += Float.isNaN(qw)
                    ? (float) rm.getFont().getStringBounds(run, rm.getFontRenderContext()).getWidth()
                    : qw;
@@ -723,9 +692,7 @@ public class Paint {
     static float macapkAdvanceIn(String s, java.awt.Font primary) {
         if (s == null || s.isEmpty() || primary == null) return 0f;
         if (MacApkFont.firstSpecial(s, primary) < 0) {
-            // A single grapheme from the per-grapheme spaced draw, or a run that
-            // draw paints with drawString: no optional ligature either way.
-            float qw = MacApkFont.quantizedWidth(primary, s, false);
+            float qw = MacApkFont.quantizedWidth(primary, s);
             if (!Float.isNaN(qw)) return qw;
             java.awt.FontMetrics fm = MacApkFont.metricsOf(primary);
             if (fm == null) return 0f;
@@ -735,14 +702,49 @@ public class Paint {
         return macapkMeasureRuns(s, primary);
     }
 
+    private static final ThreadLocal<java.text.BreakIterator> CLUSTER_ITER =
+        ThreadLocal.withInitial(() -> java.text.BreakIterator.getCharacterInstance(java.util.Locale.ROOT));
+
+    /** True when UAX #29 makes every char of `text` its own grapheme cluster:
+     *  no CR (CR LF is one cluster), surrogate, Hangul jamo, Prepend char,
+     *  combining mark, SpacingMark or format char (ZWJ, ZWNJ, bidi controls). */
+    private static boolean macapkTriviallyClustered(String text) {
+        for (int i = 0, n = text.length(); i < n; i++) {
+            char c = text.charAt(i);
+            if (c < 0x0300) {
+                if (c == 0x0D) return false;   // CR: CR LF is one cluster
+                continue;
+            }
+            if (Character.isSurrogate(c)) return false;
+            if ((c >= 0x1100 && c <= 0x11FF) || (c >= 0xA960 && c <= 0xA97F) || (c >= 0xD7B0 && c <= 0xD7FF)) return false;
+            if ((c >= 0x0600 && c <= 0x0605) || c == 0x06DD || c == 0x070F || c == 0x08E2 || c == 0x0D4E) return false;
+            // The two SpacingMarks whose general category is Lo, not Mc: Thai
+            // SARA AM and Lao AM join the preceding letter's cluster.
+            if (c == 0x0E33 || c == 0x0EB3) return false;
+            switch (Character.getType(c)) {
+                case Character.NON_SPACING_MARK:
+                case Character.ENCLOSING_MARK:
+                case Character.COMBINING_SPACING_MARK:
+                case Character.FORMAT:
+                    return false;
+                default:
+            }
+        }
+        return true;
+    }
+
     /** Grapheme-cluster count, the unit AOSP's letter-spacing is applied per.
      *  `BreakIterator.getCharacterInstance` is the JDK's UAX#29 implementation,
      *  which is the same standard minikin follows. */
     static int macapkClusterCount(String text) {
         if (text == null || text.isEmpty()) return 0;
+        // Fast path: with no combining mark, format char, surrogate, CR, Hangul
+        // jamo or prepend char, UAX #29 makes every char its own cluster. That is
+        // nearly every UI string (plain Latin, Hebrew without niqqud), and it
+        // skips building a BreakIterator, which showed in the UI-thread profile.
+        if (macapkTriviallyClustered(text)) return text.length();
         try {
-            java.text.BreakIterator it =
-                java.text.BreakIterator.getCharacterInstance(java.util.Locale.ROOT);
+            java.text.BreakIterator it = CLUSTER_ITER.get();
             it.setText(text);
             int n = 0;
             for (int e = it.first(); e != java.text.BreakIterator.DONE
@@ -948,8 +950,7 @@ public class Paint {
                     // overshoots to 641, and quantized+kern gives the device's
                     // 640. Reusing quantize() gets both for free and keeps ink
                     // bounds and drawn ink derived from ONE vector.
-                    MacApkFont.Quantized q = MacApkFont.quantize(rf, run,
-                                                                 MacApkFont.ligaFor(letterSpacing));
+                    MacApkFont.Quantized q = MacApkFont.quantize(rf, run);
                     java.awt.font.GlyphVector gv = (q != null) ? q.glyphs
                         : rf.createGlyphVector(MacApkFont.textFrc(), run);
                     java.awt.geom.Rectangle2D vb = gv.getVisualBounds();
@@ -971,8 +972,7 @@ public class Paint {
                     } catch (Throwable ignored) { }
                     // Advance the pen by the SAME quantized width the measure
                     // path charges, so run k+1's ink lands where it is drawn.
-                    float qw = MacApkFont.quantizedWidth(rf, run,
-                                                         MacApkFont.ligaFor(letterSpacing));
+                    float qw = MacApkFont.quantizedWidth(rf, run);
                     penX += Float.isNaN(qw)
                           ? (float) rf.getStringBounds(run, MacApkFont.textFrc()).getWidth()
                           : qw;

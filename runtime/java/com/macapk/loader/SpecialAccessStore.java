@@ -117,7 +117,9 @@ public final class SpecialAccessStore {
     private static final boolean HONEST;
     static {
         String e = System.getenv("MACAPK_ALLFILES_HONEST");
-        HONEST = e == null || e.isEmpty() || e.charAt(0) != '0';
+        // UCRT Edition defaults to the compatibility answer for declared
+        // all-files/media access. Explicit value 1 restores persisted prompts.
+        HONEST = e != null && !e.isEmpty() && e.charAt(0) == '1';
     }
 
     /** MACAPK_ALLFILES_HONEST, default ON. Off = the pre-S1 answers everywhere:
@@ -424,10 +426,7 @@ public final class SpecialAccessStore {
             for (int i = 0; i < apps.length(); i++) {
                 org.json.JSONObject a = apps.optJSONObject(i);
                 if (a == null) continue;
-                // "ok" = the pre-v1.0.2239 control panel's spelling of installed
-                // (InstallCore.swift AppState.legacyInstalled).
-                String st = a.optString("state", "installed");
-                if (!"installed".equals(st) && !"ok".equals(st)) continue;
+                if (!"installed".equals(a.optString("state", "installed"))) continue;
                 String bundle = a.optString("bundlePath", "");
                 if (bundle.isEmpty()) continue;
                 if (!root.equals(normalizeDir(bundle + "/Contents/android"))) continue;
@@ -668,7 +667,9 @@ public final class SpecialAccessStore {
     private static final boolean MEDIA_PERMS_ASK;
     static {
         String e = System.getenv("MACAPK_MEDIA_PERMS_ASK");
-        MEDIA_PERMS_ASK = e == null || e.isEmpty() || e.charAt(0) != '0';
+        // UCRT Edition defaults to compatibility auto-grant. Explicit value 1
+        // restores the interactive permission helper for diagnostics/testing.
+        MEDIA_PERMS_ASK = e != null && !e.isEmpty() && e.charAt(0) == '1';
     }
 
     /** MACAPK_MEDIA_PERMS_ASK, default ON. See the section header. */

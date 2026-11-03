@@ -42,8 +42,7 @@
 // Deliberate divergences from FileSystemProvider / ExternalStorageProvider:
 //   * getDocumentType reads the extension from the FILE NAME. AOSP reads it from
 //     the document id (:490-506), which on a device ends with the path; ours is
-//     opaque for a pick outside the app's volume (MACAPK_DOCS_PRIMARY_IDS gives a
-//     pick inside it AOSP's "primary:<path>" shape, see primaryIdsOn).
+//     opaque.
 //   * FLAG_SUPPORTS_METADATA only for directories: MetadataReader's EXIF types are
 //     not implemented, so getDocumentMetadata answers the directory tree count /
 //     size (:151-197) and null for files, as AOSP does for an unsupported type.
@@ -159,59 +158,11 @@ public final class HostDocumentsProvider extends DocumentsProvider {
         return sb.toString();
     }
 
-    /** MACAPK_DOCS_PRIMARY_IDS (default ON; =0 = an opaque "macapk:" token for
-     *  every pick, the old answer). A pick that lies INSIDE the app's primary
-     *  volume -- directly, or through one of its top-level links (Download ->
-     *  ~/Downloads, a shared-volume entry) -- gets ExternalStorageProvider's own
-     *  id shape, "primary:" + the path relative to the volume
-     *  (ExternalStorageProvider.getDocIdForFileMaybeCreate: rootId + ':' + path
-     *  under the root; the primary root's id is "primary"). Apps derive real
-     *  paths from that shape -- game frontends (iiSU) turn "primary:<rel>" into
-     *  getExternalStorageDirectory()/<rel> and hand THAT to the emulator as its
-     *  ROM path; with the opaque token they fell back to handing over the
-     *  content:// URI, which RetroArch cannot open (a black game window). The
-     *  capability model is unchanged: an id resolves only under a tree the app
-     *  was granted (locate() matches it against the granted ids), so a guessed
-     *  "primary:Download/other" is refused exactly like a guessed token. A pick
-     *  outside the volume (the rest of the Mac) keeps its opaque token. */
-    static boolean primaryIdsOn() {
-        return !"0".equals(System.getenv("MACAPK_DOCS_PRIMARY_IDS"));
-    }
-
-    /** "primary:" + the volume-relative path of `f`, or null when `f` is not in
-     *  the app's primary volume. */
-    static String primaryIdFor(File f) {
-        if (!primaryIdsOn() || f == null) return null;
-        try {
-            File volume = SharedStorage.externalStorageRoot();
-            String canon = f.getCanonicalPath();
-            String vol = volume.getCanonicalPath();
-            if (canon.equals(vol)) return "primary:";
-            if (canon.startsWith(vol + "/")) return "primary:" + canon.substring(vol.length() + 1);
-            File[] kids = volume.listFiles();
-            if (kids == null) return null;
-            java.util.Arrays.sort(kids);
-            for (File k : kids) {
-                if (!Files.isSymbolicLink(k.toPath())) continue;
-                String t;
-                try { t = k.getCanonicalPath(); } catch (IOException e) { continue; }
-                if (canon.equals(t)) return "primary:" + k.getName();
-                if (canon.startsWith(t + "/")) {
-                    return "primary:" + k.getName() + "/" + canon.substring(t.length() + 1);
-                }
-            }
-        } catch (Throwable t) {
-            return null;
-        }
-        return null;
-    }
-
     /** Mint the id for a file the user picked; returns its document URI.
      *  `writable` is the GRANT (whether the pick's action hands out write), not
      *  the host file's mode: that one is checked when the file is opened. */
     static Uri mint(File f, boolean writable) {
-        String pid = primaryIdFor(f);
-        String id = pid != null && !pid.equals("primary:") ? pid : newToken();
+        String id = newToken();
         sDocs.put(id, new Doc(f.getAbsolutePath(), writable));
         persist();
         return DocumentsContract.buildDocumentUri(AUTHORITY, id);
@@ -221,8 +172,7 @@ public final class HostDocumentsProvider extends DocumentsProvider {
      *  id ("macapk:<hex>"). The caller builds the tree URI with
      *  DocumentsContract.buildTreeDocumentUri(AUTHORITY, id). */
     static String mintTree(File dir) throws IOException {
-        String pid = primaryIdFor(dir);
-        String id = pid != null ? pid : newToken();
+        String id = newToken();
         sTrees.put(id, dir.getCanonicalPath());
         persistTrees();
         return id;
@@ -312,41 +262,6 @@ public final class HostDocumentsProvider extends DocumentsProvider {
         if (docId == null) throw new FileNotFoundException("no such document: null");
         Doc d = sDocs.get(docId);
         if (d != null) return new Resolved(new File(d.path), d.writable, null, null);
-        if (treesOn() && docId.startsWith("primary:")) {
-            // The granted tree whose id is the longest prefix of this one, on a
-            // path-segment boundary ("primary:" is the whole volume).
-            String best = null;
-            for (String k : sTrees.keySet()) {
-                if (!k.startsWith("primary:")) continue;
-                boolean under = docId.equals(k) || k.equals("primary:")
-                        || docId.startsWith(k + "/");
-                if (under && (best == null || k.length() > best.length())) best = k;
-            }
-            if (best == null) {
-                // isChildDocument (non-strict) asks only WHERE an id points, to
-                // judge containment: ExternalStorageProvider.getFileForDocId maps
-                // any primary id onto the volume, and enforceTree turns "not a
-                // child" into the SecurityException. Every operation (strict)
-                // still needs a granted tree.
-                if (!strictSegments) {
-                    return new Resolved(new File(SharedStorage.externalStorageRoot(),
-                            docId.substring("primary:".length())), false, null, null);
-                }
-                throw new FileNotFoundException("no such document: " + docId);
-            }
-            File root = new File(sTrees.get(best));
-            if (docId.equals(best)) return new Resolved(root, true, best, root);
-            String rel = docId.substring(best.length());
-            while (rel.startsWith("/")) rel = rel.substring(1);
-            if (strictSegments) {
-                for (String seg : rel.split("/", -1)) {
-                    if (seg.isEmpty() || ".".equals(seg) || "..".equals(seg)) {
-                        throw new FileNotFoundException("no such document: " + docId);
-                    }
-                }
-            }
-            return new Resolved(new File(root, rel), true, best, root);
-        }
         if (!treesOn() || !docId.startsWith("macapk:")) {
             throw new FileNotFoundException("no such document: " + docId);
         }
@@ -371,24 +286,65 @@ public final class HostDocumentsProvider extends DocumentsProvider {
      *  .getDocIdForFile, relative to the granted root instead of the volume). */
     private static String docIdFor(Resolved in, File file) throws FileNotFoundException {
         if (in.token == null) throw new FileNotFoundException("not in a tree: " + file);
-        String rootPath = in.root.getAbsolutePath();
-        String path = file.getAbsolutePath();
-        if (path.equals(rootPath)) return in.token;
-        if (!path.startsWith(rootPath.endsWith("/") ? rootPath : rootPath + "/")) {
+
+        // File.getAbsolutePath() returns backslash-separated paths on Windows.
+        // The old implementation appended a literal '/', so a child such as
+        // C:\Users\name\Music\song.m4a never matched the granted root
+        // C:\Users\name\Music. Canonicalize first, use the platform-aware
+        // containment helper, then store the relative part in the provider's
+        // stable forward-slash document-id format.
+        final File canonicalRoot;
+        final File canonicalFile;
+        try {
+            canonicalRoot = in.root.getCanonicalFile();
+            canonicalFile = file.getCanonicalFile();
+        } catch (IOException e) {
+            FileNotFoundException failure = new FileNotFoundException(
+                    "Failed to canonicalize tree child " + file);
+            failure.initCause(e);
+            throw failure;
+        }
+
+        String rootPath = canonicalRoot.getPath();
+        String path = canonicalFile.getPath();
+        if (samePath(rootPath, path)) return in.token;
+        if (!contains(rootPath, path)) {
             throw new FileNotFoundException("Failed to find root that contains " + path);
         }
+
         String rel = path.substring(rootPath.length());
-        while (rel.startsWith("/")) rel = rel.substring(1);
-        if (in.token.endsWith(":")) return in.token + rel;   // "primary:" = the whole volume
+        while (rel.startsWith("/") || rel.startsWith("\\")) rel = rel.substring(1);
+        rel = rel.replace('\\', '/');
+        if (rel.isEmpty()) return in.token;
         return in.token + "/" + rel;
     }
 
     /** android.os.FileUtils.contains(String, String) (android14-release
      *  core/java/android/os/FileUtils.java:916-925). Both paths canonical. */
     static boolean contains(String dirPath, String filePath) {
-        if (dirPath.equals(filePath)) return true;
-        if (!dirPath.endsWith("/")) dirPath += "/";
-        return filePath.startsWith(dirPath);
+        String dir = normalizedHostPath(dirPath);
+        String file = normalizedHostPath(filePath);
+        if (samePath(dir, file)) return true;
+        if (!dir.endsWith("/")) dir += "/";
+        return isWindowsHost()
+                ? file.toLowerCase(Locale.ROOT).startsWith(dir.toLowerCase(Locale.ROOT))
+                : file.startsWith(dir);
+    }
+
+    /** Normalize only for host-path comparison. Document ids themselves always
+     *  retain '/'. Windows paths are case-insensitive; Unix paths are not. */
+    private static String normalizedHostPath(String path) {
+        return path == null ? "" : path.replace('\\', '/');
+    }
+
+    private static boolean samePath(String first, String second) {
+        String a = normalizedHostPath(first);
+        String b = normalizedHostPath(second);
+        return isWindowsHost() ? a.equalsIgnoreCase(b) : a.equals(b);
+    }
+
+    private static boolean isWindowsHost() {
+        return File.separatorChar == '\\';
     }
 
     /** The write half of the pick's grant. On a device an app without a write
@@ -902,7 +858,12 @@ public final class HostDocumentsProvider extends DocumentsProvider {
         File[] files = dir.listFiles();
         if (files == null) return;
         for (File f : files) {
-            if (!Files.isSymbolicLink(f.toPath()) && f.isDirectory()) deleteContentsNoFollow(f);
+            // isLink also covers a Windows junction (a pnpm node_modules entry in
+            // the user's Downloads, say): deleting the junction removes the link,
+            // never the files of the folder it leads to.
+            if (!com.macapk.loader.SharedStorage.isLink(f.toPath(), null) && f.isDirectory()) {
+                deleteContentsNoFollow(f);
+            }
             if (!f.delete()) android.util.Log.w(TAG, "Failed to delete " + f);
         }
     }

@@ -895,7 +895,10 @@ public final class ResourceIndex {
     // bypasses it; MACAPK_FWVIEW_DISK_CACHE_VERIFY=1 builds AND replays and
     // logs any field mismatch (the positive control).
     private static final int MACAPK_FWVIEW_CACHE_MAGIC = 0x4657_5631;   // "FWV1"
-    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 1;
+    // 2: macapkStyleItemKey / macapkFwItemText keep ^attr-private items and hops.
+    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 2;
+    /** ArscReader's type/name spelling of a private platform attribute. */
+    static final String ATTR_PRIVATE_PREFIX = "^attr-private/";
 
     /** The framework's own -w/-h/-sw dp thresholds, set by the last live build
      *  (macapkBuildFwViewUncached) so the wrapper can canonicalize the config
@@ -1690,6 +1693,11 @@ public final class ResourceIndex {
                 String tn = v.publicMap.get(data);
                 if (tn != null && tn.startsWith("attr/")) {
                     return "?android:" + tn.substring(5);
+                }
+                // A private platform attr hop (see macapkStyleItemKey).
+                if (tn != null && tn.startsWith(ATTR_PRIVATE_PREFIX)
+                        && tn.length() > ATTR_PRIVATE_PREFIX.length()) {
+                    return "?android:" + tn.substring(ATTR_PRIVATE_PREFIX.length());
                 }
                 return String.format("?0x%08x", data);
             }
@@ -2859,6 +2867,19 @@ public final class ResourceIndex {
      *  keyed cannot be looked up either way). */
     private static String macapkStyleItemKey(String bagItemName) {
         if (bagItemName == null || bagItemName.isEmpty()) return null;
+        // A PRIVATE platform attr (table type ^attr-private, ids 0x0112....) is
+        // still an attribute, and the platform themes bind them: Theme binds
+        // `colorPopupBackground` (to ?attr/colorBackgroundFloating), which
+        // @android:drawable/popup_background_material paints as its <solid>.
+        // Dropping these items left every such ?attr unresolved -- the solid
+        // came out transparent and every AppCompat overflow / popup menu drew
+        // its items straight over the screen behind it. Keyed by NAME like the
+        // public attrs (a name is unique across attr and ^attr-private in one
+        // package; LayoutInflater's dimension walk relies on the same).
+        if (bagItemName.startsWith(ATTR_PRIVATE_PREFIX)) {
+            String n = bagItemName.substring(ATTR_PRIVATE_PREFIX.length());
+            return n.isEmpty() ? null : n;
+        }
         if (bagItemName.charAt(0) == '^') return null;
         int a = bagItemName.indexOf("attr/");
         if (a == 0) return bagItemName.substring(5);
@@ -3870,49 +3891,6 @@ public final class ResourceIndex {
      *  arrange), rendered from the compiled XML in apktool's text form. The
      *  decoded-tree walk (`matchingValueDirs("color")`) is gone with the
      *  tree. */
-    /** The DEFAULT row of a res/color selector file when that row is a theme
-     *  attribute: {"?attr", alphaOrNull}, else null. AOSP ColorStateList
-     *  inflates against a Theme and its default colour is the first row, or a
-     *  later stateless one (ColorStateList.inflate: `if (listSize == 0 ||
-     *  stateSpec.length == 0) defaultColor = color`). colorFromSelectorFile has
-     *  no Theme and skips `?` rows, so a selector whose default row is a theme
-     *  attribute resolved to nothing; Resources.Theme uses this to chase that
-     *  row in its OWN cascade. Picks the default row by colorFromSelectorFile's
-     *  rule over ALL rows, and answers only when the winner is a `?` row. */
-    public String[] macapkSelectorDefaultAttrRow(String name) {
-        if (name == null || name.isEmpty()) return null;
-        Integer fid = nameToId.get("color/" + name);
-        byte[] rowBytes = fid != null ? macapkReadFileRow(fid) : null;
-        if (rowBytes == null) return null;
-        try {
-            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-            org.w3c.dom.Document doc = dbf.newDocumentBuilder()
-                .parse(new java.io.ByteArrayInputStream(rowBytes));
-            NodeList items = doc.getElementsByTagName("item");
-            String[] chosen = null;
-            for (int i = 0; i < items.getLength(); ++i) {
-                Element e = (Element) items.item(i);
-                String colorAttr = e.getAttribute("android:color");
-                if (colorAttr == null || colorAttr.trim().isEmpty()) continue;
-                boolean hasState = false;
-                org.w3c.dom.NamedNodeMap at = e.getAttributes();
-                for (int j = 0; at != null && j < at.getLength(); ++j) {
-                    if (at.item(j).getNodeName().contains("state_")) { hasState = true; break; }
-                }
-                if (chosen == null || !hasState) {
-                    String alpha = e.getAttribute("android:alpha");
-                    if (alpha != null && alpha.trim().startsWith("@dimen/"))
-                        alpha = getDimenRaw(alpha.trim().substring(7));
-                    chosen = new String[]{ colorAttr.trim(),
-                        alpha == null || alpha.trim().isEmpty() ? null : alpha.trim() };
-                }
-            }
-            return chosen != null && chosen[0].startsWith("?") ? chosen : null;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
     private Integer colorFromSelectorFile(String name, java.util.Set<String> visited) {
         if (name == null || name.isEmpty()) return null;
         // Shared cycle guard with resolveColorRef: a selector row pointing back at

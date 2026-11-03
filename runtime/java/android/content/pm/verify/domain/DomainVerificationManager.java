@@ -10,14 +10,14 @@ package android.content.pm.verify.domain;
  *  single method; everything else upstream is @SystemApi (the verifier agent's
  *  side).
  *
- *  v1.0.2263: the verifier runs (com.macapk.loader.AppLinks): each
- *  autoVerify host's /.well-known/assetlinks.json is checked against the APK's
- *  REAL signing certificate, so the calling app's own package reports
- *  DOMAIN_STATE_VERIFIED exactly for the hosts its site really vouches for and
- *  DOMAIN_STATE_NONE for the rest. Another package, or one that declares no
- *  autoVerify domains, still answers NULL (AOSP: "@return the user state, or
- *  null if the package does not declare any domains"); MACAPK_APP_LINKS=0
- *  restores NULL for every package. */
+ *  ⚠ MAC.APK RUNS NO DOMAIN VERIFICATION AGENT. Nothing here fetches
+ *  /.well-known/assetlinks.json, nothing records a per-host state, and the
+ *  intent resolver matches `<data android:scheme="https">` filters without
+ *  consulting any verification state. So no package has a verification record,
+ *  and AOSP's own answer for a package with none is NULL
+ *  ("@return the user state, or null if the package does not declare any
+ *  domains"). That is what we return -- not an invented "verified" state, which
+ *  would tell an app its links are approved when nothing approved them. */
 public final class DomainVerificationManager {
     public DomainVerificationManager() {}
     public DomainVerificationManager(android.content.Context context) {}
@@ -38,12 +38,6 @@ public final class DomainVerificationManager {
             throw new android.content.pm.PackageManager.NameNotFoundException(packageName);
         }
         pm.getApplicationInfo(packageName, 0);   // throws when not installed
-        java.util.Map<String, Integer> states =
-                com.macapk.loader.AppLinks.stateMapFor(packageName);
-        if (states == null) return null;
-        // Link handling is allowed unless the user turned it off; there is no
-        // such user setting here, so it is on, as a device's default is.
-        return new DomainVerificationUserState(packageName,
-                android.os.Process.myUserHandle(), states, true);
+        return null;
     }
 }

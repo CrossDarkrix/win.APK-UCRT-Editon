@@ -113,12 +113,12 @@ public final class NativeAudio {
     public static native boolean nativeMpIsPlaying(long h);
     public static native void nativeMpRelease(long h);
 
-    // The track's frameCount (the app's request raised to the platform
-    // minimum) and the fill threshold under it: AudioTrack
-    // getBufferCapacityInFrames / setBufferSizeInFrames (audio_backend.mm
-    // macapk_audio_stream_buffer_capacity / _set_buffer_size).
-    public static native int nativeGetBufferCapacity(long h);
-    public static native int nativeSetBufferSize(long h, int frames);
-    // AudioTrack.getUnderrunCount: starved render cycles, one per episode.
-    public static native int nativeGetUnderrunCount(long h);
+    // Windows Phase 1: active render endpoints as records:
+    // endpointId \u001f friendlyName \u001f isDefault \u001f sampleRate \u001f channels.
+    public static native String[] nativeGetAudioOutputDevices();
+    public static native boolean nativeSetAudioOutputDevice(String endpointId);
+    public static native void nativeSetSessionVolume(float volume);
+    public static native float nativeGetSessionVolume();
+    public static native void nativeSetSessionMute(boolean muted);
+    public static native boolean nativeGetSessionMute();
 }

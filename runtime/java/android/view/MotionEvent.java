@@ -146,10 +146,6 @@ public class MotionEvent extends InputEvent implements Parcelable {
     private int source;
     private int metaState;
     private int buttonState;
-    /** AOSP mActionButton (Input.h MotionEvent::mActionButton): the button that
-     *  changed state for ACTION_BUTTON_PRESS / ACTION_BUTTON_RELEASE, 0 for every
-     *  other action. CursorInputMapper sets it on exactly those two actions. */
-    private int actionButton;
     private int deviceId;
     private int edgeFlags;
     private float xPrecision = 1f, yPrecision = 1f;
@@ -436,7 +432,6 @@ public class MotionEvent extends InputEvent implements Parcelable {
         MotionEvent e = new MotionEvent();
         e.action = action; e.flags = flags; e.source = source;
         e.metaState = metaState; e.buttonState = buttonState;
-        e.actionButton = actionButton;
         e.deviceId = deviceId; e.edgeFlags = edgeFlags;
         e.xPrecision = xPrecision; e.yPrecision = yPrecision;
         e.downTime = downTime;
@@ -473,26 +468,7 @@ public class MotionEvent extends InputEvent implements Parcelable {
     public int  getAction()           { return action; }
     public int  getActionMasked()     { int a = action & ACTION_MASK; tt("getActionMasked=" + a); return a; }
     public int  getActionIndex()      { return (action & ACTION_POINTER_INDEX_MASK) >> ACTION_POINTER_INDEX_SHIFT; }
-    public int  getActionButton()     { return actionButton; }
-    /** AOSP @hide MotionEvent.setActionButton / setButtonState (MotionEvent.java),
-     *  used by the input pipeline to build BUTTON_PRESS / BUTTON_RELEASE. */
-    public final void setActionButton(int button) { actionButton = button; }
-    /** AOSP @hide isHoverExitPending / setHoverExitPending (FLAG_HOVER_EXIT_PENDING):
-     *  ViewGroup.dispatchHoverEvent marks a HOVER_MOVE that is about to be
-     *  followed by an EXIT, so the receiving group does not hover itself. */
-    /** A copy owned by ViewGroup.dispatchHoverEvent (its synthesized
-     *  ENTER/EXIT are written into it); mirrors obtainMotionEventNoHistoryOrSelf. */
-    public boolean macapkIsHoverCopy;
-    public static MotionEvent macapkHoverCopy(MotionEvent e) {
-        MotionEvent c = obtainNoHistory(e);
-        c.macapkIsHoverCopy = true;
-        return c;
-    }
-    public boolean isHoverExitPending() { return (flags & FLAG_HOVER_EXIT_PENDING) != 0; }
-    public void setHoverExitPending(boolean pending) {
-        if (pending) flags |= FLAG_HOVER_EXIT_PENDING; else flags &= ~FLAG_HOVER_EXIT_PENDING;
-    }
-    public final void setButtonState(int buttonState) { this.buttonState = buttonState; }
+    public int  getActionButton()     { return 0; }
     public int  getFlags()            { return flags; }
     public int  getClassification()   { return CLASSIFICATION_NONE; }
     public int  getPointerCount()     { tt("getPointerCount=" + pointerCount); return pointerCount; }

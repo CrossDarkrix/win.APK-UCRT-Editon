@@ -107,124 +107,67 @@ public abstract class SQLiteOpenHelper implements AutoCloseable {
         }
     }
 
-    // AOSP routes BOTH accessors into one private getDatabaseLocked(writable)
-    // (frameworks/base core/java/android/database/sqlite/SQLiteOpenHelper.java,
-    // getReadableDatabase -> getDatabaseLocked(false)). getReadableDatabase must
-    // NOT call the public getWritableDatabase: a subclass may override that one
-    // to refuse writes and still read through super.getReadableDatabase(), and a
-    // virtual call would land in the override. Rangskat's SearchDBHelper does
-    // exactly that (getWritableDatabase throws "database is not writable"), so
-    // the old delegation threw on every read and the dictionary never loaded.
-    public SQLiteDatabase getWritableDatabase() {
-        synchronized (this) {
-            return getDatabaseLocked(true);
-        }
-    }
-
-    public SQLiteDatabase getReadableDatabase() {
-        synchronized (this) {
-            return getDatabaseLocked(false);
-        }
-    }
-
-    /** Bisect gate for the dispatch above: MACAPK_SQLITE_READABLE_PRIVATE=0
-     *  restores the pre-fix virtual call into getWritableDatabase(). */
-    private static final boolean MACAPK_READABLE_PRIVATE =
-            !"0".equals(System.getenv("MACAPK_SQLITE_READABLE_PRIVATE"));
-
-    private SQLiteDatabase getDatabaseLocked(boolean writable) {
-        if (!MACAPK_READABLE_PRIVATE && !writable) {
-            return getWritableDatabase();
-        }
-        if (database != null) {
-            if (!database.isOpen()) {
-                // The app closed the database itself.
-                database = null;
-            } else if (!writable || !database.isReadOnly()) {
-                return database;
-            }
-        }
+    public synchronized SQLiteDatabase getWritableDatabase() {
+        if (database != null && database.isOpen() && !database.isReadOnly()) return database;
         if (initializing) {
-            throw new IllegalStateException("getDatabase called recursively");
+            throw new IllegalStateException("getWritableDatabase called recursively");
         }
-
-        SQLiteDatabase db = database;
+        initializing = true;
         try {
-            initializing = true;
-            if (db != null) {
-                if (writable && db.isReadOnly()) {
-                    db.reopenReadWrite();
-                }
-            } else {
-                File path = (name == null || ":memory:".equals(name))
-                    ? null
-                    : (context != null ? context.getDatabasePath(name) : new File(name));
-                String dbPath = path != null ? path.getAbsolutePath() : ":memory:";
-                if (path != null && path.getParentFile() != null) {
-                    path.getParentFile().mkdirs();
-                }
-                try {
-                    db = SQLiteDatabase.openDatabase(dbPath, factory,
-                        SQLiteDatabase.OPEN_READWRITE | SQLiteDatabase.CREATE_IF_NECESSARY);
-                } catch (SQLiteException ex) {
-                    // AOSP: only a READABLE request falls back to read-only.
-                    if (writable || path == null) throw ex;
-                    android.util.Log.e("SQLiteOpenHelper",
-                        "Couldn't open " + name + " for writing (will try read-only):", ex);
-                    db = SQLiteDatabase.openDatabase(dbPath, factory,
-                        SQLiteDatabase.OPEN_READONLY);
-                }
-                if (openParams != null) {
-                    // Journal / synchronous mode from the params bag. AOSP applies
-                    // these through SQLiteDatabase's own open path; ours are
-                    // PRAGMAs on the freshly-opened connection, which is where
-                    // SQLite itself applies them either way.
-                    db.macapkApplyOpenParams(openParams);
-                }
-                if (!db.isReadOnly()) {
-                    if (writeAheadLoggingEnabled) {
-                        db.enableWriteAheadLogging();
-                    } else {
-                        db.disableWriteAheadLogging();
-                    }
-                }
+            File path = (name == null || ":memory:".equals(name))
+                ? null
+                : (context != null ? context.getDatabasePath(name) : new File(name));
+            String dbPath = path != null ? path.getAbsolutePath() : ":memory:";
+            if (path != null && path.getParentFile() != null) {
+                path.getParentFile().mkdirs();
             }
-
-            // ----- migration dance (AOSP order) -----------------------
-            onConfigure(db);
-            int currentVersion = db.getVersion();
+            database = SQLiteDatabase.openDatabase(dbPath, factory,
+                SQLiteDatabase.OPEN_READWRITE | SQLiteDatabase.CREATE_IF_NECESSARY);
+            if (openParams != null) {
+                // Journal / synchronous mode from the params bag. AOSP applies
+                // these through SQLiteDatabase's own open path; ours are
+                // PRAGMAs on the freshly-opened connection, which is where
+                // SQLite itself applies them either way.
+                database.macapkApplyOpenParams(openParams);
+            }
+            if (writeAheadLoggingEnabled) {
+                database.enableWriteAheadLogging();
+            } else {
+                database.disableWriteAheadLogging();
+            }
+            // ----- migration dance ------------------------------------
+            onConfigure(database);
+            int currentVersion = database.getVersion();
             if (currentVersion != newVersion) {
-                if (db.isReadOnly()) {
-                    throw new SQLiteException("Can't upgrade read-only database from version "
-                        + currentVersion + " to " + newVersion + ": " + name);
+                if (database.isReadOnly()) {
+                    throw new SQLiteException("Can't upgrade read-only db from v"
+                        + currentVersion + " to v" + newVersion);
                 }
-                db.beginTransaction();
+                database.beginTransaction();
                 try {
                     if (currentVersion == 0) {
-                        onCreate(db);
+                        onCreate(database);
                     } else if (currentVersion > newVersion) {
-                        onDowngrade(db, currentVersion, newVersion);
+                        onDowngrade(database, currentVersion, newVersion);
                     } else {
-                        onUpgrade(db, currentVersion, newVersion);
+                        onUpgrade(database, currentVersion, newVersion);
                     }
-                    db.setVersion(newVersion);
-                    db.setTransactionSuccessful();
+                    database.setVersion(newVersion);
+                    database.setTransactionSuccessful();
                 } finally {
-                    db.endTransaction();
+                    database.endTransaction();
                 }
             }
-            onOpen(db);
-            database = db;
-            return db;
+            onOpen(database);
+            return database;
         } finally {
             initializing = false;
-            // AOSP: a database opened by this call that did not become the
-            // helper's database (a callback threw) is closed, so the next call
-            // re-runs the version dance instead of handing out a half-set-up db.
-            if (db != null && db != database) {
-                db.close();
-            }
         }
+    }
+    public synchronized SQLiteDatabase getReadableDatabase() {
+        // AOSP: if writable is already open, use it; else try readonly.
+        // Simplest: always use writable. Room never asks for read-only.
+        return getWritableDatabase();
     }
 
     public synchronized void close() {

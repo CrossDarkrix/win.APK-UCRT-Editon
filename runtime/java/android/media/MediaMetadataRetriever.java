@@ -63,7 +63,9 @@ public class MediaMetadataRetriever implements AutoCloseable {
     public static final int METADATA_KEY_VIDEO_FRAME_COUNT = 32;
 
     private String mPath;   // resolved local filesystem path, or an opaque URI string we cannot open
-    private long   mDemux;  // com.macapk.loader.NativeMedia demux handle (audio-track metadata only); 0 = unavailable
+    private long   mDemux;  // decoded audio/duration handle
+    private long   mMetadata; // GstDiscoverer tag and embedded-picture handle
+    private java.io.File mTemporarySource; // owned copy for fd/content/asset sources
 
     public MediaMetadataRetriever() {}
 
@@ -86,6 +88,7 @@ public class MediaMetadataRetriever implements AutoCloseable {
                 throw new IllegalArgumentException(p + " does not exist");
             mPath = p;
             mDemux = com.macapk.loader.NativeMedia.nativeDemuxOpen(p);
+            mMetadata = com.macapk.loader.NativeMedia.nativeMetadataOpen(p);
         } else {
             // A scheme we cannot resolve to a local file (content://, http://,
             // ...): keep the historical lenient behavior. mDemux stays 0, so
@@ -94,22 +97,128 @@ public class MediaMetadataRetriever implements AutoCloseable {
         }
     }
     public void setDataSource(String uri, java.util.Map<String, String> headers) { setDataSource(uri); }
-    public void setDataSource(java.io.FileDescriptor fd) {}
-    public void setDataSource(java.io.FileDescriptor fd, long offset, long length) {}
+
+    public void setDataSource(java.io.FileDescriptor fd) {
+        setDataSource(fd, 0L, Long.MAX_VALUE);
+    }
+
+    public void setDataSource(java.io.FileDescriptor fd, long offset, long length) {
+        if (fd == null) throw new IllegalArgumentException("fd == null");
+        if (offset < 0 || length < 0) throw new IllegalArgumentException("negative offset/length");
+        java.io.File temporary = null;
+        try {
+            temporary = copyDescriptorToTemporaryFile(fd, offset, length);
+            setDataSource(temporary.getAbsolutePath());
+            mTemporarySource = temporary;
+            temporary = null;
+        } catch (java.io.IOException e) {
+            closeDemux();
+            mPath = null;
+            throw new IllegalArgumentException("Unable to read FileDescriptor", e);
+        } finally {
+            if (temporary != null) temporary.delete();
+        }
+    }
+
     public void setDataSource(android.content.Context context, android.net.Uri uri) {
-        if (uri == null) { closeDemux(); mPath = null; return; }
+        if (context == null) throw new IllegalArgumentException("context == null");
+        if (uri == null) throw new IllegalArgumentException("uri == null");
         String scheme = uri.getScheme();
         if (scheme == null || "file".equals(scheme)) {
             setDataSource(uri.getPath());
-        } else {
-            closeDemux();
+            return;
+        }
+        android.content.res.AssetFileDescriptor afd = null;
+        try {
+            afd = context.getContentResolver().openAssetFileDescriptor(uri, "r");
+            if (afd == null) throw new IllegalArgumentException("Unable to open " + uri);
+            setDataSource(afd);
             mPath = uri.toString();
+        } catch (java.io.IOException e) {
+            closeDemux();
+            mPath = null;
+            throw new IllegalArgumentException("Unable to open " + uri, e);
+        } finally {
+            if (afd != null) try { afd.close(); } catch (java.io.IOException ignored) {}
         }
     }
-    public void setDataSource(android.content.res.AssetFileDescriptor afd) {}
-    public void setDataSource(MediaDataSource dataSource) {}
+
+    public void setDataSource(android.content.res.AssetFileDescriptor afd) {
+        if (afd == null || afd.getFileDescriptor() == null)
+            throw new IllegalArgumentException("afd == null");
+        long length = afd.getLength();
+        if (length == android.content.res.AssetFileDescriptor.UNKNOWN_LENGTH) length = Long.MAX_VALUE;
+        setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), length);
+    }
+
+    public void setDataSource(MediaDataSource dataSource) {
+        if (dataSource == null) throw new IllegalArgumentException("dataSource == null");
+        java.io.File temporary = null;
+        try {
+            temporary = java.io.File.createTempFile("winapk-metadata-", ".media");
+            java.io.FileOutputStream out = new java.io.FileOutputStream(temporary);
+            try {
+                byte[] buffer = new byte[256 * 1024];
+                long position = 0;
+                long size = dataSource.getSize();
+                while (size < 0 || position < size) {
+                    int wanted = buffer.length;
+                    if (size >= 0) wanted = (int)Math.min((long)wanted, size - position);
+                    if (wanted <= 0) break;
+                    int read = dataSource.readAt(position, buffer, 0, wanted);
+                    if (read <= 0) break;
+                    out.write(buffer, 0, read);
+                    position += read;
+                }
+            } finally { out.close(); }
+            setDataSource(temporary.getAbsolutePath());
+            mTemporarySource = temporary;
+            temporary = null;
+        } catch (java.io.IOException e) {
+            closeDemux();
+            mPath = null;
+            throw new IllegalArgumentException("Unable to read MediaDataSource", e);
+        } finally {
+            if (temporary != null) temporary.delete();
+        }
+    }
+
+    private static java.io.File copyDescriptorToTemporaryFile(java.io.FileDescriptor fd,
+            long offset, long length) throws java.io.IOException {
+        java.io.File temporary = java.io.File.createTempFile("winapk-metadata-", ".media");
+        boolean success = false;
+        java.io.FileOutputStream out = null;
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream(fd);
+            java.nio.channels.FileChannel channel = in.getChannel();
+            channel.position(offset);
+            out = new java.io.FileOutputStream(temporary);
+            byte[] buffer = new byte[256 * 1024];
+            long remaining = length;
+            while (remaining > 0) {
+                int wanted = (int)Math.min((long)buffer.length, remaining);
+                int read = in.read(buffer, 0, wanted);
+                if (read < 0) break;
+                if (read == 0) continue;
+                out.write(buffer, 0, read);
+                if (remaining != Long.MAX_VALUE) remaining -= read;
+            }
+            out.getFD().sync();
+            success = true;
+            return temporary;
+        } finally {
+            // Do not close the input stream: the FileDescriptor belongs to the caller.
+            if (out != null) try { out.close(); } catch (java.io.IOException ignored) {}
+            if (!success) temporary.delete();
+        }
+    }
 
     public String extractMetadata(int keyCode) {
+        String tagKey = metadataTagKey(keyCode);
+        if (tagKey != null && mMetadata != 0) {
+            String value = com.macapk.loader.NativeMedia.nativeMetadataGetString(mMetadata, tagKey);
+            if (value != null && value.length() != 0) return value;
+        }
         switch (keyCode) {
             case METADATA_KEY_HAS_AUDIO:
                 // AOSP: "If this key exists the media contains audio content" --
@@ -234,12 +343,38 @@ public class MediaMetadataRetriever implements AutoCloseable {
          *  here produces one, so it keeps its initial value. */
         public android.graphics.Bitmap.Config getActualConfig() { return mActual; }
     }
-    public byte[] getEmbeddedPicture() { return null; }
+    public byte[] getEmbeddedPicture() {
+        return mMetadata == 0 ? null
+                : com.macapk.loader.NativeMedia.nativeMetadataGetPicture(mMetadata);
+    }
     public void release() { closeDemux(); mPath = null; }
     @Override public void close() { release(); }
 
     private void closeDemux() {
         if (mDemux != 0) { com.macapk.loader.NativeMedia.nativeDemuxClose(mDemux); mDemux = 0; }
+        if (mMetadata != 0) { com.macapk.loader.NativeMedia.nativeMetadataClose(mMetadata); mMetadata = 0; }
+        if (mTemporarySource != null) {
+            try { mTemporarySource.delete(); } catch (Throwable ignored) {}
+            mTemporarySource = null;
+        }
+    }
+
+    private static String metadataTagKey(int keyCode) {
+        switch (keyCode) {
+            case METADATA_KEY_CD_TRACK_NUMBER: return "track-number";
+            case METADATA_KEY_ALBUM: return "album";
+            case METADATA_KEY_ARTIST: return "artist";
+            case METADATA_KEY_AUTHOR: return "author";
+            case METADATA_KEY_COMPOSER: return "composer";
+            case METADATA_KEY_DATE: return "date";
+            case METADATA_KEY_GENRE: return "genre";
+            case METADATA_KEY_TITLE: return "title";
+            case METADATA_KEY_YEAR: return "year";
+            case METADATA_KEY_WRITER: return "writer";
+            case METADATA_KEY_ALBUMARTIST: return "album-artist";
+            case METADATA_KEY_DISC_NUMBER: return "disc-number";
+            default: return null;
+        }
     }
 
     private String mimeTypeFromPath() {

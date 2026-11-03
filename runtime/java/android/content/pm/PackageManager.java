@@ -1106,28 +1106,12 @@ public abstract class PackageManager {
         catch (Throwable t) { return getDefaultActivityIcon(); }
     }
     public android.graphics.drawable.Drawable getApplicationIcon(ApplicationInfo info) {
-        if (info != null) {
-            // Another installed Mac.apk app: its resources live in its own
-            // bundle, not in this process (see macapkRegistryAppIcon).
-            android.graphics.drawable.Drawable other = macapkRegistryAppIcon(info.packageName);
-            if (other != null) return other;
-        }
         if (info != null && info.icon != 0) {
             android.graphics.drawable.Drawable d = getDrawable(info.packageName, info.icon, info);
             if (d != null) return d;
         }
         return getDefaultActivityIcon();
     }
-    /** Mac.apk hook: the launcher icon of ANOTHER installed Mac.apk app, or null
-     *  (the base class knows no other apps). On a device getApplicationIcon reads
-     *  the target's own APK resources (ApplicationPackageManager.getDrawable over
-     *  getResourcesForApplication); here each app is a separate process and only
-     *  its own resources are loaded, so MacApkPackageManager answers with the
-     *  icon its bundle carries, rendered from that same APK icon at install. */
-    protected android.graphics.drawable.Drawable macapkRegistryAppIcon(String packageName) {
-        return null;
-    }
-
     public android.graphics.drawable.Drawable getDefaultActivityIcon() {
         return new android.graphics.drawable.ColorDrawable(0);
     }
@@ -2649,28 +2633,7 @@ public abstract class PackageManager {
     public android.content.pm.InstrumentationInfo getInstrumentationInfo(android.content.ComponentName className, int flags) throws NameNotFoundException {
         throw new NameNotFoundException(String.valueOf(className));
     }
-    /** AOSP ApplicationPackageManager.getLeanbackLaunchIntentForPackage
-     *  (android14): getLaunchIntentForPackageAndCategory(pkg,
-     *  CATEGORY_LEANBACK_LAUNCHER) -- the package's MAIN + LEANBACK_LAUNCHER
-     *  activity as a NEW_TASK intent carrying that category, or null when it
-     *  has none. It returned getLaunchIntentForPackage, so a phone app read as
-     *  having a TV entry and a TV app got its LAUNCHER intent instead. */
-    public android.content.Intent getLeanbackLaunchIntentForPackage(String packageName) {
-        Intent intentToResolve = new Intent(Intent.ACTION_MAIN);
-        intentToResolve.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
-        intentToResolve.setPackage(packageName);
-        List<ResolveInfo> ris = queryIntentActivities(intentToResolve, 0);
-        if (ris == null || ris.isEmpty()) return null;
-        Intent intent = new Intent(intentToResolve);
-        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        android.content.pm.ActivityInfo target = ris.get(0).activityInfo;
-        if (target != null && target.name != null) {
-            intent.setClassName(
-                target.packageName != null ? target.packageName : packageName,
-                target.name);
-        }
-        return intent;
-    }
+    public android.content.Intent getLeanbackLaunchIntentForPackage(String packageName) { return getLaunchIntentForPackage(packageName); }
     public void setInstallerPackageName(String targetPackage, String installerPackageName) { }
     public void setComponentEnabledSettings(java.util.List<ComponentEnabledSetting> settings) { }
     /** AOSP API-33 batched component-enabled change. */

@@ -159,47 +159,7 @@ final class MacApkWebViewBridge {
             if (app != null) pkg = app.getPackageName();
         } catch (Throwable ignored) {
         }
-        nativeInit(dataStoreKey(pkg));
-    }
-
-    /** MACAPK_WEBVIEW_STORE_PER_ROOT=0: every copy of a package shares one
-     *  website data store again (the pre-v1.0.2252 key), for one A/B. */
-    static final boolean STORE_PER_ROOT =
-        !"0".equals(System.getenv("MACAPK_WEBVIEW_STORE_PER_ROOT"));
-
-    /** The string the native side hashes into this app's WKWebsiteDataStore
-     *  identifier (webview_bridge.mm EnsureDataStore).
-     *
-     *  On a device the WebView's cookies and storage live in the app's OWN data
-     *  directory (AwBrowserProcess: context.getDir("webview") =
-     *  /data/data/<pkg>/app_webview), so two copies of an app with different
-     *  data never share a sign-in, and clearing the data clears it. The key was
-     *  the package name alone, so every copy of a package shared one jar: a
-     *  scratch or harness run of an app read and wrote the installed app's
-     *  sign-ins (measured 2026-10-19 with Metrolist: a sign-in made in a
-     *  scratch run became the installed app's session).
-     *
-     *  An installed bundle (root <X>.app/Contents/android) keeps the package
-     *  key every install has used so far, so existing sign-ins survive; any
-     *  other android root gets a store of its own, keyed by package + root. */
-    static String dataStoreKey(String pkg) {
-        String p = (pkg != null && !pkg.isEmpty()) ? pkg : "default";
-        if (!STORE_PER_ROOT) return p;
-        String root;
-        try { root = com.macapk.loader.SharedStorage.androidRoot(); }
-        catch (Throwable t) { return p; }
-        if (root == null || root.isEmpty()) return p;
-        java.io.File rootF = new java.io.File(root);
-        java.io.File contents = rootF.getParentFile();
-        java.io.File bundle = contents != null ? contents.getParentFile() : null;
-        if ("android".equals(rootF.getName()) && contents != null
-                && "Contents".equals(contents.getName()) && bundle != null
-                && bundle.getName().endsWith(".app")) {
-            return p;
-        }
-        String canon = root;
-        try { canon = rootF.getCanonicalPath(); } catch (Throwable ignored) {}
-        return p + "|" + canon;
+        nativeInit(pkg != null ? pkg : "default");
     }
 
     // ---- registry -----------------------------------------------------------
@@ -279,38 +239,15 @@ final class MacApkWebViewBridge {
      *  Returns the JSON result document ({"v":...}) or "" for void/error --
      *  the injected stub maps "" to undefined. */
     static String onJsBridgeCall(int viewId, String payload) {
-        final WebView wv = viewFor(viewId);
+        WebView wv = viewFor(viewId);
         if (wv == null) return "";
         try {
-            return JAVA_BRIDGE.submit(() -> wv.macapkInvokeJsInterface(payload)).get();
+            return wv.macapkInvokeJsInterface(payload);
         } catch (Throwable t) {
-            Throwable c = (t instanceof java.util.concurrent.ExecutionException
-                    && t.getCause() != null) ? t.getCause() : t;
-            com.macapk.loader.NativeLog.w("WebView", "js bridge invoke threw: " + c);
+            com.macapk.loader.NativeLog.w("WebView", "js bridge invoke threw: " + t);
             return "";
         }
     }
-
-    /** The "JavaBridge" thread: where every @JavascriptInterface method runs,
-     *  one Java thread for the process, as Chromium's WebView has. The native
-     *  side calls in from a GCD worker on its serial JS-bridge queue, and a GCD
-     *  worker has a 512 KiB stack, so the app's bridge code ran with a fraction
-     *  of the stack every other Java thread gets (-Xss16m, jvm_loader.cpp).
-     *
-     *  WHY 256 MiB. App code written for Android leans on its regex engine
-     *  being ICU, which backtracks on a heap stack; java.util.regex recurses
-     *  once per repetition. Measured on SmartTube: its PoToken generator parses
-     *  the BotGuard challenge with `'((?:[^'\\]|\\[\s\S])*)'` inside
-     *  downloadAndRunBotguard(), which threw StackOverflowError here, so no
-     *  token was made and no video could load. HotSpot, that pattern: 16 MiB
-     *  overflows at 100k characters, 64 MiB at 1M, 256 MiB holds 1M. It is ONE
-     *  thread and the reservation is virtual (pages commit only when touched). */
-    private static final java.util.concurrent.ExecutorService JAVA_BRIDGE =
-        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(null, r, "JavaBridge", 256L << 20);
-            t.setDaemon(true);
-            return t;
-        });
 
     // ---- file:///android_asset/ + file:///android_res/ (called by native) ---
     //

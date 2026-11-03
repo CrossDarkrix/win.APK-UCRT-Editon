@@ -228,12 +228,7 @@ public class ContentResolver {
         ContentProvider p = providerFor(uri);
         if (p == null) return null;
         p.macapkEnforceFile(uri, "r");   // Transport.openAssetFile -> enforceFilePermission
-        // v1.0.2244: the 3-arg entry point, as AOSP's Transport.openAssetFile calls
-        // `mInterface.openAssetFile(uri, mode, CancellationSignal.fromTransport(..))`
-        // (android14 ContentProvider.java:609). A provider that overrides only the
-        // CancellationSignal overloads (Rhythm's album-art provider) answered our
-        // 2-arg call from the base class: "No files supported by provider".
-        android.content.res.AssetFileDescriptor afd = p.openAssetFile(uri, "r", null);
+        android.content.res.AssetFileDescriptor afd = p.openAssetFile(uri, "r");
         // AOSP openInputStream (:1529-1534) converts ONLY the createInputStream
         // IOException into FileNotFoundException; a provider's own exception
         // propagates.
@@ -255,7 +250,7 @@ public class ContentResolver {
         if (p == null) return null;
         p.macapkEnforceFile(uri, mode != null ? mode : "w");
         android.content.res.AssetFileDescriptor afd =
-            p.openAssetFile(uri, mode != null ? mode : "w", null);   // Transport's 3-arg call
+            p.openAssetFile(uri, mode != null ? mode : "w");
         // AOSP openOutputStream (:1755-1760), same shape as openInputStream.
         try {
             return afd != null ? afd.createOutputStream() : null;
@@ -283,11 +278,7 @@ public class ContentResolver {
     // provider in this tree, e.g. MediaStoreProvider) is unaffected.
     public final android.os.ParcelFileDescriptor openFileDescriptor(Uri uri, String mode)
             throws java.io.FileNotFoundException {
-        return openFileDescriptor(uri, mode, null);
-    }
-    public final android.os.ParcelFileDescriptor openFileDescriptor(Uri uri, String mode,
-            CancellationSignal sig) throws java.io.FileNotFoundException {
-        android.content.res.AssetFileDescriptor afd = openAssetFileDescriptor(uri, mode, sig);
+        android.content.res.AssetFileDescriptor afd = openAssetFileDescriptor(uri, mode);
         if (afd == null) return null;
         if (afd.getDeclaredLength() < 0) {
             return afd.getParcelFileDescriptor();
@@ -295,7 +286,10 @@ public class ContentResolver {
         try { afd.close(); } catch (Throwable ignored) {}
         throw new java.io.FileNotFoundException("Not a whole file");
     }
-
+    public final android.os.ParcelFileDescriptor openFileDescriptor(Uri uri, String mode,
+            CancellationSignal sig) throws java.io.FileNotFoundException {
+        return openFileDescriptor(uri, mode);
+    }
     // AOSP ContentResolver.openAssetFileDescriptor(Uri, String, CancellationSignal)
     // special-cases scheme "file" BEFORE any provider lookup (same fetch as
     // above) -- a file:// Uri names a real path on disk, not a ContentProvider
@@ -330,10 +324,6 @@ public class ContentResolver {
     // another. Leave for whoever lands that stub.)
     public final android.content.res.AssetFileDescriptor openAssetFileDescriptor(Uri uri, String mode)
             throws java.io.FileNotFoundException {
-        return openAssetFileDescriptor(uri, mode, null);
-    }
-    public final android.content.res.AssetFileDescriptor openAssetFileDescriptor(Uri uri, String mode, CancellationSignal sig)
-            throws java.io.FileNotFoundException {
         if (uri != null && SCHEME_FILE.equals(uri.getScheme())) {
             String path = uri.getPath();
             if (path == null) throw new java.io.FileNotFoundException("no path in " + uri);
@@ -345,19 +335,22 @@ public class ContentResolver {
         ContentProvider p = providerFor(uri);
         if (p == null) return null;
         p.macapkEnforceFile(uri, mode);
-        return p.openAssetFile(uri, mode, sig);   // Transport.openAssetFile's 3-arg call
+        return p.openAssetFile(uri, mode);
+    }
+    public final android.content.res.AssetFileDescriptor openAssetFileDescriptor(Uri uri, String mode, CancellationSignal sig)
+            throws java.io.FileNotFoundException {
+        return openAssetFileDescriptor(uri, mode);
     }
     public final android.content.res.AssetFileDescriptor openTypedAssetFileDescriptor(Uri uri, String mimeType, Bundle opts)
-            throws java.io.FileNotFoundException {
-        return openTypedAssetFileDescriptor(uri, mimeType, opts, null);
-    }
-    public final android.content.res.AssetFileDescriptor openTypedAssetFileDescriptor(Uri uri, String mimeType, Bundle opts, CancellationSignal sig)
             throws java.io.FileNotFoundException {
         ContentProvider p = providerFor(uri);
         if (p == null) return null;
         p.macapkEnforceFile(uri, "r");   // Transport.openTypedAssetFile
-        // The 4-arg call Transport makes (android14 ContentProvider.java:667).
-        return p.openTypedAssetFile(uri, mimeType, opts, sig);
+        return p.openTypedAssetFile(uri, mimeType, opts);
+    }
+    public final android.content.res.AssetFileDescriptor openTypedAssetFileDescriptor(Uri uri, String mimeType, Bundle opts, CancellationSignal sig)
+            throws java.io.FileNotFoundException {
+        return openTypedAssetFileDescriptor(uri, mimeType, opts);
     }
     // AOSP ContentResolver.openTypedAssetFile (core/java/android/content/
     // ContentResolver.java) is a genuinely separate public method from
@@ -580,6 +573,8 @@ public class ContentResolver {
     // callbacks never fired. v1.0.423.
     private static final java.util.List<Object[]> sObservers =
         new java.util.concurrent.CopyOnWriteArrayList<>();
+    static final boolean MACAPK_NOTIFY_SUBTREE =
+        !"0".equals(System.getenv("MACAPK_NOTIFY_SUBTREE"));
     private static void macapkNotify(Uri uri, ContentObserver self) {
         String u = uri != null ? uri.toString() : "";
         for (Object[] e : sObservers) {
@@ -587,7 +582,19 @@ public class ContentResolver {
             if (obs == self) continue;
             String base = (String) e[1];
             boolean desc = (Boolean) e[2];
-            if (base.isEmpty() || u.equals(base) || (desc && u.startsWith(base))) {
+            // AOSP ObserverNode.collectObserversLocked (ContentService.java):
+            // once the walk reaches the LEAF of the notified uri it collects
+            // every observer in that node's whole SUBTREE, whatever their
+            // notifyForDescendants -- a change to content://a/lists also tells
+            // an observer of content://a/lists/withcount. We only matched the
+            // other direction, so NoNonsense Notes' drawer (a CursorLoader on
+            // TaskList.URI_WITH_COUNT, notified via TaskList.URI) never showed a
+            // newly created list until the app restarted.
+            // MACAPK_NOTIFY_SUBTREE=0 restores the old match.
+            final boolean subtree = MACAPK_NOTIFY_SUBTREE && !u.isEmpty()
+                    && base.length() > u.length() && base.startsWith(u)
+                    && (u.endsWith("/") || base.charAt(u.length()) == '/');
+            if (base.isEmpty() || u.equals(base) || (desc && u.startsWith(base)) || subtree) {
                 // Deliberately still broad, and NOT covered by the
                 // exception-narrowing above. On a device each observer lives
                 // behind its own binder callback, so one observer's failure

@@ -63,9 +63,6 @@ package com.macapk.loader;
  *       down at once; its settle interval only resets the gesture when more
  *       fingers land. Waiting is ours: it is what keeps a two-finger swipe or
  *       pinch (macOS-recognized, a few frames later) from ever becoming a hold.
- *       The burst that ends the wait is stamped with the time the fingers
- *       LANDED (eventTime and downTime), so the wait never shortens the touch
- *       the app measures (GitHub #23).
  *   1.  Once a hold has engaged, every finger keeps its own pointer until IT
  *       lifts (NSTouch phase ended -> POINTER_UP / UP), which is the
  *       touchscreen contract (TouchInputMapper DIRECT mode). Pointer-mode
@@ -101,19 +98,14 @@ final class TrackpadGestureMapper {
 
     /** One MotionEvent to deliver. Coordinates are SURFACE pixels (top-left
      *  origin), the space TouchDispatcher's host-mouse path uses. `index` is
-     *  the pointer index the POINTER_DOWN/UP is about (0 otherwise).
-     *  `eventTime` is when it physically happened in uptimeMillis, or 0 for
-     *  "now" (stamped at delivery). */
+     *  the pointer index the POINTER_DOWN/UP is about (0 otherwise). */
     static final class Motion {
         final int action, index;
-        final long downTime, eventTime;
+        final long downTime;
         final int[] ids;
         final float[] xs, ys;
         Motion(int action, int index, long downTime, int[] ids, float[] xs, float[] ys) {
-            this(action, index, downTime, 0L, ids, xs, ys);
-        }
-        Motion(int action, int index, long downTime, long eventTime, int[] ids, float[] xs, float[] ys) {
-            this.action = action; this.index = index; this.downTime = downTime; this.eventTime = eventTime;
+            this.action = action; this.index = index; this.downTime = downTime;
             this.ids = ids; this.xs = xs; this.ys = ys;
         }
         @Override public String toString() {
@@ -154,7 +146,6 @@ final class TrackpadGestureMapper {
     private boolean moving;       // moved past MIN_DISTANCE before settling
     private long    settleStart;  // when the current multi-finger set formed
     private long    downTime;     // the live stream's ACTION_DOWN time
-    private boolean vetoed;       // the settle elapsed while the caller vetoed the hold
 
     // Geometry. ref* are fixed when the hold engages (AOSP's reference points).
     private float curX, curY, surfW, surfH, padW = FALLBACK_PAD_W_MM, padH = FALLBACK_PAD_H_MM;
@@ -264,7 +255,6 @@ final class TrackpadGestureMapper {
                 // before it had company; that is not a gesture).
                 settleStart = now;
                 moving = false;
-                vetoed = false;
                 for (int j = 0; j < n; j++) { c0X[j] = cX[j]; c0Y[j] = cY[j]; }
             }
         }
@@ -325,7 +315,7 @@ final class TrackpadGestureMapper {
         // activity): fingers that then stay perfectly still send no further
         // touch frame, so ask for another look. It ends on its own the moment a
         // finger lifts (n < 2), the contact is claimed, or it moves.
-        if (!allowEngage) { vetoed = true; return SETTLE_MS; }
+        if (!allowEngage) return SETTLE_MS;
         // GATE-MUTANT(trackpad:engage) begin -- C1 deletes this: the pre-change
         // Mac.apk, where a two-finger contact delivered nothing at all.
         // Reference points, AOSP style: the cursor and the centroid of the
@@ -335,26 +325,11 @@ final class TrackpadGestureMapper {
         refTouchX = sx / n; refTouchY = sy / n;
         refCurX = curX; refCurY = curY;
         engaged = true;
-        // WHEN the fingers went down (GitHub #23). The settle only delays what
-        // we SEND; the contact itself began at settleStart, when the set formed
-        // (a touchscreen stamps DOWN with the moment the finger landed, and
-        // downTime is that DOWN's eventTime -- MotionEvent.getDownTime). Stamping
-        // the engage instead shaved the 100 ms settle off every hold, so a 220 ms
-        // rest reached the app as a 120 ms touch: under a 150 ms two-finger-tap
-        // timeout. The burst is stamped settleStart; later events are stamped at
-        // delivery. A hold the caller vetoed past its settle (a mouse button was
-        // down, a dialog was up) starts NOW instead: back-dating it would put its
-        // DOWN before the event that ended the veto (the mouse UP), and a
-        // detector would read a negative gap between the two streams.
-        long landed = now;
-        // GATE-MUTANT(trackpad:landtime) begin -- debug/trackpad_gate.sh C8 deletes this
-        if (!vetoed) landed = settleStart;
-        // GATE-MUTANT(trackpad:landtime) end
-        downTime = landed;
+        downTime = now;
         // Ids and DOWN order follow landing order (the contact array already is).
         for (int j = 0; j < n; j++) {
             cPtr[j] = j;
-            sink.motion(build(j == 0 ? ACTION_DOWN : ACTION_POINTER_DOWN, j, j + 1, landed));
+            sink.motion(build(j == 0 ? ACTION_DOWN : ACTION_POINTER_DOWN, j, j + 1));
         }
         // GATE-MUTANT(trackpad:engage) end
         return -1;
@@ -388,10 +363,6 @@ final class TrackpadGestureMapper {
      *  `limit` >= 0 builds over the first `limit` contacts that own pointers in
      *  landing order (the engage burst, where pointers appear one by one). */
     private Motion build(int action, int index, int limit) {
-        return build(action, index, limit, 0L);
-    }
-
-    private Motion build(int action, int index, int limit, long eventTime) {
         final float k = zoomScale();
         int m = 0;
         int[] ids = new int[n]; float[] xs = new float[n], ys = new float[n];
@@ -411,7 +382,7 @@ final class TrackpadGestureMapper {
             while (b >= 0 && ids[b] > id) { ids[b + 1] = ids[b]; xs[b + 1] = xs[b]; ys[b + 1] = ys[b]; b--; }
             ids[b + 1] = id; xs[b + 1] = x; ys[b + 1] = y;
         }
-        return new Motion(action, index, downTime, eventTime,
+        return new Motion(action, index, downTime,
                 java.util.Arrays.copyOf(ids, m), java.util.Arrays.copyOf(xs, m),
                 java.util.Arrays.copyOf(ys, m));
     }

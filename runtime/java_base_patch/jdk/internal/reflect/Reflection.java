@@ -163,26 +163,6 @@ public class Reflection {
         boolean gotIsSameClassPackage = false;
         boolean isSameClassPackage = false;
 
-        // ⚠ Mac.apk java.base overlay, second deviation from JDK 21: a PUBLIC
-        // member is accessible whatever its declaring class's access. The
-        // stock code first rejects any non-public declaring class from
-        // another package, so Method.invoke on a public method of a
-        // package-private class throws IllegalAccessException unless the
-        // caller called setAccessible(true). ART never checks the class:
-        // art/runtime/reflection.cc VerifyAccess() starts with
-        // `if ((access_flags & kAccPublic) != 0) return true;`, and apps
-        // rely on it. React Native's ViewManagersPropertyCache invokes
-        // react-native-svg's setters on the package-private
-        // VirtualViewManager$c this way; on stock HotSpot that threw,
-        // aborted the createView batch, and left the Xbox app black after
-        // sign-in. verifyModuleAccess above still runs first, so JDK
-        // module encapsulation is unchanged. Non-public members keep the
-        // stock checks, which already require the same package (or a
-        // subclass, or a nestmate) and so match ART for them too.
-        if (Modifier.isPublic(modifiers)) {
-            return true;
-        }
-
         if (!Modifier.isPublic(getClassAccessFlags(memberClass))) {
             isSameClassPackage = isSameClassPackage(currentClass, memberClass);
             gotIsSameClassPackage = true;
@@ -192,6 +172,10 @@ public class Reflection {
         }
 
         // At this point we know that currentClass can access memberClass.
+
+        if (Modifier.isPublic(modifiers)) {
+            return true;
+        }
 
         // Check for nestmate access if member is private
         if (Modifier.isPrivate(modifiers)) {

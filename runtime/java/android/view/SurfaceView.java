@@ -1258,9 +1258,44 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         if (sViewSizeGate && !holder.macapkFixedSize) {
             boolean gl = !holder.macapkLockedCanvas;                   /*HOLDER-RULE*/
             int[] v = macapkNonFillingViewSize(displayW, displayH, gl);
+            if (v == null && gl) v = macapkOversizeUnclaimedViewSize();
             if (v != null) return v;
         }
         return new int[] { displayW, displayH };
+    }
+
+    // ---- a holder nobody draws into yet, on a view larger than its window ------
+    //
+    // A "center crop" preview lays its SurfaceView out LARGER than the window
+    // (negative margins) so the frame's aspect ratio survives, then waits for
+    // surfaceChanged to report that size before it starts producing frames:
+    // AOSP always sizes the surface from the view (updateSurface :985-988). The
+    // GL rule above refuses an overflowing view, so such a holder kept the
+    // window size -- and because its producer (a camera1 preview drawing with
+    // lockCanvas, say) only starts after that surfaceChanged, the Canvas rule
+    // never took over either: the preview never started (QR Bot, 2026-10-28).
+    //
+    // The GL rule protects a GL/EGL consumer; a view with a resolved renderer, a
+    // GLSurfaceView, or the native-window owner (ANativeWindow_fromSurface) is
+    // one, and keeps it. A holder with none of those has no GL consumer the
+    // window-box layer could misplace, so it gets the view's size, as on AOSP.
+    //
+    // BISECT GATE, default ON: MACAPK_SV_OVERSIZE_HOLDER=0 restores the window
+    // size for these holders.
+    static final boolean sOversizeHolderGate =
+        !"0".equals(System.getenv("MACAPK_SV_OVERSIZE_HOLDER"));
+
+    private int[] macapkOversizeUnclaimedViewSize() {
+        if (!sOversizeHolderGate) return null;
+        LayoutSnap s = macapkLayoutSnap;
+        if (s == null || !macapkAttached) return null;
+        if (s.w <= 0 || s.h <= 0 || s.rootW <= 0 || s.rootH <= 0) return null;
+        if (s.w <= s.rootW && s.h <= s.rootH) return null;           // not overflowing: the GL rule's call
+        if (s.w > 16384 || s.h > 16384) return null;
+        if (reflectedRenderer != null || this instanceof android.opengl.GLSurfaceView) return null;
+        java.lang.ref.WeakReference<SurfaceView> owner = sNativeWindowOwner;
+        if (owner != null && owner.get() == this) return null;
+        return new int[] { s.w, s.h };
     }
 
     /** The size a RENDERER is told (onSurfaceChanged / setScreenWidthAndHeight)
@@ -1990,8 +2025,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
                 android.os.Looper.macapkEnterGlRenderer();
                 try {
                     reflectedOnSurfaceCreated.invoke(reflectedRenderer,
-                        glArgFor(reflectedOnSurfaceCreated),
-                        eglConfigArgFor(reflectedOnSurfaceCreated));
+                        glArgFor(reflectedOnSurfaceCreated), null);
                 } finally { android.os.Looper.macapkExitGlRenderer(); }
                 reflectedSurfaceCreatedFired = true;
                 // MACAPK_SV_RESUME_ONCE (default ON, 2026-09-27): the
@@ -3374,19 +3408,6 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             Class<?>[] p = m.getParameterTypes();
             Object gl = android.opengl.GLSurfaceView.macapkSharedGL10();
             if (p.length >= 1 && p[0].isInstance(gl)) return gl;
-        } catch (Throwable ignore) {}
-        return null;
-    }
-
-    /** The EGLConfig argument for a reflected onSurfaceCreated: the window
-     *  surface's config (MacApkEGL10.macapkWindowSurfaceConfig, what AOSP's
-     *  GLThread passes from its chooser) when the second parameter accepts it,
-     *  null otherwise. */
-    private static Object eglConfigArgFor(java.lang.reflect.Method m) {
-        try {
-            Class<?>[] p = m.getParameterTypes();
-            Object c = javax.microedition.khronos.egl.MacApkEGL10.macapkWindowSurfaceConfig();
-            if (p.length >= 2 && c != null && p[1].isInstance(c)) return c;
         } catch (Throwable ignore) {}
         return null;
     }

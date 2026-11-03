@@ -1,24 +1,33 @@
 // android.bluetooth.BluetoothAdapter
 //
-// Mac.apk does not bridge macOS Bluetooth to the guest. AOSP's
-// getDefaultAdapter() returns null on a context with no Bluetooth
-// available to the app (no hardware, or no BLUETOOTH permission) -- a
-// state real apps already handle -- so returning null is the honest
-// answer, not a no-op lie. Frozen Bubble calls getDefaultAdapter() from
-// its input path; the method was missing -> NoSuchMethodError.
+// The host's Bluetooth radio, when the host reports one
+// (com.macapk.loader.HostRadios; Win.apk does): its name, whether it is on,
+// and the paired devices. Nothing here talks to a device (discovery, LE scans,
+// sockets and profiles answer "not possible"), so an app can show the
+// Bluetooth state and the paired list but not connect. With no radio --
+// or on a host that does not report one (the Mac) -- getDefaultAdapter() is
+// null, AOSP's answer for a device without Bluetooth, which real apps handle.
 package android.bluetooth;
 
 public class BluetoothAdapter {
     public BluetoothAdapter() {}
 
-    /** No Bluetooth adapter is exposed to guest apps. AOSP returns null
-     *  here on devices/contexts without Bluetooth; we always do. */
-    public static BluetoothAdapter getDefaultAdapter() { return null; }
+    private static final BluetoothAdapter sAdapter = new BluetoothAdapter();
 
-    public boolean isEnabled()       { return false; }
-    public int     getState()        { return STATE_OFF; }
+    public static BluetoothAdapter getDefaultAdapter() {
+        return com.macapk.loader.HostRadios.bluetoothRadio() != null ? sAdapter : null;
+    }
+
+    public boolean isEnabled() {
+        String[] r = com.macapk.loader.HostRadios.bluetoothRadio();
+        return r != null && "1".equals(r[2]);
+    }
+    public int     getState()        { return isEnabled() ? STATE_ON : STATE_OFF; }
     public String  getAddress()      { return "02:00:00:00:00:00"; } // AOSP's redacted constant
-    public String  getName()         { return null; }
+    public String  getName() {
+        String[] r = com.macapk.loader.HostRadios.bluetoothRadio();
+        return r == null || r[0].isEmpty() ? null : r[0];
+    }
     public boolean enable()          { return false; }
     public boolean disable()         { return false; }
     public boolean isDiscovering()   { return false; }
@@ -91,8 +100,16 @@ public class BluetoothAdapter {
     public boolean startDiscovery() { return false; }
     public int getScanMode() { return SCAN_MODE_NONE; }
 
+    /** AOSP: the paired devices, empty while the adapter is off. */
     public java.util.Set<BluetoothDevice> getBondedDevices() {
-        return new java.util.HashSet<>();
+        java.util.Set<BluetoothDevice> out = new java.util.HashSet<>();
+        String[] b = isEnabled() ? com.macapk.loader.HostRadios.bluetoothBonded() : null;
+        for (int i = 0; b != null && i + 2 < b.length; i += 3) {
+            int cod = 0;
+            try { cod = Integer.parseInt(b[i + 2]); } catch (NumberFormatException ignored) {}
+            out.add(new BluetoothDevice(b[i + 1], b[i].isEmpty() ? null : b[i], cod));
+        }
+        return out;
     }
 
     public BluetoothDevice getRemoteDevice(String address) {

@@ -1,0 +1,92 @@
+Win.apk preview
+===============
+
+An early preview of Win.apk, an unofficial Windows port of Mac.apk. It runs
+Android apps as ordinary Windows programs on Windows 10/11 x64.
+
+What works
+----------
+- Apps written in Java or Kotlin. They open in their own window and respond
+  to the mouse, the mouse wheel and the keyboard. Escape (or Alt+Left, or
+  the mouse's back button) is Android's Back.
+- Games and apps that draw with OpenGL ES, from Java (GLSurfaceView, libGDX)
+  or from their own native code through a SurfaceView (SDL games). Graphics
+  go through ANGLE on Direct3D 11; without a usable GPU, a software renderer
+  takes over.
+- Apps that ship x86_64 native libraries (lib/x86_64/*.so).
+- Apps that only have 64-bit ARM native libraries (lib/arm64-v8a). When
+  such an app is installed, its ARM code is translated to x64 once
+  (winapk-aot, then compiled with clang for your CPU) and runs at close to
+  native speed. Without clang, or for code the translation cannot follow,
+  an ARM JIT runs it instead, more slowly. Apps are installed with the ABIs
+  x86_64 and arm64-v8a, so an app's x86_64 build is used when it has one.
+- Sound from Java through AudioTrack and SoundPool (WAV, Ogg, MP3), saving
+  data (files, SharedPreferences, SQLite), the clipboard, file open/save
+  dialogs and game controllers.
+
+What does not work yet
+----------------------
+- Apps that only have 32-bit ARM native libraries (lib/armeabi-v7a).
+- NativeActivity games (pure C/C++ apps without a Java activity).
+- MediaPlayer and sound from native code (OpenSL ES, AAudio), video
+  playback, the camera, WebView (web pages inside apps), location.
+- Google Play services (sign-in, in-app purchases, maps).
+
+Installing Win.apk
+------------------
+Win.apk-Setup.exe installs it for your user (no administrator rights): Win.apk
+goes into the Start menu, and .apk files open with it. Or unzip
+Win.apk-windows-x64.zip anywhere and start Win.apk.exe from that folder.
+
+Adding and running apps
+-----------------------
+Open Win.apk: it shows your app library.
+- Add an app: drag an .apk (or an .apkm, .xapk or .apks bundle) onto the
+  window, click the drop zone or the "Add app" tile, or double-click the
+  .apk in Explorer. Installing takes up to a minute, once per app; a window
+  shows its progress and its log.
+- Or get one from the Store tab, at the top of the window: the free and
+  open-source apps of F-Droid (f-droid.org). Search or pick a category, then
+  click Install; the download is checked against F-Droid's index before it
+  is installed. Update shows when F-Droid has a newer version of an app.
+- Each installed app gets its own icon in the library, in the Start menu
+  (Start > Win.apk Apps) and, unless turned off in the settings, on the
+  desktop.
+- Double-click an app to open it. Right-click for more: Get Info, a desktop
+  shortcut, its files and log, updating it from a newer APK, reinstalling or
+  removing it. Typing searches the library.
+- The gear opens the settings: language (English or Hebrew), theme, the
+  phone's screen size and orientation, and more. "Logs" at the bottom shows
+  the logs as they are written.
+
+In an app, the mouse is your finger and the wheel scrolls. Android's Back
+is Escape, Alt+Left, or the mouse's back side button. Close the app's window to quit. Apps from F-Droid
+(the Store tab) are a good place to start: they are free, open source, and
+usually Java-only.
+
+Where things are
+----------------
+Installed apps:  %LOCALAPPDATA%\Win.apk\library
+App data:        %LOCALAPPDATA%\Win.apk\android
+Last log:        %LOCALAPPDATA%\Win.apk\logs\last-run.log
+
+Removing an app from the library keeps what it saved; uninstalling Win.apk
+keeps the apps too. Delete %LOCALAPPDATA%\Win.apk to start from scratch.
+
+Reporting a problem
+-------------------
+If an app does not start or misbehaves, the last log says why. Please note
+the app's name and version and attach last-run.log. These lines in the log
+are the most useful:
+  "native not implemented"            a Windows piece that is missing
+  "not implemented on Windows yet"    a system function an app's native code needs
+  "Exception" or "FATAL"              the app crashed
+
+Java is included (Eclipse Temurin 21, in the jre folder), and so is ANGLE
+(bin\libEGL.dll, bin\libGLESv2.dll, Chromium's build; licenses in
+bin\licenses), and the parts of LLVM's clang that translate apps' ARM code
+for your processor (the clang folder, licenses in clang\licenses). Nothing
+else needs to be installed.
+
+License: AGPL-3.0, like Mac.apk. Source: the repository this build came
+from. Win.apk is not affiliated with the Mac.apk project.

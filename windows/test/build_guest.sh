@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# build_guest.sh -- builds the PoC Android x86_64 (and arm64) libraries with
+# plain clang + lld.
+#
+# No NDK needed: the guest declares its libc imports by hand and links with
+# -nostdlib, so its undefined symbols are left for the Win.apk loader.
+#
+#   windows/test/build_guest.sh [out_dir]      (default: windows/build/guest)
+#
+# Two variants of the same source:
+#   libwinapk_poc_guest.so         plain RELA relocations
+#   libwinapk_poc_guest_packed.so  Android packed relocations (APS2 + RELR),
+#                                  what NDK builds for recent minSdk produce
+#
+# And, in link/, the libraries for winapk-linker-test (see guest/link_guest.c).
+
+set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+OUT="${1:-$HERE/../build/guest}"
+CC="${CC_ANDROID:-clang}"
+mkdir -p "$OUT"
+
+COMMON=(
+    --target=x86_64-linux-android24
+    -fPIC -O2 -fstack-protector-all -ffreestanding
+    -nostdlib -shared -fuse-ld=lld
+    -fvisibility=hidden
+    -Wl,-z,relro -Wl,-z,now
+)
+
+"$CC" "${COMMON[@]}" -Wl,-soname,libwinapk_poc_guest.so \
+    -o "$OUT/libwinapk_poc_guest.so" "$HERE/guest/poc_guest.c"
+
+"$CC" "${COMMON[@]}" -Wl,-soname,libwinapk_poc_guest_packed.so \
+    -Wl,--pack-dyn-relocs=android+relr -Wl,--use-android-relr-tags \
+    -o "$OUT/libwinapk_poc_guest_packed.so" "$HERE/guest/poc_guest.c"
+
+# The linker test's dependency tree. Stub system libraries give the DT_NEEDED
+# entries an NDK build would have; they are only link inputs and never ship.
+LINK="$OUT/link"
+STUBS="$OUT/link-stubs"
+mkdir -p "$LINK" "$STUBS"
+for lib in libc libdl liblog libz; do
+    "$CC" "${COMMON[@]}" -Wl,-soname,$lib.so -o "$STUBS/$lib.so" -x c /dev/null
+done
+link_lib() {  # link_lib <part> <name> [linker args...]
+    local part="$1" name="$2"
+    shift 2
+    "$CC" "${COMMON[@]}" -DWINAPK_LINK_$part -Wl,-soname,$name.so -Wl,--no-as-needed \
+        -o "$LINK/$name.so" "$HERE/guest/link_guest.c" "$@"
+}
+# base and mid need each other: link base against a placeholder that only
+# carries mid's soname, then link the real mid against base.
+"$CC" "${COMMON[@]}" -Wl,-soname,libwinapk_link_mid.so -o "$STUBS/libwinapk_link_mid.so" -x c /dev/null
+link_lib PLUGIN libwinapk_link_plugin
+link_lib BASE libwinapk_link_base -L"$STUBS" -lwinapk_link_mid
+link_lib MID libwinapk_link_mid -L"$LINK" -L"$STUBS" -lwinapk_link_base -llog
+link_lib ROOT libwinapk_link_root -L"$LINK" -L"$STUBS" -lwinapk_link_mid -lc -ldl
+
+# The Bionic shim's guest-side test (winapk-bionic-test). Real ELF TLS, as an
+# NDK build for minSdk 29 or later uses.
+"$CC" "${COMMON[@]}" -fno-emulated-tls -Wl,-soname,libwinapk_bionic_guest.so \
+    -o "$OUT/libwinapk_bionic_guest.so" "$HERE/guest/bionic_guest.c" -L"$STUBS" -Wl,--no-as-needed -lz
+
+# The arm64 interpreter's test libraries (winapk-arm64-test, milestone M10).
+# arm64_isa.c three ways (the test compares each against the same code built
+# for the host), and the bridge library against the Bionic shim. Atomics are
+# inlined (-mno-outline-atomics): the outline helpers live in libgcc, which
+# -nostdlib leaves out.
+ARM64_OUT="$OUT/arm64"
+mkdir -p "$ARM64_OUT"
+ARM64=(
+    --target=aarch64-linux-android24
+    -fPIC -ffreestanding -nostdlib -shared -fuse-ld=lld
+    -fvisibility=hidden -Wl,-z,relro -Wl,-z,now
+)
+"$CC" "${ARM64[@]}" -O2 -mno-outline-atomics -Wl,-soname,libwinapk_arm64_isa_O2.so \
+    -o "$ARM64_OUT/libwinapk_arm64_isa_O2.so" "$HERE/guest/arm64_isa.c"
+"$CC" "${ARM64[@]}" -O3 -mno-outline-atomics -Wl,-soname,libwinapk_arm64_isa_O3.so \
+    -o "$ARM64_OUT/libwinapk_arm64_isa_O3.so" "$HERE/guest/arm64_isa.c"
+"$CC" "${ARM64[@]}" -O3 -march=armv8.1-a -Wl,-soname,libwinapk_arm64_isa_lse.so \
+    -o "$ARM64_OUT/libwinapk_arm64_isa_lse.so" "$HERE/guest/arm64_isa.c"
+"$CC" "${ARM64[@]}" -O2 -fstack-protector-all -mno-outline-atomics \
+    -Wl,--pack-dyn-relocs=android+relr -Wl,--use-android-relr-tags \
+    -Wl,-soname,libwinapk_arm64_bridge.so \
+    -o "$ARM64_OUT/libwinapk_arm64_bridge.so" "$HERE/guest/arm64_bridge_guest.c"
+# The engines' benchmarks, -O2 like an app's release build.
+"$CC" "${ARM64[@]}" -O2 -mno-outline-atomics -Wl,-soname,libwinapk_arm64_bench.so \
+    -o "$ARM64_OUT/libwinapk_arm64_bench.so" "$HERE/guest/arm64_bench.c"
+
+echo "[build_guest] $OUT/libwinapk_poc_guest.so"
+echo "[build_guest] $OUT/libwinapk_poc_guest_packed.so"
+echo "[build_guest] $LINK/libwinapk_link_{root,mid,base,plugin}.so"
+echo "[build_guest] $OUT/libwinapk_bionic_guest.so"
+echo "[build_guest] $ARM64_OUT/libwinapk_arm64_{isa_O2,isa_O3,isa_lse,bridge,bench}.so"

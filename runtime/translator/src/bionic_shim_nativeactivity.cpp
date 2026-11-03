@@ -632,21 +632,10 @@ jlong JNICALL InputQueue_nativeSendMotionEvent(JNIEnv* env, jclass, jlong ptr, j
     if (n < 0) n = 0;
     if (n > kMaxPointers) n = kMaxPointers;
     ev->pointerCount = n;
-    // Joystick / trackball / gamepad events carry the generic axes; a touch
-    // event only the nine per-pointer coordinates (the rest stay 0, as a
-    // touchscreen's do on a device). A mouse SCROLL / HOVER carries more:
-    // AXIS_VSCROLL (9) and AXIS_HSCROLL (10) are what a wheel step IS
-    // (PointerCoords keeps any axis the event set), and RetroArch reads them
-    // with AMotionEvent_getAxisValue. So every axis is copied except for a
-    // plain touchscreen event. MACAPK_NA_POINTER_AXES=0 restores the
-    // nine-axis copy for pointer events.
-    static const bool kPointerAxes = [] {
-        const char* e = std::getenv("MACAPK_NA_POINTER_AXES");
-        return !(e && e[0] == '0');
-    }();
-    const bool touchOnly = (ev->source & 0x1000 /* SOURCE_TOUCHSCREEN */) == 0x1000;
-    const bool allAxes = (ev->source & 0x10 /* SOURCE_CLASS_JOYSTICK */) != 0
-                      || (kPointerAxes && !touchOnly);
+    // Joystick / trackball / gamepad events carry the generic axes; pointer
+    // events only the nine per-pointer coordinates (the rest stay 0, as a
+    // touchscreen's do on a device).
+    const bool allAxes = (ev->source & 0x10 /* SOURCE_CLASS_JOYSTICK */) != 0;
     for (int i = 0; i < n; i++) {
         ev->pointerId[i] = env->CallIntMethod(eventObj, g_em.mPointerId, (jint)i);
         ev->toolType[i]  = env->CallIntMethod(eventObj, g_em.mToolType, (jint)i);

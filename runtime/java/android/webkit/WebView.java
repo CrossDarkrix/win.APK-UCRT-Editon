@@ -777,7 +777,7 @@ public class WebView extends android.widget.AbsoluteLayout
                 // A test bridge without the option; the view is created without it.
             }
         }
-        MacApkWebViewBridge.nativeCreate(macapkViewId, MacApkWebViewBridge.dataStoreKey(pkg),
+        MacApkWebViewBridge.nativeCreate(macapkViewId, pkg != null ? pkg : "default",
                                          macapkLastUa, macapkLastJsEnabled);
         macapkPeerCreated = true;
         // A draw made before the peer existed punched no hole (onDraw gates on
@@ -1136,6 +1136,7 @@ public class WebView extends android.widget.AbsoluteLayout
             // FLAG_NOT_TOUCHABLE takes no clicks; a FLAG_NOT_TOUCH_MODAL one
             // covers only its own bounds; a modal one takes every click.
             boolean modalAbove = false;
+            android.graphics.Rect modalBounds = null;
             try {
                 android.view.View myRoot = getRootView();
                 java.util.List<com.macapk.loader.WindowOverlayStack.Layer> layers =
@@ -1155,12 +1156,19 @@ public class WebView extends android.widget.AbsoluteLayout
                         continue;
                     }
                     modalAbove = true;
+                    modalBounds = l.bounds != null ? new android.graphics.Rect(l.bounds) : null;
                     break;
                 }
             } catch (Throwable ignored) { }
             if (modalAbove) {
                 out.clear();
                 out.add(wv);
+                // The modal window's own bounds after the whole-view rect: the
+                // whole rect is what takes the clicks, and the union is the
+                // same; a host that composites the page ABOVE the canvas
+                // (Windows: a child window) also needs to know where the
+                // dialog itself is drawn, so it can show it over the page.
+                if (modalBounds != null && modalBounds.intersect(wv)) out.add(modalBounds);
             } else {
                 // The parts an ancestor clips away (a ScrollView / RecyclerView
                 // scrolled it partly out): the canvas covers them, so the page
@@ -1251,35 +1259,6 @@ public class WebView extends android.widget.AbsoluteLayout
             macapkApplyingPageScroll = true;
             try { super.scrollTo(x, y); } finally { macapkApplyingPageScroll = false; }
         } catch (NumberFormatException ignored) { }
-    }
-
-    /** A wheel step that reaches this view through the Android tree (the
-     *  pointer is over a part of the page an app view covers, or the harness's
-     *  hostwheel; a real wheel over the page itself goes straight to the
-     *  WKWebView, which scrolls natively). Chromium's WebView answers
-     *  ACTION_SCROLL in onGenericMotionEvent by scrolling the page by the axis
-     *  value x the scroll factor (AwContents onGenericMotionEvent ->
-     *  ContentViewCore/EventForwarder.onMouseWheelEvent); here the page is
-     *  scrolled the same distance in CSS px. WheelScroll.VIEWS=0: not handled. */
-    @Override
-    public boolean onGenericMotionEvent(android.view.MotionEvent event) {
-        if (com.macapk.loader.WheelScroll.VIEWS
-                && event.getAction() == android.view.MotionEvent.ACTION_SCROLL
-                && event.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER)
-                && Z_BELOW && macapkPeerCreated) {
-            android.view.ViewConfiguration vc = android.view.ViewConfiguration.get(getContext());
-            final int dy = Math.round(-event.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL)
-                    * vc.getScaledVerticalScrollFactor());
-            final int dx = Math.round(event.getAxisValue(android.view.MotionEvent.AXIS_HSCROLL)
-                    * vc.getScaledHorizontalScrollFactor());
-            if (dx != 0 || dy != 0) {
-                float f = macapkPxPerCss > 0f ? macapkPxPerCss : 2f;
-                MacApkWebViewBridge.nativeEvaluateJs(macapkViewId,
-                    "window.scrollBy(" + (dx / f) + "," + (dy / f) + ")", 0);
-                return true;
-            }
-        }
-        return super.onGenericMotionEvent(event);
     }
 
     /** App -> page: AOSP WebView.scrollTo/scrollBy move the page (the provider
@@ -1662,11 +1641,10 @@ public class WebView extends android.widget.AbsoluteLayout
      *  JS is blocked awaiting the synchronous return. Payload/result shapes
      *  are documented in webview_bridge.mm's header. */
     String macapkInvokeJsInterface(String payload) {
-        String ifc = "?", method = "?";
         try {
             org.json.JSONObject req = new org.json.JSONObject(payload);
-            ifc = req.getString("ifc");
-            method = req.getString("m");
+            String ifc = req.getString("ifc");
+            String method = req.getString("m");
             org.json.JSONArray args = req.optJSONArray("a");
             Object target;
             synchronized (jsInterfaces) {
@@ -1732,16 +1710,7 @@ public class WebView extends android.widget.AbsoluteLayout
                     + ifc + "." + method + "/" + argc);
             return "";
         } catch (Throwable t) {
-            // Name the method and the APP's own exception: the reflective
-            // wrapper alone ("InvocationTargetException") says nothing about
-            // which interface method threw or why.
-            Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
-                    && t.getCause() != null) ? t.getCause() : t;
-            StringBuilder sb = new StringBuilder("js bridge invoke failed: ")
-                .append(ifc).append('.').append(method).append(": ").append(cause);
-            StackTraceElement[] st = cause.getStackTrace();
-            for (int i = 0; i < Math.min(6, st.length); i++) sb.append("\n    at ").append(st[i]);
-            com.macapk.loader.NativeLog.w("WebView", sb.toString());
+            com.macapk.loader.NativeLog.w("WebView", "js bridge invoke failed: " + t);
             return "";
         }
     }

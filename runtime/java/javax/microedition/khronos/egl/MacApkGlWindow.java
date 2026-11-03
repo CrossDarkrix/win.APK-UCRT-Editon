@@ -308,16 +308,6 @@ public final class MacApkGlWindow {
     private static final long EGL14_NOT_A_STREAM = 0;
     /** egl14CreateWindowSurface: the pbuffer was refused; ANGLE's error stands. */
     private static final long EGL14_ANGLE_REFUSED = -1;
-    /** egl14CreateWindowSurface: a SurfaceView's Surface. The bridge makes a real
-     *  ANGLE window on the SurfaceView's native window (the native-EGL layer
-     *  ANativeWindow_fromSurface hands NDK code), with the app's attrib list.
-     *  Not an EGL error code (those are 0x3000-0x300E), so -2 is unambiguous. */
-    private static final long EGL14_SURFACEVIEW_WINDOW = -2;
-
-    /** MACAPK_EGL14_SURFACEVIEW_WINDOW (default ON; GitHub #15). =0 restores the
-     *  pre-change refusal of a SurfaceView's Surface (EGL_BAD_NATIVE_WINDOW). */
-    private static final boolean EGL14_SURFACEVIEW_ON =
-        !"0".equals(System.getenv("MACAPK_EGL14_SURFACEVIEW_WINDOW"));
 
     private static int sLog14Budget = 24;
     private static synchronized boolean log14() {
@@ -348,8 +338,7 @@ public final class MacApkGlWindow {
      * of the JNI entry it picks (frameworks/base core/jni/android_opengl_EGL14.cpp
      * android_eglCreateWindowSurface / android_eglCreateWindowSurfaceTexture),
      * in their order. Throws what AOSP throws. Returns the new window's handle
-     * (&gt; 0), {@link #EGL14_NOT_A_STREAM}, {@link #EGL14_ANGLE_REFUSED},
-     * {@link #EGL14_SURFACEVIEW_WINDOW}, or
+     * (&gt; 0), {@link #EGL14_NOT_A_STREAM}, {@link #EGL14_ANGLE_REFUSED}, or
      * minus the EGL error to report (EGL_BAD_ALLOC: the stream is abandoned or
      * already has a producer, AOSP's native_window_api_connect failure).
      */
@@ -374,27 +363,9 @@ public final class MacApkGlWindow {
             // android_view_Surface_getNativeWindow == NULL -> not_valid_surface.
             if (!sur.isValid()) throw new IllegalArgumentException(NOT_VALID_SURFACE);
             st = sur.macapkGetSurfaceTexture();
-            if (st == null && EGL14_SURFACEVIEW_ON && sur.macapkGetOwnerSurfaceView() != null) {
-                // A SurfaceView's Surface (GitHub #15: MapLibre's SurfaceView
-                // render thread; WebRTC's SurfaceViewRenderer is the same
-                // shape). AOSP hands EGL the Surface's ANativeWindow
-                // (android_eglCreateWindowSurface: android_view_Surface_getNativeWindow);
-                // ours is the dedicated native-EGL CAMetalLayer, the window
-                // ANativeWindow_fromSurface gives NDK code for the same Surface,
-                // so a Java-made window and an NDK-made one are the SAME window.
-                // Note the owner first, as ANativeWindow_fromSurface does, so the
-                // layer composites below the window with its hole punched.
-                sur.macapkNoteNativeWindowConsumer();
-                if (log14()) {
-                    info14("eglCreateWindowSurface(" + win.getClass().getName()
-                        + ") -> SurfaceView window on the native-EGL layer");
-                }
-                return EGL14_SURFACEVIEW_WINDOW;
-            }
             if (st == null) {
-                // An ImageReader's Surface, a plain Surface (or a SurfaceView's
-                // under MACAPK_EGL14_SURFACEVIEW_WINDOW=0): no window we can
-                // produce into.
+                // A SurfaceView's surface (the MTKView driver owns it), an
+                // ImageReader's, a plain Surface: no stream we can produce into.
                 if (log14()) {
                     info14("eglCreateWindowSurface(" + win.getClass().getName()
                         + ") -> EGL_NO_SURFACE (EGL_BAD_NATIVE_WINDOW: not a SurfaceTexture stream)");

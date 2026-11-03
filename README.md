@@ -1,146 +1,207 @@
-# Mac.apk
+# Win.apk (UCRT Edition)
 
-**Run Android apps natively on Apple Silicon Macs. No emulator, no virtual machine, no Linux underneath.**
+**AndroidアプリをWindows 10 / 11（x64）上で、通常のWindowsアプリのように実行するためのWin.apk UCRTカスタムエディションです。**
 
-[![Latest release](https://img.shields.io/github/v/release/kksimp/Mac.apk?label=latest&color=6c5ce7)](../../releases/latest)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE) [![Commercial license available](https://img.shields.io/badge/commercial%20license-available-blue)](COMMERCIAL.md)
-[![Signed and notarized](https://img.shields.io/badge/signed-notarized%20by%20Apple-000000)](https://github.com/kksimp/Mac.apk/wiki/Installation)
-[![Sponsor](https://img.shields.io/badge/sponsor-kksimp-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/kksimp)
+> [!IMPORTANT]
+> Win.apk (UCRT Edition)は、MSYS2 UCRT64環境に統一し、Windows上での安定動作、起動時間、マルチメディア、ストレージ連携、実機互換性を重視して調整したカスタムビルドです。上流Win.apkとの互換性を保ちながら、UCRT向けのネイティブブリッジとWindows統合を追加しています。
 
-### 📱 [Which apps work? See the compatibility list →](COMPATIBILITY.md)
-
-[![Apps tested: 71](https://img.shields.io/badge/apps%20tested-71-6c5ce7)](COMPATIBILITY.md) [![Fully playable: 58](https://img.shields.io/badge/fully%20playable-58-2ea44f)](COMPATIBILITY.md) [![Partly works: 10](https://img.shields.io/badge/partly%20works-10-dfb317)](COMPATIBILITY.md) [![Not yet: 3](https://img.shields.io/badge/not%20yet-3-e05d44)](COMPATIBILITY.md)
+---
+[English](README_EN.md)
 
 ---
 
-**Alpha.** Mac.apk is early software under active development. Some apps run
-beautifully, some run partially, and some do not run yet. It is stable enough to use
-and interesting enough to explore, and it improves with every build.
+## 概要
 
-## What it is
+Win.apkは、`.apk`、`.apkm`、`.xapk`、`.apks`をインストールし、Androidアプリを個別のWindowsウィンドウで実行します。仮想マシンや一般的なAndroidエミュレーターを常駐させる方式ではなく、JavaコードはJava VM上で動作し、x86_64ネイティブライブラリはプロセスへ直接ロードされます。arm64-v8aライブラリにはx64向け変換経路があります。
 
-Mac.apk runs Android apps directly on Apple Silicon. Apps launch as ordinary macOS
-processes, draw through the Mac's GPU, and execute on the CPU at native speed. They
-appear in your Dock, get their own windows with a back button next to the traffic
-lights, resize and rotate like any Mac window, and switch between light and dark
-along with your Mac. Android TV apps work from the keyboard, and game launchers can
-start your other installed apps.
+UCRT Editionでは、WindowsのUniversal C Runtimeを利用するUCRT64ツールチェーンへネイティブ依存関係を揃え、異なるABIやランタイムの混在を避ける構成にしています。
 
-There is no emulator here, and no virtual machine. Nothing boots Android in the
-background, there is no Linux kernel running underneath, and nothing is interpreted
-instruction-by-instruction. Mac.apk implements the Android application environment
-on top of macOS directly. [How it works →](https://github.com/kksimp/Mac.apk/wiki/How-Mac.apk-Works)
+## UCRT Editionの主な特徴
 
-![How an Android app runs on your Mac: the app code, native code and resources in an APK go through Mac.apk and come out as a real Mac app](images/how-mac-apk-works-overview.png)
+### UCRT64向け安定化
 
-## 📖 [Read the wiki →](https://github.com/kksimp/Mac.apk/wiki)
+- MSYS2 **UCRT64**を正式なビルド環境として使用
+- UCRT64版GStreamer、プラグイン、スキャナー、ランタイムDLLを同一ABIで配置
+- MINGW64、CLANG64など、異なる環境の成果物を混在させない構成
+- ネイティブブリッジ、JNI、Windowsホスト処理を含めたUCRT64一貫ビルド
 
-| | |
+### GStreamerによる描画・メディア処理
+
+- GStreamerの`appsrc`、D3D11アップロード、`d3d11videosink`を使用する非同期描画経路
+- GStreamer MediaExtractor PCMブリッジによる音声デコード経路
+- GStreamerレジストリキャッシュを最終配置先で事前生成
+- GStreamer初期化を最初のフレーム描画後に遅延し、起動時の白画面時間を短縮
+- GStreamerが使用できない場合はWin32描画経路へフォールバック
+- 全画面サイズプリセットで、縦横ともウィンドウのクライアント領域へストレッチフィット
+
+グラフィックAPIについては、Android/OpenGL ES描画をANGLE経由でDirect3D 11へ接続し、最終フレームのWindows表示にはGStreamer D3D11プレゼンターまたはWin32フォールバックを使用します。
+
+### Windowsオーディオ統合
+
+- Windowsの既定出力デバイスとアクティブなオーディオエンドポイントの列挙
+- Android側からの出力デバイス選択
+- `AudioTrack.setPreferredDevice()`相当の出力先切り替え
+- Windowsセッション音量との同期
+- AudioTrack、SoundPool、MediaPlayer向けのWindows音声経路
+
+### 音楽CD・光学ドライブ対応
+
+- Windowsの光学ドライブをAndroid側へ公開するUCRT CDブリッジ
+- ドライブ列挙、オープン、TEST UNIT READY、INQUIRYに対応
+- READ TOCによるトラック情報取得
+- READ CDによるCD-DAセクター読み取り
+- 大きな読み取り要求を安全な単位へ分割するチャンク読み取り
+- Windows SCSI pass-throughを使用したコマンド転送
+
+光学ドライブやメディアの状態、ドライブ側の対応状況によって、利用可能な操作は異なります。
+
+### Windowsユーザーフォルダ連携
+
+Android側の共有ストレージから、Windowsの既知のユーザーフォルダへアクセスできるようにマッピングします。
+
+- Downloads
+- Pictures
+- Documents
+- Music
+- Videos（Android側ではMovies）
+
+Windowsのファイルピッカー、URI許可、共有ストレージ層も利用できるため、対応アプリではWindows上のファイルを開く、保存する、読み込むといった操作が可能です。ネットワーク共有や異なるボリュームでは、Windows側の制約に応じて通常フォルダへフォールバックする場合があります。
+
+### Windowsとの統合
+
+- APK、APKM、XAPK、APKSのインストール
+- アプリごとのウィンドウ、アイコン、スタートメニューショートカット
+- Windowsクリップボード
+- Windowsファイルピッカー
+- ゲームコントローラー
+- カメラ、マイク入力、写真ライブラリのホストブリッジ
+- WebView2ベースのWebView / ブラウザー連携
+- ライブ実行ログとインストールログ
+- 日本語、英語、ヘブライ語と右から左のUI
+- ライトテーマ、ダークテーマ
+
+## 画面サイズと表示
+
+ランチャーの画面サイズ設定には、1270 x 720のFit screenと複数の端末プリセットがあります。UCRT Editionでは、すべてのプリセットでアスペクト比を固定せず、ウィンドウの縦横全体へ描画をフィットさせます。
+
+- 左右・上下の黒帯を作らず、クライアント領域全体へ描画
+- ウィンドウのリサイズと最大化へ追従
+- マウス・タッチ座標と子ウィンドウも同じ全面矩形を使用
+- プリセット解像度はAndroidアプリが認識する内部描画解像度として維持
+
+## 対応状況
+
+### 対応している主な機能
+
+- Java / Kotlin Androidアプリ
+- x86_64ネイティブライブラリ
+- arm64-v8aネイティブライブラリのx64変換経路
+- JavaおよびネイティブコードからのOpenGL ES
+- AudioTrack、SoundPool、MediaPlayer系の音声
+- ファイル、SharedPreferences、SQLite、クリップボード
+- ファイルピッカー、ゲームコントローラー
+- Windowsユーザーフォルダ
+- 音楽CD読み取り
+
+### 制限事項
+
+- 32ビットARM専用アプリ（armeabi-v7a）は未対応
+- Google Play開発者サービスを前提とする機能は、アプリによって動作しない場合があります
+- Android実機固有のセンサー、DRM、認証、ハードウェア機能は完全互換ではありません
+- 本プロジェクトは開発中であり、アプリごとに互換性が異なります
+
+## 必要環境
+
+- Windows 10またはWindows 11、64ビット（x64）
+- Direct3D 11対応GPUを推奨
+- アプリ本体、Javaランタイム、GStreamer、ANGLE、インストールするアプリを格納できる空き容量
+
+## インストールと使い方
+
+1. リリースのインストーラー、またはポータブルZIPを入手します。
+2. インストーラー版はセットアップを実行します。ポータブル版は任意のフォルダへ展開します。
+3. `Win.apk.exe`を起動します。
+4. APKまたは対応するAPKバンドルをウィンドウへドロップするか、追加ボタンから選択します。
+5. インストール完了後、ライブラリのタイルからアプリを開きます。
+
+初回インストールではAndroidコードの変換や準備に時間がかかる場合があります。アプリの起動や動作に問題がある場合は、ランチャーのログビューアーで`last-run.log`とインストールログを確認してください。
+
+## データの保存先
+
+| 内容 | 保存先 |
 |---|---|
-| **Getting started** | [Installation](https://github.com/kksimp/Mac.apk/wiki/Installation) |
-| **Installing apps** | [Installing apps](https://github.com/kksimp/Mac.apk/wiki/Installing-Apps) · [App stores](https://github.com/kksimp/Mac.apk/wiki/App-Stores) · [How apps are installed](https://github.com/kksimp/Mac.apk/wiki/How-Apps-Are-Installed) · [Managing apps](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps) |
-| **Using apps** | [Controls and input](https://github.com/kksimp/Mac.apk/wiki/Controls-and-Input) · [Windows and appearance](https://github.com/kksimp/Mac.apk/wiki/Windows-and-Appearance) · [Files and privacy](https://github.com/kksimp/Mac.apk/wiki/Files-and-Privacy) · [Google accounts and Play Services](https://github.com/kksimp/Mac.apk/wiki/Google-Accounts-and-Play-Services) |
-| **Flags and advanced settings** | [Flags](https://github.com/kksimp/Mac.apk/wiki/Flags) · [Flags reference](https://github.com/kksimp/Mac.apk/wiki/Flags-Reference) · [Developer menu](https://github.com/kksimp/Mac.apk/wiki/Developer-Menu) |
-| **Help** | [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) · [Troubleshooting](https://github.com/kksimp/Mac.apk/wiki/Troubleshooting) · [Reporting problems](https://github.com/kksimp/Mac.apk/wiki/Reporting-Problems) |
-| **About Mac.apk** | [How Mac.apk works](https://github.com/kksimp/Mac.apk/wiki/How-Mac.apk-Works) · [Design decisions](https://github.com/kksimp/Mac.apk/wiki/Design-Decisions) · [For developers and publishers](https://github.com/kksimp/Mac.apk/wiki/For-Developers-and-Publishers) |
+| Win.apk本体 | `%LOCALAPPDATA%\Programs\Win.apk`、またはポータブル版の展開先 |
+| インストール済みAPK | `%LOCALAPPDATA%\Win.apk\library` |
+| 変換済みコードとアプリ情報 | `%LOCALAPPDATA%\Win.apk\apps\<app>` |
+| Androidアプリの保存データ | `%LOCALAPPDATA%\Win.apk\android` |
+| ログ | `%LOCALAPPDATA%\Win.apk\logs` |
+| ストア情報 | `%LOCALAPPDATA%\Win.apk\store` |
+| 設定 | `HKEY_CURRENT_USER\Software\Win.apk` |
 
-## System requirements
+アプリを削除しても保存データを保持する操作があります。完全に削除する場合は、対象データの場所を確認してから削除してください。
 
-| | |
+## ソースからのビルド
+
+### 前提条件
+
+- MSYS2
+- **MSYS2 UCRT64**シェル
+- Git、Make、CMake、Ninja
+- UCRT64 GCC / G++ツールチェーン
+- UCRT64 Clang
+- JDK
+- UCRT64版GStreamer開発環境
+
+### 基本ビルド
+
+```bash
+./build.sh
+```
+
+実行権限が失われている場合は次を使用します。
+
+```bash
+bash build.sh
+```
+
+`MSYSTEM`は必ず`UCRT64`であることを確認してください。
+
+```bash
+printf '%s\n' "$MSYSTEM"
+```
+
+CLANG64、MINGW64など別環境で作成したビルドディレクトリやDLLを再利用しないでください。ABIの異なる成果物の混在は、起動失敗、プラグイン読み込み失敗、音声・描画ブリッジの不整合につながります。
+
+## 主な環境変数
+
+| 変数 | 内容 |
 |---|---|
-| **macOS 26.4 (Tahoe) or newer** | Required. macOS 27 works from v1.0.1702 |
-| **Apple Silicon** | Any Apple Silicon Mac, including MacBook Neo. Intel Macs are not supported |
-| **Disk** | ~280 MB for Mac.apk. Each installed app takes roughly 1.5 to 3 times its APK size |
+| `WINAPK_PHONE_SIZE=1270x720` | Androidアプリが認識する画面サイズ |
+| `MACAPK_LETTERBOX=0` | アスペクト比固定を解除し、ウィンドウ全面へストレッチ |
+| `MACAPK_GSTREAMER_PRESENT=0` | GStreamerプレゼンターを無効化し、Win32経路を使用 |
+| `GST_PLUGIN_PATH` | GStreamerプラグインの探索先 |
+| `GST_PLUGIN_SYSTEM_PATH` | システムプラグイン探索先 |
+| `GST_PLUGIN_SCANNER` | GStreamerプラグインスキャナー |
+| `GST_REGISTRY` | 事前生成したGStreamerレジストリキャッシュ |
+| `WINAPK_HEADLESS=1` | ウィンドウなしでテスト実行 |
+| `WINAPK_HEADLESS_FRAME=frame.bmp` | 最終描画フレームを保存 |
 
-## Quick start
+## リポジトリ構成
 
-1. Download the disk image from the [Releases page](../../releases/latest) and drag
-   **Mac.apk** into **Applications**. It is signed and notarized by Apple, so it opens
-   normally.
-2. Open Mac.apk and click **Install** next to **Runtime:** in the top left.
-3. Open **Settings** (the gear), find **File types**, click **Make Default**, and
-   approve the macOS prompt.
-4. Double-click any `.apk` (or `.apkm`, `.xapk`, `.apks`, `.apkx`), or drag it onto
-   the Mac.apk window.
+| パス | 内容 |
+|---|---|
+| `windows/` | Windowsホスト、JNI、ランチャー、パッケージ、テスト |
+| `windows/host/` | GStreamer、音声、CD、ユーザーフォルダ、入力などのWindowsブリッジ |
+| `runtime/` | Android Javaフレームワークと共通ネイティブコード |
+| `docs/` | 実装資料、検証記録、画像 |
+| `.github/workflows/` | Windowsビルド、互換性検査、リリース処理 |
 
-![Installing an Android app in four steps: pick an app, confirm, it becomes a Mac app, first launch](images/installing-an-app.png)
+## クレジット
 
-**The first launch of any app is slow** (up to a minute for a large one) while
-Mac.apk prepares it. Later launches are fast. Full details, updating, and the app
-stores are in the [Installation](https://github.com/kksimp/Mac.apk/wiki/Installation) and
-[App stores](https://github.com/kksimp/Mac.apk/wiki/App-Stores) pages.
+Win.apkは、Kaleb Simpson / VoltareによるMac.apkの移植を起点とし、Androidランタイムの一部を同プロジェクトから継承しています。本エディションはMac.apkプロジェクトから承認または推奨された製品ではありません。
 
-> [!NOTE]
-> Each app's data lives in `~/Library/Application Support/MacApk/<package>`, not
-> inside its `.app`. Dragging an app to the Trash leaves that data behind; **Uninstall**
-> in the Mac.apk window cleans it up and can keep your saves for a reinstall.
-> [More →](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps)
+主な外部コンポーネントには、ANGLE、Eclipse Temurin、GStreamerなどがあります。詳細は`THIRD_PARTY_NOTICES.txt`を確認してください。
 
-## Known issues in v1.0.2303
+## ライセンス
 
-See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
-[compatibility list](COMPATIBILITY.md) for every app tested by hand.
-
-## Reporting problems
-
-Send the Mac.apk version, your macOS version, the app and where you got it, what
-happened, and the app's log from `~/Library/Logs/macapk/` to Kaleb@voltare.us or
-[open an issue](../../issues/new). Look the log over before posting it publicly.
-[What to include →](https://github.com/kksimp/Mac.apk/wiki/Reporting-Problems)
-
-## Source code
-
-Everything that makes Mac.apk work is in this repository: the Android framework
-reimplementation, the native runtime, the arm64 loader and Bionic shim, the ARM32
-recompiler and the macOS app. [BUILDING.md](BUILDING.md) explains how to build it, and
-[CONTRIBUTING.md](CONTRIBUTING.md) how to send a fix. App reports are just as useful
-as code.
-
-## Developers and publishers
-
-Mac.apk serves no ads and supports no in-app purchases, by design. If you publish an
-app that runs on Mac.apk and want to talk about a partnership, or would rather it
-not run here, email Kaleb@voltare.us. [Details →](https://github.com/kksimp/Mac.apk/wiki/For-Developers-and-Publishers)
-
-## License
-
-Mac.apk is **open source under the [GNU AGPL v3.0](LICENSE)**, and a **commercial
-license** is available for companies that want to ship or offer it without the AGPL's
-terms. Using the official app is free. Details: [COMMERCIAL.md](COMMERCIAL.md). The
-Mac.apk name and logo are covered separately in [TRADEMARKS.md](TRADEMARKS.md).
-
-## Disclaimer
-
-Mac.apk is provided "as is", with no warranty of any kind. You are responsible for the
-Android apps you choose to load, and Voltare cannot test, audit, or vouch for any
-third-party APK. Voltare is not liable for damages, data loss, malware, security
-incidents, copyright disputes, or any other consequence of code that runs through
-Mac.apk.
-
-**Only install APKs you trust.** An Android app running under Mac.apk runs as ordinary
-native code with your macOS user account's permissions. There is no phone-style app
-sandbox around it: it can read and write your files the same way any Mac app you run
-can. Treat an APK exactly as you would any program you download and run yourself, and
-get it from a source you trust.
-
-## Third-party software
-
-Mac.apk bundles several open-source components (ANGLE, MoltenVK and the Vulkan loader,
-Capstone, libpng, libvpx, stb_vorbis, Bouncy Castle, a JRE built from OpenJDK together
-with the libraries its font and image code uses, such as FreeType, HarfBuzz and GLib,
-and the Android platform resources built from AOSP source). Each is used under its own
-licence; the full notices are in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt),
-and a copy ships inside the app at `Contents/Resources/THIRD_PARTY_NOTICES.txt`.
-
-Two of them, GLib and GNU gettext's libintl, are licensed under the LGPL. Their
-complete source for the exact versions in each release (upstream source, patches and
-build recipe) is attached to that release on the
-[Releases page](https://github.com/kksimp/Mac.apk/releases), with
-`LGPL-SOURCE-README.txt` explaining how to use a modified build.
-
-## Links
-
-- **Project page:** https://projects.voltare.us/macapk
-- **Wiki:** https://github.com/kksimp/Mac.apk/wiki
-- **Commercial licensing:** Kaleb@voltare.us
-- **Bug reports:** Kaleb@voltare.us or [open an issue](../../issues/new)
+[AGPL-3.0](LICENSE)

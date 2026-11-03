@@ -81,152 +81,10 @@ public final class SharedStorage {
 
     /** Host directory of the primary shared-storage volume: what /sdcard and
      *  /storage/emulated/0 name on a device, and what
-     *  Environment.getExternalStorageDirectory() returns. For an installed app
-     *  on the app-data layout, after Boot's adoptCanonicalVolume, the ONE path
-     *  every app shares (canonicalVolumePath); otherwise this app's own volume,
-     *  <root>/sdcard. Does not create anything. */
+     *  Environment.getExternalStorageDirectory() returns. <root>/sdcard until
+     *  stage S3. Does not create anything. */
     public static File externalStorageRoot() {
-        File c = sCanonicalVolume;
-        return c != null ? c : appVolume();
-    }
-
-    /** This app's own volume, <root>/sdcard: its private Android/ and, on the
-     *  app-data layout, links to the shared volume's top-level entries. Every
-     *  device path native code names (/sdcard/...) reached it before stage S3,
-     *  and app paths saved before it still do. */
-    public static File appVolume() {
         return new File(androidRoot(), "sdcard");
-    }
-
-    // ---- one volume path for every app (owner 2026-10-20: "yes i think it
-    // should be shared like a phone") -----------------------------------------
-    //
-    // On a device every app names the primary volume /storage/emulated/0, so a
-    // path one app hands another names the same file: a frontend (iiSU, ES-DE,
-    // Daijisho) builds RetroArch's CONFIGFILE from ITS OWN
-    // getExternalStorageDirectory() plus "Android/data/com.retroarch/files/...".
-    // Here each app's volume was its own bundle path, so that string named a
-    // folder inside the frontend's storage (measured 2026-10-19,
-    // app_com.retroarch log). So every installed app on the app-data layout now
-    // gets ONE host path for its volume, P = ~/Library/Caches/MacApk/storage/
-    // emulated/0, a link to the shared volume MacApk/sdcard.
-    //  - P is space-free and has no ".apk" (both break guests:
-    //    BundleGenerator.apkSafeDirName), unlike the shared volume's real path
-    //    ("Application Support"). It is only a LINK, so a cache purge that
-    //    removes it loses nothing; the next launch recreates it.
-    //  - Android/{data,obb,media}/<pkg> under P must be the app's OWN private
-    //    folder, as on a device: the shared volume gets one link per kind for the
-    //    app being launched, to MacApk/<pkg>/sdcard/Android/<kind>/<pkg>. Native
-    //    code reaches the same folder without it (the shim folds
-    //    <P>/Android/{data,obb,media} into the app-private root).
-    //  - Native /sdcard/... follows: __macapk_set_shared_storage_root(P), the
-    //    shim's stage-S3 setter, so a folder native code creates at the top of the
-    //    volume is shared too.
-    //  - Paths an app saved before (inside <App>.app/Contents/android/sdcard) keep
-    //    working: that volume's top-level entries are links into the shared one.
-    // MACAPK_STORAGE_ONE_PATH=0 restores per-app volume paths exactly.
-    private static volatile File sCanonicalVolume;
-
-    public static boolean onePathEnabled() {
-        String e = System.getenv("MACAPK_STORAGE_ONE_PATH");
-        return e == null || e.isEmpty() || e.charAt(0) != '0';
-    }
-
-    /** P, the one volume path every installed app shares (see above). */
-    public static File canonicalVolumePath() {
-        return new File(HOST_HOME, "Library/Caches/MacApk/storage/emulated/0");
-    }
-
-    /** Boot step, after linkSharedVolume: switch this installed app's volume to
-     *  P. @return P, or null when nothing changed. Never throws. */
-    public static synchronized File adoptCanonicalVolume() {
-        if (!onePathEnabled() || !sharedVolumeEnabled()) return null;
-        try {
-            String[] id = SpecialAccessStore.selfIdentity();
-            if (id == null) return null;            // not an installed bundle
-            File p = adoptCanonicalVolume(appVolume(), id[1]);
-            if (p != null) {
-                try {
-                    NativeCocoa.setSharedStorageRoot(p.getPath());
-                } catch (Throwable t) {
-                    // An older runtime binary without the setter: native /sdcard
-                    // keeps naming this app's volume, which links into the same
-                    // shared folders, so only a NEW top-level folder native code
-                    // creates stays the app's own until its next launch.
-                    logQuiet("native shared root not set: " + t);
-                }
-            }
-            return p;
-        } catch (Throwable t) {
-            NativeLog.w(TAG, "adoptCanonicalVolume failed: " + t);
-            return null;
-        }
-    }
-
-    /** The mechanism, for a given app volume (the offline gate drives it). */
-    static File adoptCanonicalVolume(File appVol, String pkg) {
-        if (!onePathEnabled() || !sharedVolumeEnabled()) return null;
-        java.nio.file.Path shared = sharedVolumeFor(appVol);
-        if (shared == null) return null;           // not the app-data layout
-        final java.nio.file.LinkOption NF = java.nio.file.LinkOption.NOFOLLOW_LINKS;
-        java.nio.file.Path p = canonicalVolumePath().toPath();
-        String ps = p.toString();
-        if (ps.indexOf(' ') >= 0 || ps.contains(".apk")) {
-            logQuiet("one volume path: " + p + " has a space or \".apk\"; keeping per-app paths");
-            return null;
-        }
-        java.nio.file.Path lockFile = shared.getParent().resolve(".sdcard.lock");
-        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(lockFile,
-                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
-             java.nio.channels.FileLock lk = ch.lock()) {
-            java.nio.file.Path real;
-            try {
-                real = appVol.toPath().toRealPath();
-            } catch (Throwable t) {
-                return null;
-            }
-            // P -> the shared volume. P sits in our own cache folder, so a link
-            // there naming anything else is a leftover of ours and is replaced;
-            // a real folder there is not ours to remove, and the app keeps its
-            // own path.
-            java.nio.file.Files.createDirectories(p.getParent());
-            if (java.nio.file.Files.isSymbolicLink(p)) {
-                if (!java.nio.file.Files.readSymbolicLink(p).equals(shared)) {
-                    java.nio.file.Files.delete(p);
-                    java.nio.file.Files.createSymbolicLink(p, shared);
-                }
-            } else if (java.nio.file.Files.exists(p, NF)) {
-                logQuiet("one volume path: " + p + " is not a link; keeping per-app paths");
-                return null;
-            } else {
-                java.nio.file.Files.createSymbolicLink(p, shared);
-            }
-            // <shared>/Android/<kind>/<pkg> -> this app's own private folder. The
-            // target is created first: a mkdirs through a dangling link fails.
-            for (String kind : new String[] { "data", "obb", "media" }) {
-                java.nio.file.Path own = real.resolve("Android").resolve(kind).resolve(pkg);
-                java.nio.file.Files.createDirectories(own);
-                java.nio.file.Path dir = shared.resolve("Android").resolve(kind);
-                java.nio.file.Files.createDirectories(dir);
-                java.nio.file.Path link = dir.resolve(pkg);
-                if (java.nio.file.Files.isSymbolicLink(link)) {
-                    if (java.nio.file.Files.readSymbolicLink(link).equals(own)) continue;
-                    java.nio.file.Files.delete(link);
-                } else if (java.nio.file.Files.exists(link, NF)) {
-                    // Real content in the SHARED Android/ (an app wrote there
-                    // before its link existed): leave it, and say so.
-                    logQuiet("one volume path: " + link + " is a real folder; left alone");
-                    continue;
-                }
-                java.nio.file.Files.createSymbolicLink(link, own);
-            }
-        } catch (Throwable t) {
-            logQuiet("one volume path: " + t);
-            return null;
-        }
-        sCanonicalVolume = p.toFile();
-        logQuiet("one volume path: " + p + " -> " + shared + " (Android/*/" + pkg + " -> own)");
-        return sCanonicalVolume;
     }
 
     // ---- real Mac folders (owner reversal 2026-09-28) ------------------------
@@ -279,13 +137,9 @@ public final class SharedStorage {
      *  /sdcard/Pictures -> / (or -> anywhere) and have a walker follow it. */
     public static boolean isRecognizedFolderLink(File link) {
         String name = link.getName();
-        // A shared-volume link (linkSharedVolume): exactly "../../sdcard/<name>".
-        try {
-            java.nio.file.Path t = java.nio.file.Files.readSymbolicLink(link.toPath());
-            if (t.equals(java.nio.file.Paths.get("..", "..", SHARED_VOLUME_DIR, name))) return true;
-        } catch (Throwable ignored) { }
         for (String[] m : USER_FOLDER_MAP) {
             if (!m[0].equals(name)) continue;
+            if (!java.nio.file.Files.isSymbolicLink(link.toPath())) return isHostFolderMapping(link);
             try {
                 java.nio.file.Path target = java.nio.file.Files.readSymbolicLink(link.toPath());
                 return target.equals(new File(HOST_HOME, m[1]).toPath());
@@ -294,6 +148,138 @@ public final class SharedStorage {
             }
         }
         return false;
+    }
+
+    // ---- the Windows host's junctions (Win.apk) ------------------------------
+    //
+    // On Windows the host maps the same five folders before the JVM starts
+    // (windows/host/user_folders.cpp), with directory junctions: a symlink
+    // needs Developer Mode or an administrator there, a junction does not.
+    // Java reports a junction as a plain directory (isSymbolicLink false,
+    // readSymbolicLink throws), so without the code below MediaStore would
+    // walk the user's whole Downloads as a volume folder, with no privacy
+    // filter and no cache, and a recursive walk or delete would follow any
+    // junction inside it. The host names what it mapped in
+    // WINAPK_USER_FOLDER_TARGETS ("Download=C:\Users\me\Downloads|..."); its
+    // presence also means the host owns the mapping (mapUserFolders).
+
+    private static volatile java.util.Map<String, String> sHostTargets;
+
+    /** WINAPK_USER_FOLDER_TARGETS as volume name -> host folder, or null when
+     *  the host set none (the Mac, or a run on a scratch data folder). */
+    static java.util.Map<String, String> hostFolderTargets() {
+        java.util.Map<String, String> m = sHostTargets;
+        if (m == null) {
+            m = new java.util.HashMap<>();
+            String e = System.getenv("WINAPK_USER_FOLDER_TARGETS");
+            if (e != null) {
+                for (String part : e.split("\\|")) {
+                    int eq = part.indexOf('=');
+                    if (eq > 0 && eq < part.length() - 1) m.put(part.substring(0, eq), part.substring(eq + 1));
+                }
+            }
+            sHostTargets = m;
+        }
+        return m.isEmpty() ? null : m;
+    }
+
+    /** True when the host, not this class, maps the user's folders. */
+    static boolean hostMapsUserFolders() {
+        return File.separatorChar == '\\' || System.getenv("WINAPK_USER_FOLDER_TARGETS") != null;
+    }
+
+    /** True when `f`, a root-level volume entry, is one of the host's
+     *  junctions: a name the host reported, resolving to exactly the folder it
+     *  reported (toRealPath follows a junction). */
+    public static boolean isHostFolderMapping(File f) {
+        java.util.Map<String, String> m = hostFolderTargets();
+        if (m == null) return false;
+        String target = m.get(f.getName());
+        if (target == null || !isJunction(f.toPath())) return false;
+        try {
+            return f.toPath().toRealPath().equals(java.nio.file.Paths.get(target).toRealPath());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** True for a directory junction (or another directory reparse point that
+     *  is not a symlink): HotSpot on Windows reports one as isDirectory() AND
+     *  isOther() when links are not followed. Always false on the Mac. */
+    public static boolean isJunction(java.nio.file.Path p) {
+        try {
+            java.nio.file.attribute.BasicFileAttributes a = java.nio.file.Files.readAttributes(p,
+                    java.nio.file.attribute.BasicFileAttributes.class, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            return a.isDirectory() && a.isOther();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** True when `p` is a link a walk or a delete must not descend: a symlink,
+     *  or a junction that leads somewhere other than where it stands. OneDrive's
+     *  cloud placeholders are reparse points too but resolve to themselves, so
+     *  they stay real folders. `a` is p's attributes read without following
+     *  links (a walk has them), or null to read them here. */
+    public static boolean isLink(java.nio.file.Path p, java.nio.file.attribute.BasicFileAttributes a) {
+        try {
+            if (a == null) {
+                a = java.nio.file.Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes.class,
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            }
+            if (a.isSymbolicLink()) return true;
+            if (!a.isDirectory() || !a.isOther()) return false;
+            java.nio.file.Path parent = p.toAbsolutePath().getParent();
+            if (parent == null) return false;
+            return !p.toRealPath().toString().equalsIgnoreCase(
+                    parent.toRealPath().resolve(p.getFileName().toString()).toString());
+        } catch (Throwable t) {
+            return true;                            // cannot tell: do not follow it
+        }
+    }
+
+    /** Breadth-first walk of a folder the host mapped, for MediaStore's scan
+     *  and StorageStatsManager's size: shallow files first, at most `limit`
+     *  of them (Long.MAX_VALUE: all). A user's Downloads can hold whole source
+     *  trees (measured: 495,000 files, 6,000 of them in its top two levels), so
+     *  an unbounded scan there stalls every MediaStore query; breadth first
+     *  keeps what the user sees in the folder. Skips names starting with ".",
+     *  Windows hidden or system entries (desktop.ini) and links, and descends
+     *  only where `enter` agrees. Entries come with the attributes the
+     *  directory listing already read, so a file costs no extra system call.
+     *  Lambdas, not visitor classes: a new framework class moves FRAMEWORK_ID.
+     *  @return how many files were passed to onFile. Never throws. */
+    public static long walkHostFolder(java.nio.file.Path top, long limit,
+            java.util.function.Predicate<java.nio.file.Path> enter,
+            java.util.function.BiConsumer<java.nio.file.Path, java.nio.file.attribute.BasicFileAttributes> onFile) {
+        java.util.ArrayDeque<java.nio.file.Path> dirs = new java.util.ArrayDeque<>();
+        dirs.add(top);
+        long[] n = {0};
+        while (!dirs.isEmpty() && n[0] < limit) {
+            java.nio.file.Path dir = dirs.poll();
+            // maxDepth 1: the listing's own entries only, each with the
+            // attributes FindNextFile returned (FileTreeWalker uses them as is).
+            try (java.util.stream.Stream<java.nio.file.Path> s = java.nio.file.Files.find(dir, 1, (p, a) -> {
+                if (p.equals(dir) || n[0] >= limit) return false;
+                if (p.getFileName().toString().startsWith(".")) return false;
+                if (a instanceof java.nio.file.attribute.DosFileAttributes) {
+                    java.nio.file.attribute.DosFileAttributes d = (java.nio.file.attribute.DosFileAttributes) a;
+                    if (d.isHidden() || d.isSystem()) return false;
+                }
+                if (a.isDirectory()) {
+                    if (!isLink(p, a) && enter.test(p)) dirs.add(p);
+                } else if (a.isRegularFile()) {
+                    n[0]++;
+                    onFile.accept(p, a);
+                }
+                return false;
+            })) {
+                s.forEach(p -> { });
+            } catch (Throwable t) {
+                // An unreadable folder (access denied) is skipped, as listFiles() == null is.
+            }
+        }
+        return n[0];
     }
 
     /** Volume folder name -> folder under the host home. DCIM: see above. */
@@ -307,59 +293,10 @@ public final class SharedStorage {
 
     /** MACAPK_USER_FOLDERS, default ON. =0 creates and refreshes no mapping and
      *  moves nothing (links made by an earlier launch are left as they are:
-     *  removing one would hide the files it reaches). When the variable is not
-     *  set, the Settings switch decides (userFoldersOffFile). */
+     *  removing one would hide the files it reaches). */
     public static boolean userFoldersEnabled() {
         String e = System.getenv("MACAPK_USER_FOLDERS");
-        if (e != null && !e.isEmpty()) return e.charAt(0) != '0';
-        return !userFoldersSettingOff();
-    }
-
-    /** The Settings switch (Mac.apk Settings > App data, owner 2026-10-20: "map
-     *  the android downloads folder to macos downloads folder"): this file's
-     *  presence turns the mapping OFF for every app, and unlike
-     *  MACAPK_USER_FOLDERS=0 the next launch then UNMAPS (unmapUserFolders), so
-     *  the switch visibly does what it says. It is a file the launcher writes,
-     *  not an env var, because a Dock-launched app gets no environment from the
-     *  launcher (same reason as space-tap.properties). */
-    public static File userFoldersOffFile() {
-        return new File(HOST_HOME, "Library/Application Support/Mac.apk/user-folders-off");
-    }
-
-    /** True when the Settings switch is OFF and nothing overrides it: an explicit
-     *  MACAPK_USER_FOLDERS (gates pin it), or MACAPK_USER_FOLDERS_SETTING=0,
-     *  which ignores the switch (the gate's positive control). */
-    static boolean userFoldersSettingOff() {
-        String e = System.getenv("MACAPK_USER_FOLDERS");
-        if (e != null && !e.isEmpty()) return false;
-        if ("0".equals(System.getenv("MACAPK_USER_FOLDERS_SETTING"))) return false;
-        return userFoldersOffFile().exists();
-    }
-
-    /** Settings OFF: each of OUR links (name AND exact target from
-     *  USER_FOLDER_MAP) becomes an empty folder of the volume again. Only the
-     *  link goes; every file stays in the Mac folder it was always in. A link
-     *  Mac.apk did not make, and a real folder, are left alone. Turning the
-     *  switch back on maps again, moving in whatever the app saved meanwhile
-     *  (mapUserFolders' no-clobber merge). @return links removed. */
-    static int unmapUserFolders(File volume) {
-        java.nio.file.Path vol = volume.toPath();
-        int n = 0;
-        for (String[] m : USER_FOLDER_MAP) {
-            java.nio.file.Path link = vol.resolve(m[0]);
-            java.nio.file.Path target = new File(HOST_HOME, m[1]).toPath();
-            try {
-                if (!java.nio.file.Files.isSymbolicLink(link)
-                        || !java.nio.file.Files.readSymbolicLink(link).equals(target)) continue;
-                java.nio.file.Files.delete(link);
-                java.nio.file.Files.createDirectory(link);
-                n++;
-                logQuiet("unmapped " + link + " (Settings: Mac folders off); its files stay in " + target);
-            } catch (Throwable t) {
-                logQuiet("unmapping " + m[0] + " failed: " + t);
-            }
-        }
-        return n;
+        return e == null || e.isEmpty() || e.charAt(0) != '0';
     }
 
     /** Where every move the mapping makes is recorded (src TAB dst), so the
@@ -393,11 +330,15 @@ public final class SharedStorage {
      *
      *  @return links created this call, or -1 when nothing ran. Never throws. */
     public static synchronized int mapUserFolders() {
-        if (!userFoldersEnabled() && !userFoldersSettingOff()) return -1;
+        if (!userFoldersEnabled()) return -1;
+        // Win.apk: the host made junctions before the JVM started. This code
+        // would see each as a real folder and "merge" the user's folder into
+        // itself, renaming every file in it.
+        if (hostMapsUserFolders()) return -1;
         try {
             String[] id = SpecialAccessStore.selfIdentity();
             if (id == null) return -1;              // not an installed bundle
-            return mapUserFolders(appVolume(), id[1]);
+            return mapUserFolders(externalStorageRoot(), id[1]);
         } catch (Throwable t) {
             NativeLog.w(TAG, "mapUserFolders failed: " + t);
             return -1;
@@ -407,10 +348,6 @@ public final class SharedStorage {
     /** The mapping itself, for a given volume root (the offline gate drives it
      *  directly). `pkg` names the app in collision suffixes. */
     static int mapUserFolders(File volume, String pkg) {
-        if (userFoldersSettingOff()) {
-            unmapUserFolders(volume);
-            return -1;
-        }
         if (!userFoldersEnabled()) return -1;
         java.nio.file.Path vol = volume.toPath();
         volume.mkdirs();
@@ -422,6 +359,10 @@ public final class SharedStorage {
             try {
                 if (!java.nio.file.Files.isDirectory(target)) {
                     logQuiet("user folder " + target + " missing; " + m[0] + " stays in the volume");
+                    continue;
+                }
+                if (isJunction(link)) {
+                    logQuiet("left alone: " + link + " is a junction (the Windows host's)");
                     continue;
                 }
                 if (java.nio.file.Files.isSymbolicLink(link)) {
@@ -631,7 +572,7 @@ public final class SharedStorage {
         try {
             File marker = defaultFoldersMarker();
             if (marker.exists()) return -1;
-            File volume = appVolume();
+            File volume = externalStorageRoot();
             volume.mkdirs();
             if (!volume.isDirectory()) {
                 NativeLog.w(TAG, "shared storage root unusable, default folders skipped: "
@@ -656,179 +597,5 @@ public final class SharedStorage {
             NativeLog.w(TAG, "ensureDefaultFolders failed: " + t);
             return -1;
         }
-    }
-
-    // ---- ONE shared volume for every installed app (2026-10-19) ---------------
-    //
-    // docs/shared-sdcard-plan_2026-10-19.md, built on the app-data layout of
-    // v1.0.2251 (launcher/InstallCore.swift AppDataLayout): an installed app's
-    // android root is <App>.app/Contents/android, a link to
-    // ~/Library/Application Support/MacApk/<package>/. On a device every app sees
-    // the SAME primary volume (/storage/emulated/0); here each app had its own
-    // <root>/sdcard. The shared volume is MacApk/sdcard, a sibling of the app
-    // folders (a package name always has a dot, so it never collides).
-    //
-    // How an app reaches it: the app keeps <root>/sdcard as its volume path (so a
-    // guest is never handed the real Application Support path, which has a
-    // space), and each top-level entry of the shared volume appears in it as a
-    // RELATIVE link "../../sdcard/<name>". Java File/NIO and native code
-    // (bionic_shim.cpp maps /sdcard/... to <root>/sdcard/...) then name the same
-    // directory with no translation on either side, the same mechanism as the
-    // real-Mac-folder links above. Android/ stays a real folder of the app's own
-    // volume: Android/{data,obb,media}/<pkg> remain private to the app.
-    //
-    // A real top-level folder the app already has with content is MOVED into the
-    // shared volume at launch (default since the owner's 2026-10-20 answer;
-    // MACAPK_SHARED_SDCARD_MIGRATE=0 keeps it the app's own, where it hides the
-    // shared entry of that name): moveNoClobber, never replacing, every move
-    // journalled, then the link. An EMPTY folder (the default folders
-    // ensureDefaultFolders made) holds no data, so it is replaced by the link.
-    // A new top-level folder an app creates during a run is shared at once when
-    // it goes through the one volume path (adoptCanonicalVolume), else at the
-    // app's next launch.
-    // MACAPK_SHARED_SDCARD=0 restores per-app volumes exactly (no links made).
-
-    static final String SHARED_VOLUME_DIR = "sdcard";
-
-    public static boolean sharedVolumeEnabled() {
-        String e = System.getenv("MACAPK_SHARED_SDCARD");
-        return e == null || e.isEmpty() || e.charAt(0) != '0';
-    }
-
-    /** Default ON since the owner's answer (2026-10-20, "yes i think it should
-     *  be shared like a phone"): an app's own top-level folders move into the
-     *  shared volume at its launch, never replacing anything (moveNoClobber),
-     *  every move journalled. MACAPK_SHARED_SDCARD_MIGRATE=0 keeps them the
-     *  app's own. */
-    static boolean sharedVolumeMigrate() {
-        String e = System.getenv("MACAPK_SHARED_SDCARD_MIGRATE");
-        return e == null || e.isEmpty() || e.charAt(0) != '0';
-    }
-
-    /** The shared volume for an app volume on the app-data layout
-     *  (<...>/MacApk/<pkg>/sdcard resolved), else null. */
-    static java.nio.file.Path sharedVolumeFor(File appVolume) {
-        try {
-            java.nio.file.Path real = appVolume.toPath().toRealPath();
-            java.nio.file.Path appDir = real.getParent();
-            java.nio.file.Path macapk = appDir != null ? appDir.getParent() : null;
-            if (macapk == null || macapk.getFileName() == null
-                    || !"MacApk".equals(macapk.getFileName().toString())) {
-                return null;
-            }
-            if (!real.getFileName().toString().equals("sdcard")) return null;
-            return macapk.resolve(SHARED_VOLUME_DIR);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /** Boot step (after mapUserFolders / ensureDefaultFolders): link the shared
-     *  volume into this installed app's own volume. @return links made, or -1
-     *  when nothing ran. Never throws. */
-    public static synchronized int linkSharedVolume() {
-        if (!sharedVolumeEnabled()) return -1;
-        try {
-            String[] id = SpecialAccessStore.selfIdentity();
-            if (id == null) return -1;              // not an installed bundle
-            return linkSharedVolume(appVolume(), id[1]);
-        } catch (Throwable t) {
-            NativeLog.w(TAG, "linkSharedVolume failed: " + t);
-            return -1;
-        }
-    }
-
-    /** The mechanism, for a given app volume (the offline gate drives it). */
-    static int linkSharedVolume(File appVolume, String pkg) {
-        if (!sharedVolumeEnabled()) return -1;
-        java.nio.file.Path shared = sharedVolumeFor(appVolume);
-        if (shared == null) return -1;              // not the app-data layout
-        final java.nio.file.LinkOption NF = java.nio.file.LinkOption.NOFOLLOW_LINKS;
-        java.nio.file.Path mine;
-        try {
-            mine = appVolume.toPath().toRealPath();
-        } catch (Throwable t) {
-            return -1;
-        }
-        java.nio.file.Path lockFile = shared.getParent().resolve(".sdcard.lock");
-        int linked = 0;
-        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(lockFile,
-                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
-             java.nio.channels.FileLock lk = ch.lock()) {
-            java.nio.file.Files.createDirectories(shared);
-            // The shared volume's own first-time layout, under the same lock that
-            // every app's launch takes: the real-Mac-folder links, then AOSP's
-            // default folders once (marker outside the volume).
-            mapUserFolders(shared.toFile(), pkg);
-            java.nio.file.Path marker = shared.getParent().resolve(".sdcard-default-folders");
-            if (!java.nio.file.Files.exists(marker)) {
-                for (String n : defaultFolderNames()) {
-                    if (n == null || n.isEmpty()) continue;
-                    java.nio.file.Path f = shared.resolve(n);
-                    if (!java.nio.file.Files.exists(f, NF)) java.nio.file.Files.createDirectories(f);
-                }
-                java.nio.file.Files.write(marker, new byte[] { '1' });
-            }
-            // Optional migration: this app's own top-level folders into the
-            // shared volume, never replacing anything there.
-            if (sharedVolumeMigrate()) {
-                java.util.List<java.nio.file.Path> own = new java.util.ArrayList<>();
-                try (java.nio.file.DirectoryStream<java.nio.file.Path> ds =
-                             java.nio.file.Files.newDirectoryStream(mine)) {
-                    for (java.nio.file.Path p : ds) own.add(p);
-                }
-                for (java.nio.file.Path p : own) {
-                    String n = p.getFileName().toString();
-                    if (n.equals("Android") || java.nio.file.Files.isSymbolicLink(p)) continue;
-                    if (!java.nio.file.Files.isDirectory(p, NF)) continue;
-                    java.nio.file.Path there = shared.resolve(n);
-                    if (!java.nio.file.Files.exists(there, NF)) {
-                        java.nio.file.Files.move(p, there);   // one rename, same volume
-                        journal(p, there);
-                    } else if (java.nio.file.Files.isDirectory(there) && mergeInto(p, there, pkg)) {
-                        removeEmptyTree(p);
-                    }
-                }
-            }
-            // Link each shared top-level entry into this app's volume.
-            java.util.List<java.nio.file.Path> entries = new java.util.ArrayList<>();
-            try (java.nio.file.DirectoryStream<java.nio.file.Path> ds =
-                         java.nio.file.Files.newDirectoryStream(shared)) {
-                for (java.nio.file.Path p : ds) entries.add(p);
-            }
-            for (java.nio.file.Path e : entries) {
-                String n = e.getFileName().toString();
-                if (n.equals("Android")) continue;   // per-app, never shared
-                java.nio.file.Path link = mine.resolve(n);
-                java.nio.file.Path rel = java.nio.file.Paths.get("..", "..", SHARED_VOLUME_DIR, n);
-                try {
-                    if (java.nio.file.Files.isSymbolicLink(link)) {
-                        // An app-volume real-folder link (Pictures -> ~/Pictures)
-                        // names the same place as the shared one: replace it so
-                        // every app reaches the volume one way.
-                        java.nio.file.Path cur = java.nio.file.Files.readSymbolicLink(link);
-                        if (cur.equals(rel)) continue;
-                        if (isRecognizedFolderLink(link.toFile()) && java.nio.file.Files.isSymbolicLink(e)) {
-                            java.nio.file.Files.delete(link);
-                        } else {
-                            continue;                // not ours to change
-                        }
-                    } else if (java.nio.file.Files.exists(link, NF)) {
-                        if (!java.nio.file.Files.isDirectory(link, NF) || !removeEmptyTree(link)) {
-                            continue;                // the app's own content: kept
-                        }
-                    }
-                    java.nio.file.Files.createSymbolicLink(link, rel);
-                    linked++;
-                } catch (Throwable t) {
-                    logQuiet("shared volume: linking " + n + " failed: " + t);
-                }
-            }
-            logQuiet("shared volume " + shared + ": " + linked + " link(s) made in " + mine);
-        } catch (Throwable t) {
-            NativeLog.w(TAG, "linkSharedVolume: " + t);
-            return -1;
-        }
-        return linked;
     }
 }

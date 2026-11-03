@@ -162,33 +162,41 @@ public class MediaPlayer implements AudioRouting, VolumeAutomation {
 
     public void start() {
         com.macapk.loader.AudioTrace.hit("MediaPlayer.start");
-        if (handle != 0) {
-            mUserPaused = false;
-            com.macapk.loader.NativeAudio.nativeMpStart(handle);
-            startCompletionWatcher();
-        }
+        if (handle == 0) return;
+        mUserPaused = false;
+        mStartedIntent = true;
+        mPlaybackGeneration++;
+        com.macapk.loader.NativeAudio.nativeMpSetLooping(handle, looping);
+        com.macapk.loader.NativeAudio.nativeMpStart(handle);
+        startCompletionWatcher();
     }
-    // The completion watcher below polls isPlaying(), and the native
-    // macapk_mp_is_playing reports false for PAUSED as well as for STOPPED --
-    // so a pause() used to look exactly like end-of-media: it fired
-    // onCompletion AND auto-started the gapless nextPlayer. AOSP fires
-    // onCompletion only "when the end of a media source is reached". These
-    // flags let the watcher tell a user-initiated stop from a real completion.
-    private volatile boolean mUserPaused;
-    public void pause()  {
+    public void pause() {
         mUserPaused = true;
+        mPlaybackGeneration++;
         if (handle != 0) com.macapk.loader.NativeAudio.nativeMpPause(handle);
+        synchronized (this) { mWatcherLive = false; }
     }
-    public void stop()   {
-        mUserPaused = true;
+    public void stop() {
+        mUserPaused = false;
+        mStartedIntent = false;
+        mPlaybackGeneration++;
         if (handle != 0) com.macapk.loader.NativeAudio.nativeMpStop(handle);
+        synchronized (this) { mWatcherLive = false; }
     }
-    public void reset()  {
+    public void reset() {
         if (handle != 0) com.macapk.loader.NativeAudio.nativeMpStop(handle);
+        mUserPaused = false;
+        mStartedIntent = false;
+        mPlaybackGeneration++;
+        synchronized (this) { mWatcherLive = false; }
         prepared = false;
         pendingSource = null;
     }
     public void release() {
+        mUserPaused = false;
+        mStartedIntent = false;
+        mPlaybackGeneration++;
+        synchronized (this) { mWatcherLive = false; }
         if (handle != 0) { com.macapk.loader.NativeAudio.nativeMpRelease(handle); handle = 0; }
         prepared = false;
         pendingSource = null;
@@ -228,7 +236,18 @@ public class MediaPlayer implements AudioRouting, VolumeAutomation {
     }
     public void setLooping(boolean looping) {
         this.looping = looping;
-        if (handle != 0) com.macapk.loader.NativeAudio.nativeMpSetLooping(handle, looping);
+        if (handle == 0) return;
+        com.macapk.loader.NativeAudio.nativeMpSetLooping(handle, looping);
+        if (looping && mStartedIntent && !mUserPaused) {
+            if (!isPlaying()) {
+                com.macapk.loader.NativeAudio.nativeMpStop(handle);
+                com.macapk.loader.NativeAudio.nativeMpSetLooping(handle, true);
+                com.macapk.loader.NativeAudio.nativeMpSeek(handle, 0);
+                com.macapk.loader.NativeAudio.nativeMpStart(handle);
+                mPlaybackGeneration++;
+            }
+            startCompletionWatcher();
+        }
     }
     public boolean isLooping() { return looping; }
     // AOSP API-21 audio routing config. Mac.apk has one audio output, so
@@ -260,67 +279,61 @@ public class MediaPlayer implements AudioRouting, VolumeAutomation {
     // current track plays.
     public void setNextMediaPlayer(MediaPlayer next) { this.nextPlayer = next; }
 
-    // Best-effort completion firing: poll while playing; when playback stops
-    // on its own (not looping, not user-stopped) fire onCompletion once.
+    // Completion/repeat watcher. A generation token prevents stale watcher
+    // threads from treating pause, stop, reset, or a newer start as EOS.
+    private volatile long mPlaybackGeneration;
     private volatile boolean mWatcherLive;
+    private volatile boolean mStartedIntent;
+    private volatile boolean mUserPaused;
+
     private void startCompletionWatcher() {
-        final OnCompletionListener l = onCompletion;
-        // Watch if there's a completion listener OR a gapless-chained next
-        // player to start. A looping track never completes, so no watcher.
-        if ((l == null && nextPlayer == null) || looping) return;
-        // Every start() -- including a resume from pause -- used to spawn a
-        // fresh watcher, so a track paused and resumed twice had three threads
-        // racing to fire onCompletion once each. Claimed AFTER the checks
-        // above, or an early return would latch the flag and no watcher could
-        // ever start.
-        synchronized (this) { if (mWatcherLive) return; mWatcherLive = true; }
+        if (handle == 0 || !mStartedIntent || mUserPaused) return;
+        synchronized (this) {
+            if (mWatcherLive) return;
+            mWatcherLive = true;
+        }
+        final long generation = mPlaybackGeneration;
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
-                    // Wait until it actually starts, then until it stops.
-                    boolean started = false;
-                    for (int i = 0; i < 50 && !started; i++) {
-                        if (isPlaying()) started = true; else Thread.sleep(20);
+                    boolean observedPlaying = false;
+                    for (int i = 0; i < 100 && generation == mPlaybackGeneration; i++) {
+                        if (isPlaying()) { observedPlaying = true; break; }
+                        Thread.sleep(20);
                     }
-                    while (isPlaying()) Thread.sleep(50);
-                    // Playback stopped -- but WHY? A user pause/stop is not a
-                    // completion. Belt and braces: also require the cursor to
-                    // have reached the end, because a stop can race the flag.
-                    boolean atEnd;
-                    try {
-                        int dur = getDuration(), pos = getCurrentPosition();
-                        atEnd = dur <= 0 || pos >= dur - 250;
-                    } catch (Throwable t) { atEnd = true; }
-                    if (mUserPaused || !atEnd) { mWatcherLive = false; return; }
-                    // Release the single-flight BEFORE the terminal callbacks.
-                    // onCompletion runs INLINE on this thread, and the canonical
-                    // MediaPlayer idiom is to call start() (or seekTo(0);start())
-                    // from inside it for a manual loop or playlist advance. With
-                    // the flag still held, that start() finds mWatcherLive true,
-                    // spawns nothing, and this thread then exits -- leaving a
-                    // PLAYING track with no watcher, so the next completion never
-                    // fires and the playlist stops after one advance.
-                    mWatcherLive = false;
-                    if (started && !looping) {
-                        // Gapless chain: auto-start the next player (AOSP
-                        // setNextMediaPlayer semantics) before notifying.
-                        MediaPlayer np = nextPlayer;
-                        if (np != null) { try { np.start(); } catch (Throwable ignore) {} }
-                        if (l != null) { try { l.onCompletion(MediaPlayer.this); } catch (Throwable ignore) {} }
+                    if (!observedPlaying) return;
+                    while (generation == mPlaybackGeneration && isPlaying()) Thread.sleep(25);
+                    if (generation != mPlaybackGeneration || mUserPaused || !mStartedIntent || handle == 0) return;
+
+                    int duration = getDuration();
+                    int position = getCurrentPosition();
+                    boolean atEnd = duration <= 0 || position >= Math.max(0, duration - 300);
+                    if (!atEnd) return;
+
+                    if (looping) {
+                        // Recreate the native voice deterministically. This also
+                        // handles formats/backends whose completed voice cannot
+                        // be revived by changing its loop counter in place.
+                        com.macapk.loader.NativeAudio.nativeMpStop(handle);
+                        com.macapk.loader.NativeAudio.nativeMpSetLooping(handle, true);
+                        com.macapk.loader.NativeAudio.nativeMpSeek(handle, 0);
+                        com.macapk.loader.NativeAudio.nativeMpStart(handle);
+                        mPlaybackGeneration++;
+                        synchronized (MediaPlayer.this) { mWatcherLive = false; }
+                        startCompletionWatcher();
+                        return;
                     }
+
+                    MediaPlayer next = nextPlayer;
+                    if (next != null) { try { next.start(); } catch (Throwable ignore) {} }
+                    OnCompletionListener listener = onCompletion;
+                    if (listener != null) { try { listener.onCompletion(MediaPlayer.this); } catch (Throwable ignore) {} }
                 } catch (Throwable ignore) {
-                    // Only reachable from the polling code ABOVE the release --
-                    // both app callbacks have their own catch -- so clearing here
-                    // cannot stomp a flag a nested start() re-claimed. Without
-                    // it, an interrupt during the sleep would latch mWatcherLive
-                    // forever and no watcher could start again for this player.
-                    mWatcherLive = false;
+                } finally {
+                    synchronized (MediaPlayer.this) {
+                        if (generation == mPlaybackGeneration) mWatcherLive = false;
+                    }
                 }
-                // NOTE: no `finally { mWatcherLive = false; }` here. Every exit
-                // path above clears it explicitly BEFORE running app code; a
-                // blanket clear in finally would also fire after a nested
-                // start() had legitimately re-claimed the flag, so two watchers
-                // could then run for one player.
             }
         }, "mediaplayer-completion").start();
     }
@@ -366,7 +379,10 @@ public class MediaPlayer implements AudioRouting, VolumeAutomation {
     }
 
     public void setOnPreparedListener(OnPreparedListener l)   { onPrepared = l; }
-    public void setOnCompletionListener(OnCompletionListener l){ onCompletion = l; }
+    public void setOnCompletionListener(OnCompletionListener l) {
+        onCompletion = l;
+        if (l != null && mStartedIntent && !mUserPaused) startCompletionWatcher();
+    }
     public void setOnErrorListener(OnErrorListener l)         { onError = l; }
     public void setOnInfoListener(OnInfoListener l)           { onInfo = l; }
     public interface OnPreparedListener  { void onPrepared(MediaPlayer mp); }

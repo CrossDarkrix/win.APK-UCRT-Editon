@@ -83,16 +83,13 @@ public class Canvas {
         BufferedImage layerImage;  // the offscreen layer drawn into
         float         alpha;       // 0..1 composite alpha
         int           awtRule = AlphaComposite.SRC_OVER; // PorterDuff composite rule (Lottie mattes)
-        java.awt.Shape clipDev; // effective device-space saveLayer clip, including parent clipping
+        java.awt.Rectangle clipDev; // device-space saveLayer bounds to clip a non-SRC_OVER composite to (null = none)
         // MACAPK_FRAMESPEED_LAYER (see LayerPool below): the device rect outside
         // which this layer provably holds only transparent pixels (null = the
         // gate is off: composite the whole layer, as before), and the pool entry
         // the layer image came from (null = allocated the pre-change way).
         java.awt.Rectangle inkDev;
         LayerPool.Entry    pooled;
-        ColorFilter   colorFilter; // captured at saveLayer, applied once to the flattened pixels
-        java.awt.Composite filteredComposite; // destination blend, without paint alpha
-        Shape         filterClipDev; // exact initial clip: filters can make transparent pixels opaque
     }
     private static final Layer NO_LAYER = new Layer();
 
@@ -528,15 +525,8 @@ public class Canvas {
                 // path left it null.
                 pg.setClip(layer.awtRule != AlphaComposite.SRC_OVER ? layer.clipDev
                            : (SAVE_CLIP ? layer.inkDev : null));
-                if (layer.colorFilter != null) {
-                    macapkMarkInk();
-                    filterLayerPixels(layer);
-                    pg.setClip(layer.filterClipDev);
-                    pg.setComposite(layer.filteredComposite);
-                } else {
-                    pg.setComposite(AlphaComposite.getInstance(
-                            layer.awtRule, Math.max(0f, Math.min(1f, layer.alpha))));
-                }
+                pg.setComposite(AlphaComposite.getInstance(
+                        layer.awtRule, Math.max(0f, Math.min(1f, layer.alpha))));
                 pg.drawImage(layer.layerImage, 0, 0, null);
                 pg.setComposite(oldComp);
                 // The layer's pixels are consumed; recycle its image. The ink box
@@ -606,9 +596,14 @@ public class Canvas {
     public int saveLayerAlpha(RectF bounds, int alpha, int saveFlags) {
         return saveLayerAlpha(bounds, alpha);
     }
-    /** Save a flattened group. Paint alpha modulates its pixels BEFORE the color filter;
-     *  the filtered result is then blended onto the parent. Capture the filter now, not
-     *  at restore: callers may mutate both the Paint and mutable filter objects. */
+    /** AOSP Canvas.saveLayer(bounds, paint): the layer alpha comes from the
+     *  paint's alpha (null paint == fully opaque == a plain save). The paint's
+     *  PorterDuff xfermode (if any) selects the composite RULE blended back at
+     *  restore() -- SRC_OVER ordinarily, DST_IN/DST_OUT/SRC_IN/... for Lottie
+     *  mattes/masks. A non-SRC_OVER rule REQUIRES the saveLayer bounds (so the
+     *  composite is clipped to the matte region, not the whole canvas); when the
+     *  bounds are missing/degenerate it falls back to SRC_OVER. (color-filter
+     *  still ignored.) */
     public int saveLayer(float l, float t, float r, float b, Paint paint) {
         int a = (paint != null) ? paint.getAlpha() : 255;
         // v1.0.500: a saveLayer() with explicit bounds + a paint FORCES a real
@@ -622,26 +617,8 @@ public class Canvas {
         // clearCanvas wipe only that offscreen; on restore it composites
         // SRC_OVER and leaves the rest of the frame intact. saveLayerAlpha()
         // (View group-opacity, no clearCanvas) keeps the optimization.
-        ColorFilter filter = paint == null ? null : MacApkDisplayList.snap(paint.getColorFilter());
-        boolean forceLayer = (r > l && b > t) || filter != null;
-        int count = pushLayer(Math.max(0, Math.min(255, a)) / 255f,
-                awtRuleForPaint(paint), l, t, r, b, forceLayer);
-        if (filter != null && g != null && image != null) {
-            Layer layer = layerStack.peek();
-            layer.colorFilter = filter;
-            java.awt.Composite composite = bitmapRuleFor(paint);
-            layer.filteredComposite = composite == null ? AlphaComposite.SrcOver : composite;
-            Shape clip = g.getClip();
-            layer.filterClipDev = clip == null
-                    ? new java.awt.Rectangle(0, 0, image.getWidth(), image.getHeight())
-                    : g.getTransform().createTransformedShape(clip);
-            // Required even with pooling disabled. Only pixels in the initial layer clip
-            // can contribute; a filter with alpha bias must not fill the rest of the canvas.
-            if (layer.inkDev == null) {
-                layer.inkDev = macapkLayerInkBounds(g, image.getWidth(), image.getHeight());
-            }
-        }
-        return count;
+        boolean forceLayer = (r > l && b > t);
+        return pushLayer(Math.max(0, Math.min(255, a)) / 255f, awtRuleForPaint(paint), l, t, r, b, forceLayer);
     }
     public int saveLayer(RectF bounds, Paint paint) {
         if (bounds == null) return saveLayer(0, 0, 0, 0, paint);
@@ -662,24 +639,24 @@ public class Canvas {
     private int pushLayer(float alpha01, int awtRule, float l, float t, float r, float b) {
         return pushLayer(alpha01, awtRule, l, t, r, b, false);
     }
-    /** Layer setup with an explicit Porter-Duff rule. Non-SrcOver rules require an offscreen
-     *  even at full alpha; restore clips their composite to the intersection of the saveLayer
-     *  bounds, the parent clip and the device so a foreground mask cannot erase unrelated UI. */
+    /** Layer setup with an explicit PorterDuff composite rule + saveLayer bounds.
+     *  A non-SRC_OVER rule (Lottie matte) forces a real offscreen buffer even at
+     *  alpha 255 AND captures the device-space bounds so restore() can clip the
+     *  composite to the matte region. If the bounds are degenerate (no rect), the
+     *  non-SRC_OVER rule is unsafe (it would clear the whole canvas), so we fall
+     *  back to SRC_OVER. */
     private int pushLayer(float alpha01, int awtRule, float l, float t, float r, float b, boolean forceLayer) {
         if (g == null || image == null) return save();
-        java.awt.Shape clipDev = null;
+        java.awt.Rectangle clipDev = null;
         if (awtRule != AlphaComposite.SRC_OVER) {
-            java.awt.geom.Area region = new java.awt.geom.Area(
-                new java.awt.Rectangle(0, 0, image.getWidth(), image.getHeight()));
             if (r > l && b > t) {
-                region.intersect(new java.awt.geom.Area(g.getTransform().createTransformedShape(
-                    new java.awt.geom.Rectangle2D.Float(l, t, r - l, b - t))));
+                try {
+                    clipDev = g.getTransform()
+                        .createTransformedShape(new java.awt.geom.Rectangle2D.Float(l, t, r - l, b - t))
+                        .getBounds();
+                } catch (Throwable ignored) { clipDev = null; }
             }
-            java.awt.Shape parentClip = g.getClip();
-            if (parentClip != null) {
-                region.intersect(new java.awt.geom.Area(g.getTransform().createTransformedShape(parentClip)));
-            }
-            clipDev = region;
+            if (clipDev == null) awtRule = AlphaComposite.SRC_OVER; // no bounds -> unsafe to mask; degrade
         }
         // Ordinary SRC_OVER-at-full-alpha degenerates to a plain save() (a real
         // matte never does, because awtRule != SRC_OVER keeps it off this path)
@@ -743,21 +720,17 @@ public class Canvas {
         return txStack.size();
     }
 
-    /** Porter-Duff rule used when restoring a saved layer. Modern BlendMode takes precedence
-     *  over the legacy Xfermode, exactly as it does for primitive/bitmap draws. */
+    /** The Java2D AlphaComposite rule for a saveLayer paint's PorterDuff
+     *  xfermode, or SRC_OVER when there is none / it is not a PorterDuffXfermode.
+     *  Modes with no AWT AlphaComposite equivalent (ADD/MULTIPLY/SCREEN/OVERLAY/
+     *  DARKEN/LIGHTEN) fall back to SRC_OVER. */
     private static int awtRuleForPaint(Paint paint) {
         if (paint == null) return AlphaComposite.SRC_OVER;
         try {
-            android.graphics.BlendMode blendMode = paint.getBlendMode();
-            android.graphics.PorterDuff.Mode m;
-            if (blendMode != null) {
-                m = blendMode.toPorterDuffModeOrNull();
-            } else {
-                android.graphics.Xfermode xm = paint.getXfermode();
-                m = xm instanceof android.graphics.PorterDuffXfermode
-                    ? ((android.graphics.PorterDuffXfermode) xm).getMode() : null;
-            }
-            if (m != null) {
+            android.graphics.Xfermode xm = paint.getXfermode();
+            if (xm instanceof android.graphics.PorterDuffXfermode pdx) {
+                android.graphics.PorterDuff.Mode m = pdx.getMode();
+                if (m == null) return AlphaComposite.SRC_OVER;
                 switch (m) {
                     case CLEAR:    return AlphaComposite.CLEAR;
                     case SRC:      return AlphaComposite.SRC;
@@ -2579,41 +2552,93 @@ public class Canvas {
             macapkDrawStringRuns(text, x, y, primary);
             return;
         }
-        // v1.0.2239: shape the WHOLE run first, then space its glyph clusters,
-        // which is minikin's order (LayoutCore.cpp adds the gaps while walking
-        // HarfBuzz's output). Drawing grapheme by grapheme made every ligature
-        // impossible -- an icon font such as Material Symbols, whose "home" is a
-        // single rlig glyph, drew the letter H instead -- and lost kerning across
-        // clusters that measureText (one quantized vector) still charged. Same
-        // vector, same cluster rule (MacApkFont.spacingClusterOrdinals) as the
-        // measure side, so measure and draw agree by construction.
-        if (MacApkFont.SHAPED_SPACING && MacApkFont.firstSpecial(text, primary) < 0) {
-            MacApkFont.Quantized q = MacApkFont.quantize(g.getFont(), text,
-                                                         MacApkFont.ligaFor(ls));
-            int[] ord = (q == null) ? null : MacApkFont.spacingClusterOrdinals(q.glyphs, text);
-            if (ord != null) {
-                java.awt.font.GlyphVector gv = q.glyphs;
-                final int ng = gv.getNumGlyphs();
-                for (int i = 0; i <= ng; i++) {
-                    java.awt.geom.Point2D gp = gv.getGlyphPosition(i);
-                    // Glyph i sits half a gap in, plus one gap per cluster before
-                    // its own; position ng (the total advance) carries every gap.
-                    float shift = (i < ng) ? gap * (0.5f + ord[i]) : gap * ord[ng];
-                    gv.setGlyphPosition(i, new java.awt.geom.Point2D.Float(
-                        (float) gp.getX() + shift, (float) gp.getY()));
-                }
-                g.drawGlyphVector(gv, x, y);
-                return;
-            }
-        }
         // Same UAX#29 segmentation the measure side counts with -- shared, not
         // re-derived, because a disagreement here is a whole gap per cluster.
         int[] bounds = android.graphics.Paint.macapkClusterBounds(text);
         float penX = x + gap * 0.5f;
+        if (mMacapkRunDir < 0 || android.text.MacApkBidi.hasRtl(text, 0, text.length())) {
+            // Same cells, visual order: bidi runs left to right, and the clusters
+            // of a right-to-left run from its logical end. One cluster at a time
+            // in logical order mirrored every Hebrew word.
+            final int saved = mMacapkRunDir;
+            try {
+                java.text.Bidi b = new java.text.Bidi(text, mMacapkRunDir < 0
+                        ? java.text.Bidi.DIRECTION_RIGHT_TO_LEFT
+                        : mMacapkRunDir > 0 ? java.text.Bidi.DIRECTION_LEFT_TO_RIGHT
+                                            : java.text.Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT);
+                final int rc = b.getRunCount();
+                byte[] levels = new byte[rc];
+                Integer[] order = new Integer[rc];
+                for (int r = 0; r < rc; r++) { levels[r] = (byte) b.getRunLevel(r); order[r] = r; }
+                java.text.Bidi.reorderVisually(levels, 0, order, 0, rc);
+                for (Integer r : order) {
+                    final int rs = b.getRunStart(r), re = b.getRunLimit(r);
+                    final boolean rtl = (b.getRunLevel(r) & 1) != 0;
+                    java.util.ArrayList<String> cells = new java.util.ArrayList<>();
+                    for (int k = 0; k + 1 < bounds.length; k++) {
+                        if (bounds[k] >= rs && bounds[k] < re) cells.add(text.substring(bounds[k], bounds[k + 1]));
+                    }
+                    if (rtl) java.util.Collections.reverse(cells);
+                    mMacapkRunDir = rtl ? -1 : 1;
+                    for (String cluster : cells) {
+                        macapkDrawStringRuns(cluster, penX, y, primary);
+                        penX += android.graphics.Paint.macapkAdvanceIn(cluster, primary) + gap;
+                    }
+                }
+            } finally {
+                mMacapkRunDir = saved;
+            }
+            return;
+        }
         for (int k = 0; k + 1 < bounds.length; k++) {
             String cluster = text.substring(bounds[k], bounds[k + 1]);
             macapkDrawStringRuns(cluster, penX, y, primary);
             penX += android.graphics.Paint.macapkAdvanceIn(cluster, primary) + gap;
+        }
+    }
+
+    /** The direction a drawTextRun caller asked for: 0 = from the text
+     *  (first strong character), 1 = left-to-right, -1 = right-to-left. */
+    private int mMacapkRunDir = 0;
+
+    /** Right-to-left or bidi-mixed text through java.awt.font.TextLayout, which
+     *  implements UAX #9 (reordering, mirroring) and Arabic shaping; the
+     *  per-codepoint font fallback below rides along as FONT attributes. False
+     *  when the layout cannot be built, so the caller falls back. */
+    private boolean macapkDrawBidi(String text, float x, float y, Font primary) {
+        final int n = text.length();
+        if (n == 0) return true;
+        try {
+            final Font base = (primary != null) ? primary : g.getFont();
+            java.text.AttributedString as = new java.text.AttributedString(text);
+            as.addAttribute(java.awt.font.TextAttribute.FONT, base);
+            int i = 0;
+            while (i < n) {
+                int cp = text.codePointAt(i);
+                Font fb = (cp < 0x20) ? null : MacApkFont.fallbackBaseFor(cp, base);
+                int runStart = i;
+                i += Character.charCount(cp);
+                while (i < n) {
+                    int cp2 = text.codePointAt(i);
+                    Font f2 = (cp2 < 0x20) ? null : MacApkFont.fallbackBaseFor(cp2, base);
+                    if (f2 != fb) break;
+                    i += Character.charCount(cp2);
+                }
+                if (fb != null) {
+                    as.addAttribute(java.awt.font.TextAttribute.FONT, MacApkFont.atSizeOf(fb, base), runStart, i);
+                }
+            }
+            if (mMacapkRunDir != 0) {
+                as.addAttribute(java.awt.font.TextAttribute.RUN_DIRECTION, mMacapkRunDir < 0
+                        ? java.awt.font.TextAttribute.RUN_DIRECTION_RTL
+                        : java.awt.font.TextAttribute.RUN_DIRECTION_LTR);
+            }
+            java.awt.font.TextLayout tl =
+                    new java.awt.font.TextLayout(as.getIterator(), g.getFontRenderContext());
+            tl.draw(g, x, y);
+            return true;
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -2636,6 +2661,10 @@ public class Canvas {
      *  The font is restored on exit because the shadow pass re-enters with the
      *  same Graphics2D state. */
     private void macapkDrawStringRuns(String text, float x, float y, Font primary) {
+        if ((mMacapkRunDir < 0 || android.text.MacApkBidi.hasRtl(text, 0, text.length()))
+                && macapkDrawBidi(text, x, y, primary)) {
+            return;
+        }
         if (MacApkFont.firstSpecial(text, primary) < 0) {
             // ⚠ v1.0.937: draw the SAME GlyphVector Paint measured, with its
             // per-glyph positions already snapped to integer advances. Calling
@@ -3069,15 +3098,12 @@ public class Canvas {
                 java.awt.AlphaComposite.SRC_OVER, ca));
         }
         BufferedImage src = bitmapAsImage(rec);
-        // Apply the immutable Skia ImageFilter DAG to this node's recorded source. The
-        // legacy software blur remains only for effects without a native filter.
+        // v1.0.434: approximate a graphicsLayer RenderEffect blur (Material3
+        // scrim / glassmorphism) with a java.awt box-blur ConvolveOp over the
+        // recorded layer bitmap. No-op for the common no-effect case.
         RenderEffect re = node.macapkRenderEffect();
         if (src != null && re != null && re.macapkIsBlur()) {
-            if (re.hasSkiaFilter()) {
-                src = macapkApplySkiaFilter(src, re.getNativeFilter());
-            } else {
-                src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
-            }
+            src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
         }
         if (RenderNode.macapkStats) {
             // "Did the replay reach any pixels?" -- after position + transform
@@ -3199,11 +3225,7 @@ public class Canvas {
                 dl.replay(new Canvas(off));
                 BufferedImage src = bitmapAsImage(off);
                 if (src == null) return;
-                if (re.hasSkiaFilter()) {
-                    src = macapkApplySkiaFilter(src, re.getNativeFilter());
-                } else {
-                    src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
-                }
+                src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
                 // The layer paint's alpha times the node alpha, in 8 bits, as
                 // hwui's layerNeedsPaint does: paint->setAlpha(alpha() * multiplier).
                 final Paint lp = node.macapkLayerPaint();
@@ -3211,17 +3233,14 @@ public class Canvas {
                 if (la <= 0) return;
                 macapkTraceBlit("rendernode-layer", off, "pos=" + node.getLeft() + "," + node.getTop()
                     + " " + node.getWidth() + "x" + node.getHeight() + " alpha=" + a);
-                java.awt.Composite old = g.getComposite();
-                java.awt.Composite composite = bitmapRuleFor(lp);
-                if (composite == null) composite = java.awt.AlphaComposite.SrcOver;
-                if (composite instanceof java.awt.AlphaComposite ac) {
-                    composite = java.awt.AlphaComposite.getInstance(ac.getRule(), la / 255f);
-                } else if (composite instanceof BlendComposite bc) {
-                    composite = bc.withAlpha(la);
+                java.awt.Composite old = null;
+                if (la < 255) {
+                    old = g.getComposite();
+                    g.setComposite(java.awt.AlphaComposite.getInstance(
+                        java.awt.AlphaComposite.SRC_OVER, la / 255f));
                 }
-                g.setComposite(composite);
                 g.drawImage(src, 0, 0, null);
-                g.setComposite(old);
+                if (old != null) g.setComposite(old);
                 if (RenderNode.macapkStats) RenderNode.sStReplayOk.incrementAndGet();
                 return;
             }
@@ -3792,14 +3811,26 @@ public class Canvas {
                             float x, float y, boolean isRtl, Paint p) {
         if (text == null) return;
         com.macapk.loader.GfxTrace.real("Canvas.drawTextRun(char[])");
-        drawText(new String(text, index, count), x, y, p);
+        final int saved = mMacapkRunDir;
+        mMacapkRunDir = isRtl ? -1 : 1;
+        try {
+            drawText(new String(text, index, count), x, y, p);
+        } finally {
+            mMacapkRunDir = saved;
+        }
     }
     public void drawTextRun(CharSequence text, int start, int end,
                             int contextStart, int contextEnd,
                             float x, float y, boolean isRtl, Paint p) {
         if (text == null) return;
         com.macapk.loader.GfxTrace.real("Canvas.drawTextRun(CharSequence)");
-        drawText(text.subSequence(start, end).toString(), x, y, p);
+        final int saved = mMacapkRunDir;
+        mMacapkRunDir = isRtl ? -1 : 1;
+        try {
+            drawText(text.subSequence(start, end).toString(), x, y, p);
+        } finally {
+            mMacapkRunDir = saved;
+        }
     }
 
     // drawDoubleRoundRect -- Material3 outlined borders (OutlinedCard /
@@ -4441,96 +4472,30 @@ public class Canvas {
         if (g == null || path == null || !REAL_CLIP) return true;
         java.awt.Shape s = path.macapkShape();
         if (s == null) return true;
-        if (DIAG_CLIP) {
-            long t0 = System.nanoTime();
-            int how = macapkIntersectClip(s);
-            long dt = System.nanoTime() - t0;
-            sDiagClipN++; sDiagClipNs += dt;
-            if (how == 2) { sDiagClipSlow++; sDiagClipSlowNs += dt; }
-            if (how == 1) sDiagClipShort++;
-            long now = System.currentTimeMillis();
-            if (now - sDiagClipT > 2000) {
-                com.macapk.loader.NativeLog.i("Mac.apk.DiagClip", "clipPath n=" + sDiagClipN
-                    + " ms=" + (sDiagClipNs / 1000000) + " contained=" + sDiagClipShort
-                    + " area=" + sDiagClipSlow + " areaMs=" + (sDiagClipSlowNs / 1000000));
-                sDiagClipT = now; sDiagClipN = 0; sDiagClipNs = 0; sDiagClipSlow = 0;
-                sDiagClipSlowNs = 0; sDiagClipShort = 0;
-            }
-            return true;
-        }
         macapkIntersectClip(s);
         return true;
     }
-
-    /** Intersect the clip with `s` (user space), as g.clip(s) does, but without
-     *  java.awt.geom.Area when one shape provably contains the other.
-     *
-     *  WHY (v1.0.2284, Rhythm, issue #11 "significant slowdowns"). Graphics2D.clip
-     *  intersects two non-rectangular shapes by building java.awt.geom.Areas
-     *  (SunGraphics2D.intersectShapes -> intersectByArea): curve subdivision,
-     *  edge sorting and pruning, about 1 ms per call for two rounded shapes.
-     *  Compose clips nearly every card, button and icon to its Shape
-     *  (Modifier.clip / graphicsLayer clip, RenderNode clipToOutline), and those
-     *  clips NEST, so every frame paid hundreds of Area intersections: measured
-     *  on Rhythm's Settings screen, 579 of them took 626 ms out of 2 s (MACAPK_DIAG_CLIP),
-     *  and each frame drew in 37-40 ms where the same screen's rectangle-clipped
-     *  frames drew in 5. A nested clip is almost always CONTAINED in its parent's,
-     *  and then the intersection is exactly the inner shape, so no Area is needed:
-     *    - the current clip contains s's bounds: the result is s (setClip(s));
-     *    - s contains the current clip's bounds: the result is the current clip.
-     *  Shape.contains(Rectangle2D) may answer false conservatively (Path2D does
-     *  near curves) but never true wrongly, so both shortcuts are exact; anything
-     *  else still goes through g.clip(s). Returns 0 rect fast path / no clip,
-     *  1 shortcut, 2 the Area path. Gate MACAPK_CLIP_CONTAIN (default on). */
     private int macapkIntersectClip(java.awt.Shape s) {
-        if (CLIP_CONTAIN && !(s instanceof java.awt.geom.Rectangle2D)) {
+        if (!(s instanceof java.awt.geom.Rectangle2D)) {
             java.awt.Shape cur = g.getClip();
             if (cur != null && !(cur instanceof java.awt.geom.Rectangle2D)) {
                 try {
-                    java.awt.geom.Rectangle2D sb = s.getBounds2D();
-                    if (cur.contains(sb)) { g.setClip(s); return 1; }
+                    if (cur.contains(s.getBounds2D())) { g.setClip(s); return 1; }
                     if (s.contains(cur.getBounds2D())) return 1;
-                    if (CLIP_FLATTEN) {
-                        // Area intersects CUBIC curves by recursive subdivision
-                        // (sun.awt.geom.Order3.refine / TforY, the top frames of
-                        // the profile); on straight segments it is far cheaper.
-                        // Java2D shape clips are not antialiased -- a pixel is in
-                        // when its centre is -- so flattening both outlines to a
-                        // quarter of a DEVICE pixel moves the clip edge by at most
-                        // that, which can change only pixels whose centres sit
-                        // within 0.25 px of the curve.
-                        double sc = 1.0;
-                        try {
-                            java.awt.geom.AffineTransform at = g.getTransform();
-                            sc = Math.max(1e-6, Math.sqrt(Math.abs(at.getDeterminant())));
-                        } catch (Throwable ignored) {}
-                        double flat = 0.25 / sc;
-                        java.awt.geom.Area a = new java.awt.geom.Area(flattened(cur, flat));
-                        a.intersect(new java.awt.geom.Area(flattened(s, flat)));
-                        g.setClip(a);
-                        return 2;
-                    }
-                } catch (Throwable ignored) {
-                    // fall through to the general intersection
-                }
-                g.clip(s);
-                return 2;
+                    double sc=1.0; try { sc=Math.max(1e-6,Math.sqrt(Math.abs(g.getTransform().getDeterminant()))); } catch(Throwable ignored) {}
+                    double flat=0.25/sc;
+                    java.awt.geom.Area a=new java.awt.geom.Area(macapkFlattenClip(cur,flat));
+                    a.intersect(new java.awt.geom.Area(macapkFlattenClip(s,flat)));
+                    g.setClip(a); return 2;
+                } catch(Throwable ignored) {}
             }
         }
-        g.clip(s);
-        return 0;
+        g.clip(s); return 0;
     }
-    private static final boolean CLIP_CONTAIN =
-        !"0".equals(System.getenv("MACAPK_CLIP_CONTAIN"));
-    private static final boolean CLIP_FLATTEN =
-        !"0".equals(System.getenv("MACAPK_CLIP_FLATTEN"));
-    private static java.awt.Shape flattened(java.awt.Shape sh, double flatness) {
-        java.awt.geom.Path2D.Double p = new java.awt.geom.Path2D.Double();
-        p.append(sh.getPathIterator(null, flatness), false);
-        return p;
+    private static java.awt.Shape macapkFlattenClip(java.awt.Shape s,double f) {
+        java.awt.geom.Path2D.Double p=new java.awt.geom.Path2D.Double();
+        p.append(s.getPathIterator(null,f),false); return p;
     }
-    private static final boolean DIAG_CLIP = System.getenv("MACAPK_DIAG_CLIP") != null;
-    private static long sDiagClipN, sDiagClipNs, sDiagClipSlow, sDiagClipSlowNs, sDiagClipT, sDiagClipShort;
     public boolean getClipBounds(Rect bounds) {
         if (bounds == null) return true;
         if (g == null) {
@@ -4557,20 +4522,7 @@ public class Canvas {
     // gradient across ALL fill/stroke ops at once. Returns null when no faithful
     // mapping is possible (then applyPaint falls back to the solid color). Every
     // AWT constructor that can throw on degenerate geometry is guarded.
-    private java.awt.Paint awtPaintForShader(Shader shader) { return awtPaintForShader(shader, null); }
-    /** REPEAT and MIRROR tile; a TexturePaint can reproduce both. */
-    private static boolean macapkTiles(Shader.TileMode m) {
-        return m == Shader.TileMode.REPEAT || m == Shader.TileMode.MIRROR;
-    }
-    /** MACAPK_BITMAPSHADER_MATRIX (default ON; =0 = every BitmapShader is a
-     *  java.awt.TexturePaint at the bitmap's own size, the pre-v1.0.2271 path):
-     *  a BitmapShader with a local matrix, or with a CLAMP / DECAL axis, is
-     *  sampled through CTM x localMatrix with its tile modes
-     *  (MacApkBitmapShaderPaint). TexturePaint stays for REPEAT / MIRROR with no
-     *  local matrix, where it is exact. */
-    static final boolean BITMAPSHADER_MATRIX =
-        !"0".equals(System.getenv("MACAPK_BITMAPSHADER_MATRIX"));
-    private java.awt.Paint awtPaintForShader(Shader shader, Paint p) {
+    private java.awt.Paint awtPaintForShader(Shader shader) {
         try {
             AffineTransform lm = shader.macapkLocalAffine();
             if (shader instanceof LinearGradient) {
@@ -4617,17 +4569,6 @@ public class Canvas {
                 // CLAMP (edge-texel extension) and DECAL (transparent outside) still approximate --
                 // they need padding sized to the fill bounds, which is not available here; that is
                 // stated rather than silently lumped in with MIRROR.
-                if (BITMAPSHADER_MATRIX) {
-                    final boolean hasMatrix = lm != null && !lm.isIdentity();
-                    final boolean clampish = !macapkTiles(bs.tileX) || !macapkTiles(bs.tileY);
-                    if (hasMatrix || clampish) {
-                        final int fm = bs.getFilterMode();
-                        final boolean bilinear = fm == BitmapShader.FILTER_MODE_LINEAR
-                            || (fm == BitmapShader.FILTER_MODE_DEFAULT && (p == null || p.isFilterBitmap()));
-                        return new MacApkBitmapShaderPaint(img, hasMatrix ? lm : null,
-                            bs.tileX, bs.tileY, bilinear);
-                    }
-                }
                 BufferedImage tile = img;
                 boolean mx = (bs.tileX == Shader.TileMode.MIRROR);
                 boolean my = (bs.tileY == Shader.TileMode.MIRROR);
@@ -4646,10 +4587,7 @@ public class Canvas {
             if (shader instanceof ComposeShader) {
                 // Cannot truly compose two shaders on a software canvas; sample
                 // the first so the fill is approximately right rather than blank.
-                return awtPaintForShader(((ComposeShader) shader).macapkA(), p);
-            }
-            if (shader instanceof RuntimeShader) {
-                return new MacApkRuntimeShaderPaint((RuntimeShader) shader, p);
+                return awtPaintForShader(((ComposeShader) shader).macapkA());
             }
         } catch (Throwable t) {
             // Degenerate gradient geometry / bad fractions -> solid-color fallback.
@@ -4872,23 +4810,20 @@ public class Canvas {
     private BufferedImage filterPixels(int[] in, int w, int h, ColorFilter cf, int preAlpha) {
         BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
         int[] o = ((java.awt.image.DataBufferInt) out.getRaster().getDataBuffer()).getData();
-        filterPixels(in, o, 0, w * h, cf, preAlpha);
-        return out;
-    }
-    /** Also used in place by saveLayer; no second canvas-sized filtered image. */
-    private void filterPixels(int[] in, int[] out, int start, int end, ColorFilter cf, int preAlpha) {
+        final int n = w * h;
         final boolean pre = preAlpha < 255;
         if (cf instanceof PorterDuffColorFilter f) {
-            final BlendMode m = filterBlendMode(f.getMode());
+            final PorterDuff.Mode m = f.getMode();
             final int c = f.getColor();
-            for (int i = start; i < end; i++) out[i] = blendPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
+            for (int i = 0; i < n; i++) o[i] = pdfPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
         } else if (cf instanceof BlendModeColorFilter f) {
             final BlendMode m = f.getMode();
             final int c = f.getColor();
-            for (int i = start; i < end; i++) out[i] = blendPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
+            for (int i = 0; i < n; i++) o[i] = blendPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
         } else {
-            for (int i = start; i < end; i++) out[i] = filterPixel(cf, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
+            for (int i = 0; i < n; i++) o[i] = filterPixel(cf, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
         }
+        return out;
     }
     private int filterPixel(ColorFilter cf, int pixel) {
         if (cf instanceof PorterDuffColorFilter) {
@@ -4910,137 +4845,34 @@ public class Canvas {
     }
     // Skia color-filter semantics: filter color is "src", pixel is "dst".
     private static int pdfPixel(PorterDuff.Mode m, int color, int pixel) {
-        return blendPixel(filterBlendMode(m), color, pixel);
-    }
-    private static BlendMode filterBlendMode(PorterDuff.Mode m) {
-        if (m == null) return null;
-        // Android's legacy MULTIPLY is Skia MODULATE, not the newer blend MULTIPLY.
-        return switch (m) {
-            case MULTIPLY -> BlendMode.MODULATE;
-            case ADD -> BlendMode.PLUS;
-            case CLEAR -> BlendMode.CLEAR;
-            case SRC -> BlendMode.SRC;
-            case DST -> BlendMode.DST;
-            case SRC_OVER -> BlendMode.SRC_OVER;
-            case DST_OVER -> BlendMode.DST_OVER;
-            case SRC_IN -> BlendMode.SRC_IN;
-            case DST_IN -> BlendMode.DST_IN;
-            case SRC_OUT -> BlendMode.SRC_OUT;
-            case DST_OUT -> BlendMode.DST_OUT;
-            case SRC_ATOP -> BlendMode.SRC_ATOP;
-            case DST_ATOP -> BlendMode.DST_ATOP;
-            case XOR -> BlendMode.XOR;
-            case SCREEN -> BlendMode.SCREEN;
-            case OVERLAY -> BlendMode.OVERLAY;
-            case DARKEN -> BlendMode.DARKEN;
-            case LIGHTEN -> BlendMode.LIGHTEN;
-        };
+        if (m == null) return recolorPixel(color, pixel);
+        switch (m) {
+            case SRC:                return color;
+            case SRC_IN: case SRC_ATOP: return recolorPixel(color, pixel);
+            case DST: case DST_IN: case DST_OUT: case DST_ATOP: case DST_OVER: return pixel;
+            case MULTIPLY:           return multiplyColors(color, pixel);
+            case SCREEN:             return screenColors(color, pixel);
+            case ADD:                return addColors(color, pixel);
+            case CLEAR:              return 0;
+            default:                 return recolorPixel(color, pixel);
+        }
     }
     private static int blendPixel(BlendMode m, int color, int pixel) {
-        if (m == null || m == BlendMode.SRC_IN) return recolorPixel(color, pixel);
-        if (m == BlendMode.CLEAR) return 0;
-        if (m == BlendMode.SRC) return (color >>> 24) == 0 ? 0 : color;
-        if (m == BlendMode.DST) return pixel;
-        float sa = (color >>> 24) / 255f, da = (pixel >>> 24) / 255f;
-        float sr = ((color >>> 16) & 255) / 255f, sg = ((color >>> 8) & 255) / 255f,
-              sb = (color & 255) / 255f;
-        float dr = ((pixel >>> 16) & 255) / 255f, dg = ((pixel >>> 8) & 255) / 255f,
-              db = (pixel & 255) / 255f;
-        float sf, df;
-        switch (m) {
-            case SRC_OVER: sf = 1f; df = 1f - sa; break;
-            case DST_OVER: sf = 1f - da; df = 1f; break;
-            case DST_IN: sf = 0f; df = sa; break;
-            case SRC_OUT: sf = 1f - da; df = 0f; break;
-            case DST_OUT: sf = 0f; df = 1f - sa; break;
-            case SRC_ATOP: sf = da; df = 1f - sa; break;
-            case DST_ATOP: sf = 1f - da; df = sa; break;
-            case XOR: sf = 1f - da; df = 1f - sa; break;
-            default: return blendFilterColor(m, sa, sr, sg, sb, da, dr, dg, db);
-        }
-        float a = sa * sf + da * df;
-        return packFilterColor(a, sa * sr * sf + da * dr * df,
-                sa * sg * sf + da * dg * df, sa * sb * sf + da * db * df);
+        if (m == null) return recolorPixel(color, pixel);
+        if (m == BlendMode.SRC) return color;
+        if (m == BlendMode.SRC_IN || m == BlendMode.SRC_ATOP) return recolorPixel(color, pixel);
+        if (m == BlendMode.DST || m == BlendMode.DST_IN || m == BlendMode.DST_OUT || m == BlendMode.DST_ATOP || m == BlendMode.DST_OVER) return pixel;
+        if (m == BlendMode.MODULATE || m == BlendMode.MULTIPLY) return multiplyColors(color, pixel);
+        if (m == BlendMode.SCREEN) return screenColors(color, pixel);
+        if (m == BlendMode.PLUS)   return addColors(color, pixel);
+        if (m == BlendMode.CLEAR)  return 0;
+        return recolorPixel(color, pixel);
     }
-    private static int blendFilterColor(BlendMode mode, float sa, float sr, float sg, float sb,
-            float da, float dr, float dg, float db) {
-        if (mode == BlendMode.PLUS) {
-            return packFilterColor(Math.min(1f, sa + da), Math.min(1f, sa * sr + da * dr),
-                    Math.min(1f, sa * sg + da * dg), Math.min(1f, sa * sb + da * db));
-        }
-        if (mode == BlendMode.MODULATE) {
-            return packFilterColor(sa * da, sa * da * sr * dr, sa * da * sg * dg, sa * da * sb * db);
-        }
-        int blend = switch (mode) {
-            case SCREEN -> BlendComposite.B_SCREEN;
-            case OVERLAY -> BlendComposite.B_OVERLAY;
-            case DARKEN -> BlendComposite.B_DARKEN;
-            case LIGHTEN -> BlendComposite.B_LIGHTEN;
-            case COLOR_DODGE -> BlendComposite.B_COLOR_DODGE;
-            case COLOR_BURN -> BlendComposite.B_COLOR_BURN;
-            case HARD_LIGHT -> BlendComposite.B_HARD_LIGHT;
-            case SOFT_LIGHT -> BlendComposite.B_SOFT_LIGHT;
-            case DIFFERENCE -> BlendComposite.B_DIFFERENCE;
-            case EXCLUSION -> BlendComposite.B_EXCLUSION;
-            case MULTIPLY -> BlendComposite.B_MULTIPLY;
-            default -> -1;
-        };
-        float br, bg, bb;
-        if (blend >= 0) {
-            br = BlendComposite.blend(blend, sr, dr);
-            bg = BlendComposite.blend(blend, sg, dg);
-            bb = BlendComposite.blend(blend, sb, db);
-        } else {
-            // W3C non-separable modes: SetSat followed by SetLum/ClipColor.
-            boolean sourceHue = mode == BlendMode.HUE || mode == BlendMode.COLOR;
-            br = sourceHue ? sr : dr;
-            bg = sourceHue ? sg : dg;
-            bb = sourceHue ? sb : db;
-            float lum = mode == BlendMode.LUMINOSITY
-                    ? 0.3f * sr + 0.59f * sg + 0.11f * sb
-                    : 0.3f * dr + 0.59f * dg + 0.11f * db;
-            if (mode == BlendMode.HUE || mode == BlendMode.SATURATION) {
-                float sat = mode == BlendMode.HUE
-                        ? Math.max(dr, Math.max(dg, db)) - Math.min(dr, Math.min(dg, db))
-                        : Math.max(sr, Math.max(sg, sb)) - Math.min(sr, Math.min(sg, sb));
-                float min = Math.min(br, Math.min(bg, bb));
-                float range = Math.max(br, Math.max(bg, bb)) - min;
-                float scale = range > 0f ? sat / range : 0f;
-                br = (br - min) * scale; bg = (bg - min) * scale; bb = (bb - min) * scale;
-            }
-            float delta = lum - (0.3f * br + 0.59f * bg + 0.11f * bb);
-            br += delta; bg += delta; bb += delta;
-            float min = Math.min(br, Math.min(bg, bb));
-            float max = Math.max(br, Math.max(bg, bb));
-            if (min < 0f) {
-                float scale = lum / (lum - min);
-                br = lum + (br - lum) * scale;
-                bg = lum + (bg - lum) * scale;
-                bb = lum + (bb - lum) * scale;
-            }
-            if (max > 1f) {
-                float scale = (1f - lum) / (max - lum);
-                br = lum + (br - lum) * scale;
-                bg = lum + (bg - lum) * scale;
-                bb = lum + (bb - lum) * scale;
-            }
-        }
-        float overlap = sa * da;
-        return packFilterColor(sa + da * (1f - sa),
-                (1f - da) * sa * sr + (1f - sa) * da * dr + overlap * br,
-                (1f - da) * sa * sg + (1f - sa) * da * dg + overlap * bg,
-                (1f - da) * sa * sb + (1f - sa) * da * db + overlap * bb);
-    }
-    /** Premultiplied blend result to the layer's straight ARGB storage. */
-    private static int packFilterColor(float a, float r, float g, float b) {
-        if (a <= 0f) return 0;
-        return (clamp255(a * 255f) << 24) | (clamp255(r * 255f / a) << 16)
-                | (clamp255(g * 255f / a) << 8) | clamp255(b * 255f / a);
-    }
-    /** SRC_IN tint, preserving coverage with rounded alpha multiplication. */
+    /** Recolor a pixel to the filter RGB, keeping alpha = pixelAlpha*filterAlpha
+     *  (the classic SRC_IN "tint an icon" result). */
     private static int recolorPixel(int color, int pixel) {
-        int alpha = ((pixel >>> 24) * (color >>> 24) + 127) / 255;
-        return alpha == 0 ? 0 : (alpha << 24) | (color & 0x00FFFFFF);
+        int pa = (pixel >>> 24) & 0xff, ca = (color >>> 24) & 0xff;
+        return ((pa * ca / 255) << 24) | (color & 0x00FFFFFF);
     }
     private static int multiplyColors(int a, int b) {
         int aa=(a>>>24)&0xff, ar=(a>>16)&0xff, ag=(a>>8)&0xff, ab=a&0xff;
@@ -5063,20 +4895,18 @@ public class Canvas {
         int mr=(mul>>16)&0xff, mg=(mul>>8)&0xff, mb=mul&0xff;
         int ar=(add>>16)&0xff, ag=(add>>8)&0xff, ab=add&0xff;
         return (sa<<24)
-            | (Math.min(255, (sr*mr + 127)/255 + ar) << 16)
-            | (Math.min(255, (sg*mg + 127)/255 + ag) << 8)
-            |  Math.min(255, (sb*mb + 127)/255 + ab);
+            | (Math.min(255, sr*mr/255 + ar) << 16)
+            | (Math.min(255, sg*mg/255 + ag) << 8)
+            |  Math.min(255, sb*mb/255 + ab);
     }
     private static int applyColorMatrix(int argb, float[] m) {
         if (m == null || m.length < 20) return argb;
         float a=(argb>>>24)&0xff, r=(argb>>16)&0xff, gg=(argb>>8)&0xff, b=argb&0xff;
-        // Skia unpremultiplies before the matrix: at alpha zero there is no hidden RGB.
-        if (a == 0f) r = gg = b = 0f;
         int nr=clamp255(m[0]*r  + m[1]*gg  + m[2]*b  + m[3]*a  + m[4]);
         int ng=clamp255(m[5]*r  + m[6]*gg  + m[7]*b  + m[8]*a  + m[9]);
         int nb=clamp255(m[10]*r + m[11]*gg + m[12]*b + m[13]*a + m[14]);
         int na=clamp255(m[15]*r + m[16]*gg + m[17]*b + m[18]*a + m[19]);
-        return na == 0 ? 0 : (na<<24)|(nr<<16)|(ng<<8)|nb;
+        return (na<<24)|(nr<<16)|(ng<<8)|nb;
     }
     private static int clamp255(float v) { int i=(int)(v+0.5f); return i<0?0:(i>255?255:i); }
 
@@ -5611,32 +5441,6 @@ public class Canvas {
             return dst;
         } catch (Throwable t) { return src; }
     }
-    private static BufferedImage macapkApplySkiaFilter(BufferedImage src, long filterPtr) {
-        if (src == null || filterPtr == 0 || !com.macapk.graphics.MacApkSkia.isAvailable()) return src;
-        int w = src.getWidth();
-        int h = src.getHeight();
-        if (w <= 0 || h <= 0) return src;
-        try {
-            int[] inPixels = null;
-            java.awt.image.Raster raster = src.getRaster();
-            if (src.getType() == BufferedImage.TYPE_INT_ARGB
-                    && raster.getDataBuffer() instanceof java.awt.image.DataBufferInt
-                    && raster.getDataBuffer().getOffset() == 0
-                    && raster.getDataBuffer().getNumBanks() == 1
-                    && raster.getSampleModelTranslateX() == 0 && raster.getSampleModelTranslateY() == 0
-                    && raster.getSampleModel() instanceof java.awt.image.SinglePixelPackedSampleModel
-                    && ((java.awt.image.SinglePixelPackedSampleModel) raster.getSampleModel()).getScanlineStride() == w) {
-                inPixels = ((java.awt.image.DataBufferInt) raster.getDataBuffer()).getData();
-            }
-            if (inPixels == null) inPixels = src.getRGB(0, 0, w, h, null, 0, w);
-            BufferedImage dst = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-            int[] outPixels = ((java.awt.image.DataBufferInt) dst.getRaster().getDataBuffer()).getData();
-            if (com.macapk.graphics.MacApkSkia.applyFilter(filterPtr, inPixels, w, h, outPixels)) return dst;
-        } catch (Throwable t) {
-            System.err.println("[W] macapkApplySkiaFilter error: " + t);
-        }
-        return src;
-    }
     /** Composite for a bitmap blit: the paint's blend mode, modulated by the paint alpha (so a
      *  Coil/Glide cross-fade, whose paint alpha ramps 0..255, actually fades).
      *
@@ -5782,7 +5586,7 @@ public class Canvas {
             g.setColor(toAwtColor(tint));
             com.macapk.loader.GfxTrace.feature("colorFilter", cf.getClass().getSimpleName(), true);
         } else if (shader != null) {
-            java.awt.Paint sp = awtPaintForShader(shader, p);
+            java.awt.Paint sp = awtPaintForShader(shader);
             if (sp != null) {
                 shaderInstalled = true;
                 g.setPaint(sp);
@@ -5949,7 +5753,7 @@ public class Canvas {
             case XOR:      return AlphaComposite.Xor;
             case DARKEN:   return BlendComposite.DARKEN;
             case LIGHTEN:  return BlendComposite.LIGHTEN;
-            case MULTIPLY: return BlendComposite.MODULATE;
+            case MULTIPLY: return BlendComposite.MULTIPLY;
             case SCREEN:   return BlendComposite.SCREEN;
             case ADD:      return BlendComposite.PLUS;
             case OVERLAY:  return BlendComposite.OVERLAY;
@@ -6525,22 +6329,6 @@ public class Canvas {
     public boolean clipRegion(android.graphics.Region region, android.graphics.Region.Op op) { return false; }
     public long getNativeCanvasWrapper() { return 0L; }
     public void setScreenDensity(int density) { }
-
-    /** Filter the private layer buffer in place, only inside its device bounding box.
-     *  The exact clip is applied on composite, including nonrectangular/rotated clips.
-     *  Pool release uses the same box, so generated pixels cannot leak on reuse. */
-    private void filterLayerPixels(Layer layer) {
-        int[] pixels = ((java.awt.image.DataBufferInt) layer.layerImage.getRaster()
-                .getDataBuffer()).getData();
-        int stride = layer.layerImage.getWidth();
-        java.awt.Rectangle box = layer.inkDev;
-        int alpha = Math.round(layer.alpha * 255f);
-        for (int y = box.y; y < box.y + box.height; y++) {
-            int start = y * stride + box.x;
-            filterPixels(pixels, pixels, start, start + box.width, layer.colorFilter, alpha);
-        }
-    }
-
 }
 
 

@@ -2402,17 +2402,6 @@ static bool host_dylib_is_private_crypto(void* addr) {
         || std::strncmp(base, "libssl", 6) == 0;
 }
 
-// True when `addr` is owned by a Cocoa framework bundle (.../Foo.framework/...).
-// A framework export can never satisfy an Android ELF import: those are
-// ObjC/Swift app-facing implementations, not a Bionic substitute, and dlsym
-// (RTLD_DEFAULT) walks EVERY image in the process. dladdr on a guest ELF
-// mmap'd by arm64_native returns 0, so this only classifies host dylibs.
-static bool host_addr_in_framework(void* addr) {
-    Dl_info di;
-    if (!addr || !dladdr(addr, &di) || !di.dli_fname) return false;
-    return std::strstr(di.dli_fname, ".framework/") != nullptr;
-}
-
 // Defined in bionic_shim.cpp (same dylib). Returns a dl_iterate_phdr trampoline
 // that lives INSIDE the libdl.so both /proc/self/maps and dl_iterate_phdr enumerate,
 // so pairip's anti-hook "which module owns dl_iterate_phdr" check passes honestly;
@@ -2446,10 +2435,6 @@ static void* macapk_shim_self_handle() {
     }();
     return h;
 }
-
-// bionic_shim_vulkan.cpp: the guest libvulkan.so's symbol for `name`, or null
-// when this app gets no Vulkan.
-extern "C" void* __macapk_guest_vulkan_symbol(const char* name);
 
 static void* macapk_shim_dlsym(const char* name) {
     void* h = macapk_shim_self_handle();
@@ -2777,27 +2762,6 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
     // See the adapter block above resolve_external for the paired prototypes.
     if (void* p = macapk_bionic_adapter(name)) return p;
 
-    // Then a vk* import of a library linked against libvulkan.so: the guest's
-    // libvulkan is MoltenVK plus the VK_KHR_android_surface translation
-    // (bionic_shim_vulkan.cpp), the same resolver dlsym(<libvulkan.so>, name)
-    // uses, so a direct call and a dlsym'd pointer reach the same function.
-    // GitHub #17: MapLibre's renderer links -lvulkan and calls
-    // vkCreateInstance directly; before this every vk* import fell to the
-    // RTLD_DEFAULT lookup below, which cannot see MoltenVK (opened RTLD_LOCAL,
-    // and only on the first libvulkan dlopen), so the binder trapped them all.
-    // This must come BEFORE that lookup: a globally visible Khronos loader
-    // (ANGLE's, under MACAPK_ANGLE_BACKEND=vulkan) also exports vkCreateInstance,
-    // and binding the guest to it would skip the surface translation. Keyed on
-    // the importer's DT_NEEDED, as bionic resolves an import from the library's
-    // own dependencies; a vk* name in a library that does not link libvulkan
-    // (volk-style function-pointer globals) is left to the usual lookups. When
-    // this app gets no Vulkan the resolver answers null and the lookups below
-    // run exactly as before.
-    if (name.size() > 2 && name[0] == 'v' && name[1] == 'k' &&
-        std::find(needed_.begin(), needed_.end(), "libvulkan.so") != needed_.end()) {
-        if (void* p = __macapk_guest_vulkan_symbol(name.c_str())) return p;
-    }
-
     // Then any host-process symbol (libSystem libc/libm/libpthread,
     // libc++, ANGLE, the shim's directly-exported Bionic names like
     // AAssetManager_*). dlsym(RTLD_DEFAULT) walks every loaded dylib.
@@ -2827,32 +2791,6 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
     // the owning dylib, no package name; the game fleet imports zero crypto
     // symbols, so it is unaffected either way.
     if (void* p = dlsym(RTLD_DEFAULT, name.c_str())) {
-        // A framework-owned hit is an accident of the global dlsym walk, not a
-        // resolution. Prefer any loaded guest ELF definition instead; without
-        // this, an import whose name collides with a framework export executes
-        // Apple code under the Android ABI. Observed with an obfuscated
-        // single-letter import: the framework happened to export the same
-        // name, so the first call jumped into it and died on SIGILL. /usr/lib
-        // hits keep their priority deliberately -- __cxa_throw and _Unwind_*
-        // must stay on the host libc++abi for cross-frame unwinding.
-        if (host_addr_in_framework(p)) {
-            for (Image* img : loaded_images()) {
-                if (img == this) continue;
-                if (void* g = img->lookup(name.c_str())) {
-                    static std::atomic<int> n_fw{0};
-                    if (n_fw.fetch_add(1) < 64) {
-                        Dl_info di;
-                        std::fprintf(stderr,
-                            "[arm64-native] %s: '%s' -> guest %s "
-                            "(refused host framework %s)\n",
-                            dbg_name_, name.c_str(), img->name(),
-                            (dladdr(p, &di) && di.dli_fname) ? di.dli_fname
-                                                             : "?framework?");
-                    }
-                    return g;
-                }
-            }
-        }
         if (host_dylib_is_private_crypto(p)) {
             for (Image* img : loaded_images()) {
                 if (img == this) continue;
@@ -5269,10 +5207,6 @@ static void macapk_openal_stub_retired_note() {
             "docs/libopenal-alcopendevice-retired_2026-09-27.md)\n", v);
 }
 
-// Registered with the abort diagnostic in bionic_shim.cpp so a crash inside
-// this image logs as "libX.so+0xNNN" instead of a bare address.
-extern "C" void macapk_diag_note_guest_image(uintptr_t base, size_t span, const char* name);
-
 bool Image::load_common() {
     // MACAPK_LOAD_TIMING=1: wall time of every pass in this load, printed as
     // `[load-timing] <lib>: <pass> <ms>` for passes >= 2 ms. A boot-time
@@ -5293,7 +5227,6 @@ bool Image::load_common() {
     std::fprintf(stderr,
         "[arm64-native] %s: mapped, base=%p span=%zu\n",
         dbg_name_, (void*)base_, mapped_size_);
-    macapk_diag_note_guest_image((uintptr_t)base_, mapped_size_, dbg_name_);
     if (!parse_dynamic())                     return false;
     std::fprintf(stderr,
         "[arm64-native] %s: parsed dyn (rela=%zu pltrel=%zu init=%zu)\n",

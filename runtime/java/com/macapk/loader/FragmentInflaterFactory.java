@@ -105,7 +105,12 @@ public final class FragmentInflaterFactory implements LayoutInflater.Factory2 {
             int id = attrs.getAttributeResourceValue(null, "id", View.NO_ID);
             String tag = attrs.getAttributeValue(null, "tag");
 
-            Activity activity = ActivityHost.peek();
+            // The activity that owns this inflater, as on Android, where the
+            // activity itself is its window inflater's private factory. The
+            // host stack is only a fallback: it does not hold the first
+            // activity yet while that activity's onCreate inflates its layout.
+            Activity activity = activityOf(context);
+            if (activity == null) activity = ActivityHost.peek();
             if (activity == null) return null;
 
             // WHICH MANAGER SHOULD HOST THIS? Real Android answers by TYPE, not
@@ -187,10 +192,6 @@ public final class FragmentInflaterFactory implements LayoutInflater.Factory2 {
             // FragmentContainerView[android:name] is an ordinary add, and its own
             // 3-arg ctor (tryRealContainerCtor above) is the path that handles it.
             boolean added = hostFragment(fm, container, fname, id, tag, context, attrs, isFragmentTag);
-            if (added && isFragmentTag && FRAGMENT_TAG_OWN_VIEW) {
-                View own = unwrapFromLayout(lastHostedFragment, container, parent, id, tag, fname);
-                if (own != null) return own;
-            }
             if (!added) {
                 NativeLog.w(TAG, "could not host fragment " + fname + " (tag <" + name + ">)");
                 // Still return the container so the layout tree is intact; the
@@ -212,6 +213,18 @@ public final class FragmentInflaterFactory implements LayoutInflater.Factory2 {
      *  mFragments.onCreateView (Activity.java:7355). Returns the fragment's own
      *  view, or null if it could not be hosted (the inflater then substitutes
      *  its placeholder, and FragmentManagerImpl has already logged why). */
+    /** The Activity a context is, or wraps (ContextThemeWrapper and friends). */
+    private static Activity activityOf(Context context) {
+        for (int depth = 0; context != null && depth < 32; depth++) {
+            if (context instanceof Activity a) return a;
+            if (!(context instanceof android.content.ContextWrapper w)) return null;
+            Context base = w.getBaseContext();
+            if (base == context) return null;
+            context = base;
+        }
+        return null;
+    }
+
     private static View frameworkOnCreateView(Activity activity, View parent, String name,
                                               Context context, AttributeSet attrs) {
         android.app.FragmentManager fm = activity.getFragmentManager();
@@ -441,7 +454,6 @@ public final class FragmentInflaterFactory implements LayoutInflater.Factory2 {
             // MANDATORY COMPANION to markFromLayout -- never one without the
             // other. See attachInflatedView.
             if (fromLayout) attachInflatedView(frag, container, context, fname, marked);
-            lastHostedFragment = frag;
             return true;
         }
         // The commit failed, so moveToExpectedState never ran and no view was
@@ -469,63 +481,6 @@ public final class FragmentInflaterFactory implements LayoutInflater.Factory2 {
                ? "no commit* method found on " + tx.getClass().getName()
                : lastCommitFail));
         return false;
-    }
-
-    /** The fragment the most recent successful hostFragment() committed, for
-     *  unwrapFromLayout. Inflation runs on the main thread, as lastCommitFail. */
-    private Object lastHostedFragment;
-
-    /** BISECT GATE (2026-10-20, default ON): a `<fragment>` tag inflates to the
-     *  FRAGMENT'S OWN VIEW, not to a FrameLayout holding it. androidx
-     *  FragmentLayoutInflaterFactory.onCreateView ends
-     *      if (id != 0) fragment.mView.setId(id);
-     *      if (fragment.mView.getTag() == null) fragment.mView.setTag(tag);
-     *      return fragment.mView;
-     *  with fragment.mContainer = the inflating parent. Our wrapper carried the
-     *  tag's android:id as well, so activity.findViewById(id) found the bare
-     *  FrameLayout before the fragment's view, and anything the fragment hangs on
-     *  its own view was invisible through the id. Victim: every Navigation app
-     *  with <fragment android:name="...NavHostFragment"> that calls
-     *  findNavController(activity, R.id.nav_host_fragment) in onCreate
-     *  (NavHostFragment.onViewCreated tags its root view with the NavController):
-     *  Rangskat threw "does not have a NavController set", its toolbar title and
-     *  drawer were never wired. MACAPK_FRAGMENT_TAG_OWN_VIEW=0 restores the wrapper. */
-    static final boolean FRAGMENT_TAG_OWN_VIEW =
-        !"0".equals(System.getenv("MACAPK_FRAGMENT_TAG_OWN_VIEW"));
-
-    /** Hand the inflater the from-layout fragment's own view, as androidx's
-     *  factory does: take it back out of the transaction container hostFragment
-     *  committed into, stamp the tag's android:id / android:tag on it, and point
-     *  mContainer / mContainerId at the inflating parent (androidx writes
-     *  fragment.mContainer = (ViewGroup) parent and mContainerId = parent's id),
-     *  so a later removal takes the view out of the real parent. The inflater
-     *  then generates the tag's layout params and adds the view to that parent,
-     *  which also lifts computeExpectedState's "unparented from-layout view"
-     *  VIEW_CREATED cap, exactly as on a device.
-     *  Returns null (caller keeps the container) when the view is not the one
-     *  attachInflatedView put in the container. */
-    private View unwrapFromLayout(Object frag, ViewGroup container, View parent,
-                                  int id, String tag, String fname) {
-        if (frag == null || container == null) return null;
-        Object mv = getFieldIfPresent(frag, "mView");
-        if (!(mv instanceof View)) return null;
-        View v = (View) mv;
-        if (v.getParent() != container) return null;
-        try {
-            container.removeView(v);
-        } catch (Throwable t) {
-            NativeLog.w(TAG, "<fragment " + fname + "> could not leave its container: " + t);
-            return null;
-        }
-        if (id != View.NO_ID) v.setId(id);
-        if (v.getTag() == null && tag != null) v.setTag(tag);
-        ViewGroup p = (parent instanceof ViewGroup) ? (ViewGroup) parent : null;
-        setFieldIfPresent(frag, "mContainer", p);
-        setFieldIfPresent(frag, "mContainerId", p != null ? p.getId() : 0);
-        NativeLog.i(TAG, "M0: <fragment " + fname + "> inflates to its own view "
-            + v.getClass().getName() + " id=0x" + Integer.toHexString(v.getId())
-            + " (androidx FragmentLayoutInflaterFactory returns fragment.mView)");
-        return v;
     }
 
     /** Why the most recent commitNow() failed -- every attempted commit* method
@@ -587,12 +542,10 @@ public final class FragmentInflaterFactory implements LayoutInflater.Factory2 {
     // AND THE CATCH, which is why markFromLayout and attachInflatedView are one
     // change and not two: the second clause CAPS an unparented from-layout
     // fragment at VIEW_CREATED forever. androidx gets past it because its factory
-    // returns fragment.mView to the LayoutInflater, which parents it. We commit
-    // through an add transaction into a container, so WE do the parenting first;
-    // since 2026-10-20 (FRAGMENT_TAG_OWN_VIEW) unwrapFromLayout then hands the
-    // view itself back to the inflater as androidx does. (Before, the container
-    // was returned and carried the tag's android:id too, which hid the
-    // fragment's own view from findViewById: Rangskat's NavController.) Setting the marks without attaching would strand every
+    // returns fragment.mView to the LayoutInflater, which parents it. We return a
+    // container instead (so the tag's android:id keeps naming one stable view and
+    // the tree shape does not change for apps that already work), so WE have to do
+    // the parenting. Setting the marks without attaching would strand every
     // `<fragment>` below STARTED -- strictly worse than the late view we have now.
 
     /** Tell the manager this fragment came from a `<fragment>` tag, mirroring the

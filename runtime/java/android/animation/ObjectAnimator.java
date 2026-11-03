@@ -530,23 +530,7 @@ public class ObjectAnimator extends ValueAnimator {
     public Object getTarget() { return target; }
     public void setPropertyName(String propertyName) { this.propertyName = propertyName; this.setterResolved = false; }
     public String getPropertyName() { return propertyName; }
-    /** AOSP ObjectAnimator.setProperty: when the animator already has value holders
-     *  (ofPropertyValuesHolder, or ofFloat/ofInt then setProperty), the Property goes
-     *  onto the FIRST holder -- `mValues[0].setProperty(property)` -- so that holder
-     *  writes through Property.set from then on. Material's ExtendedFloatingActionButton
-     *  relies on exactly this: its shrink/extend MotionSpec builds a "labelOpacity"
-     *  holder from XML and then calls setProperty(LABEL_OPACITY_PROPERTY); with no
-     *  setLabelOpacity() method to find by name, the label never faded and a shrunk FAB
-     *  kept drawing its text past its own edge (ytdlnis 1.9.1's paste-link FAB,
-     *  2026-10-19). MACAPK_ANIM_HOLDER_PROPERTY=0 restores the field-only store. */
-    public void setProperty(android.util.Property property) {
-        if (HOLDER_PROPERTY && holders != null && holders.length > 0 && holders[0] != null) {
-            holders[0].setProperty(property);
-        }
-        this.property = property;
-    }
-    static final boolean HOLDER_PROPERTY =
-        !"0".equals(System.getenv("MACAPK_ANIM_HOLDER_PROPERTY"));
+    public void setProperty(android.util.Property property) { this.property = property; }
 
     /** Tier 3 M7: push the per-frame value onto the target property. */
     @Override @SuppressWarnings("unchecked")
@@ -561,16 +545,8 @@ public class ObjectAnimator extends ValueAnimator {
                 if (v == null) continue;
                 // A multi-parameter holder evaluates to an int[]/float[] whose
                 // elements are the setter's ARGUMENTS, not a single value.
-                if (h.macapkIsMultiValue()) { setByNameMulti(h.getPropertyName(), v); continue; }
-                // A holder built on (or given) a Property writes through Property.set,
-                // as AOSP PropertyValuesHolder.setAnimatedValue does (`if (mProperty !=
-                // null) mProperty.set(target, getAnimatedValue())`), before any setter
-                // lookup by name: an app-defined Property has no JavaBean setter.
-                android.util.Property hp = HOLDER_PROPERTY ? h.getProperty() : null;
-                if (hp != null) {
-                    try { hp.set(target, v); continue; } catch (Throwable ignored) {}
-                }
-                setByName(h.getPropertyName(), v);
+                if (h.macapkIsMultiValue()) setByNameMulti(h.getPropertyName(), v);
+                else setByName(h.getPropertyName(), v);
             }
             return;
         }

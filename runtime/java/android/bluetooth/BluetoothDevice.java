@@ -88,17 +88,33 @@ public class BluetoothDevice implements Parcelable {
     public static final String EXTRA_UUID = "android.bluetooth.device.extra.UUID";
 
     private final String mAddress;
+    // A device the host has paired (BluetoothAdapter.getBondedDevices) carries
+    // its name and class of device; one made from an address alone does not.
+    private final String mName;
+    private final int mClassOfDevice;
+    private final boolean mBonded;
 
     public BluetoothDevice() { this(null); }
-    public BluetoothDevice(String address) { mAddress = address; }
+    public BluetoothDevice(String address) {
+        mAddress = address;
+        mName = null;
+        mClassOfDevice = 0;
+        mBonded = false;
+    }
+    BluetoothDevice(String address, String name, int classOfDevice) {
+        mAddress = address;
+        mName = name;
+        mClassOfDevice = classOfDevice;
+        mBonded = true;
+    }
 
     public String getAddress() { return mAddress; }
-    public String getName() { return null; }
-    public String getAlias() { return null; }
-    public int getType() { return DEVICE_TYPE_UNKNOWN; }
-    public int getBondState() { return BOND_NONE; }
+    public String getName() { return mName; }
+    public String getAlias() { return mName; }
+    public int getType() { return mBonded ? DEVICE_TYPE_CLASSIC : DEVICE_TYPE_UNKNOWN; }
+    public int getBondState() { return mBonded ? BOND_BONDED : BOND_NONE; }
     public boolean createBond() { return false; }
-    public BluetoothClass getBluetoothClass() { return null; }
+    public BluetoothClass getBluetoothClass() { return mBonded ? new BluetoothClass(mClassOfDevice) : null; }
     public android.os.ParcelUuid[] getUuids() { return null; }
     public boolean fetchUuidsWithSdp() { return false; }
     public boolean setPin(byte[] pin) { return false; }

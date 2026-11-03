@@ -4,9 +4,9 @@
 // to Paint.setShader / constructing it where a Shader is expected failed at the
 // type level. Now extends Shader and stores the bitmap + tile modes. Stale-
 // comment fix: this used to say "our Canvas doesn't yet sample the shader" --
-// not true since v1.0.433/434: Canvas.awtPaintForShader samples it (since
-// v1.0.2271 through MacApkBitmapShaderPaint, honouring the local matrix and the
-// tile modes, when either matters; a TexturePaint otherwise).
+// not true since v1.0.433/434: Canvas.awtPaintForShader maps a BitmapShader to
+// a real java.awt TexturePaint keyed off bitmap/tileX/tileY (see Shader.java's
+// own correction note, which this file never got the matching update for).
 // Source: frameworks/base/graphics/java/android/graphics/BitmapShader.java
 package android.graphics;
 
@@ -20,12 +20,12 @@ public class BitmapShader extends Shader {
     // shader samples between texels, overriding Paint#isFilterBitmap once set
     // to a non-default value. AOSP's setFilterMode backs this by discarding a
     // native Skia instance so the next draw rebuilds it with new
-    // SamplingOptions. Since v1.0.2271 Canvas.awtPaintForShader reads it when it
-    // samples through MacApkBitmapShaderPaint (a shader with a local matrix or a
-    // CLAMP / DECAL axis): LINEAR = bilinear, NEAREST = nearest, DEFAULT = the
-    // Paint's FILTER_BITMAP flag. A plain REPEAT / MIRROR shader with no matrix
-    // is still a java.awt.TexturePaint, whose interpolation is the Graphics2D
-    // hint. There is no native instance to discard.
+    // SamplingOptions. Canvas.awtPaintForShader (below, in Canvas.java) maps
+    // us to a java.awt.TexturePaint and does not yet consult a filter mode --
+    // AWT's own interpolation is a Graphics2D-wide RenderingHints setting, not
+    // a per-Paint one -- so there is no native instance to discard here; this
+    // is plain storage until a renderer reads it, matching how tileX/tileY
+    // were plain storage before Canvas.awtPaintForShader existed.
     public static final int FILTER_MODE_DEFAULT = 0;
     public static final int FILTER_MODE_NEAREST = 1;
     public static final int FILTER_MODE_LINEAR = 2;

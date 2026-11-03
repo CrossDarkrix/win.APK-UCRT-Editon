@@ -628,7 +628,6 @@ public final class MediaCodec {
     public void release() {
         com.macapk.loader.MediaStats.codecEnd(mStat, "release");
         stopAsyncDispatch(); releaseDec();
-        drainTimedFrames(true);
         // Drop the video-plane geometry binding IF it is still ours (a newer
         // codec's registration wins -- macapkUnregisterVideoSink compares the
         // Surface identity, so releasing an old codec after a new one bound
@@ -668,80 +667,7 @@ public final class MediaCodec {
     // Releases any polled-but-not-yet-released video frames (native
     // CVPixelBuffers) before the index pool that tracks them gets dropped or
     // reset, so they don't leak. Called with mAsyncLock held.
-    /** AOSP MediaCodec hands decoded video out in PRESENTATION order: the
-     *  codec component reorders B-frames. VideoToolbox does not -- its output
-     *  callback fires in DECODE order even with kVTDecodeFrame_Enable
-     *  TemporalProcessing (FFmpeg's videotoolbox hwaccel reorders itself for
-     *  the same reason). Measured on ytdlnis's ExoPlayer preview (H.264 720p
-     *  with B-frames): consecutive release timestamps stepped -66.7 / +33.4 /
-     *  +133.5 ms, i.e. frames shown out of order -- the "stuttery" playback
-     *  (owner report 2026-10-19). This holds VideoToolbox output in a
-     *  pts-ordered window and emits the earliest frame once more than
-     *  mReorderDepth frames are held (or the stream ended). The depth starts at
-     *  2 and grows whenever a frame arrives older than one already emitted
-     *  (that frame is dropped, as a component never emits backwards), capped at
-     *  16 = H.264's max_dec_frame_buffering. MACAPK_VIDEO_REORDER=0 restores
-     *  decode-order output. VP8/VP9 (libvpx) already output in order. */
-    static final boolean VIDEO_REORDER = !"0".equals(System.getenv("MACAPK_VIDEO_REORDER"));
-    private final VideoReorder mReorder = new VideoReorder();
-    private static final java.util.function.LongConsumer RELEASE_FRAME =
-        com.macapk.loader.NativeMedia::nativeVidReleaseFrame;
-
-    /** Called with mAsyncLock held, like tryDequeueOutputLocked0. */
-    private long[] reorderPoll() {
-        final long dec = mVidDec;
-        return mReorder.poll(() -> com.macapk.loader.NativeMedia.nativeVidPoll(dec), RELEASE_FRAME);
-    }
-    private void resetReorder() { mReorder.reset(RELEASE_FRAME); }
-
-    /** The presentation-order window (see VIDEO_REORDER above). A frame is
-     *  {pixbuf, ptsUs, flags}; pixbuf 0 is the end-of-stream marker. Static and
-     *  source-agnostic so debug/videoreorder_gate.sh drives it offline. */
-    static final class VideoReorder {
-        private final java.util.PriorityQueue<long[]> held =
-            new java.util.PriorityQueue<>(16, (a, b) -> Long.compare(a[1], b[1]));
-        private long[] eos;
-        int depth = 2;
-        private long lastPts = Long.MIN_VALUE;
-
-        long[] poll(java.util.function.Supplier<long[]> src, java.util.function.LongConsumer release) {
-            long[] f;
-            while (eos == null && (f = src.get()) != null) {
-                if (f[0] == 0) { eos = f; break; }               // EOS marker: drain everything
-                if (f[1] < lastPts) {
-                    // Arrived after a later frame already went out: a component
-                    // never emits backwards, so drop it and widen the window.
-                    release.accept(f[0]);
-                    if (depth < 16) depth++;
-                    continue;
-                }
-                held.add(f);
-            }
-            if (!held.isEmpty() && (held.size() > depth || eos != null)) {
-                long[] out = held.poll();
-                lastPts = out[1];
-                return out;
-            }
-            if (eos != null && held.isEmpty()) {
-                long[] e = eos;
-                eos = null;
-                lastPts = Long.MIN_VALUE;
-                return e;
-            }
-            return null;
-        }
-        /** flush / stop / release: drop everything held; the learned depth stays. */
-        void reset(java.util.function.LongConsumer release) {
-            for (long[] f : held) release.accept(f[0]);
-            held.clear();
-            eos = null;
-            lastPts = Long.MIN_VALUE;
-        }
-    }
-
     private void releasePendingVideoFrames() {
-        resetReorder();
-        drainTimedFrames(false);
         if (mOutPixbuf == null) return;
         for (int i = 0; i < mOutPixbuf.length; i++) {
             if (mOutPixbuf[i] != 0) {
@@ -1134,7 +1060,6 @@ public final class MediaCodec {
         }
     }
     public void queueInputBuffer(int index, int offset, int size, long presentationTimeUs, int flags) {
-        if (PRESENT_TRACE && mIsVideo) traceIn();
         synchronized (mAsyncLock) {
             if (!mStarted) return;
             boolean eos = (flags & BUFFER_FLAG_END_OF_STREAM) != 0;
@@ -1198,11 +1123,9 @@ public final class MediaCodec {
                 ? com.macapk.loader.NativeMedia.nativeVp8Poll(mVidDec)
                 : isVp9()
                 ? com.macapk.loader.NativeMedia.nativeVp9Poll(mVidDec)
-                : VIDEO_REORDER ? reorderPoll()
                 : com.macapk.loader.NativeMedia.nativeVidPoll(mVidDec);
             if (polled == null) return INFO_TRY_AGAIN_LATER;
             int oi = mOutFree.poll();
-            if (PRESENT_TRACE) traceOut();
             mOutPixbuf[oi] = polled[0];
             mOutPts[oi] = polled[1];
             // No real "compressed size" applies to an opaque decoded pixel
@@ -1248,9 +1171,7 @@ public final class MediaCodec {
                     // Surface for real (video_toolbox.mm's
                     // macapk_vtb_render_frame -> cocoa_bridge.mm's
                     // CocoaPresentVideoFrame), not merely decode it.
-                    if (PRESENT_TRACE && !render) mTraceAppDrops++;
                     if (render && mHasSurface) {
-                        if (PRESENT_TRACE) tracePresent();
                         com.macapk.loader.NativeMedia.nativeVidRender(pb, mVidWidth, mVidHeight);
                         com.macapk.loader.MediaStats.codecRendered(mStat);
                     }
@@ -1263,151 +1184,7 @@ public final class MediaCodec {
             if (mOut != null && index >= 0 && index < mOut.length) { mOut[index] = null; mOutFree.add(index); }
         }
     }
-    /** AOSP releaseOutputBuffer(index, renderTimestampNs): the frame is shown
-     *  AT that System.nanoTime() timestamp (SurfaceFlinger latches, per vsync,
-     *  the newest queued buffer that is due and drops the ones it supersedes;
-     *  a timestamp more than a second away is treated as "now"). We ignored the
-     *  timestamp and presented on release. ExoPlayer's MediaCodecVideoRenderer
-     *  releases each frame up to 50 ms EARLY with its vsync-aligned display
-     *  time, so frames landed early by a varying amount: uneven cadence, i.e.
-     *  judder (ytdlnis's preview player, owner report 2026-10-19).
-     *  MACAPK_VIDEO_TIMED_RELEASE=0 restores present-on-release. */
-    public void releaseOutputBuffer(int index, long renderTimestampNs) {
-        if (!VIDEO_TIMED_RELEASE || !mIsVideo || !mHasSurface) { releaseOutputBuffer(index, true); return; }
-        long pb = 0;
-        synchronized (mAsyncLock) {
-            if (mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
-                pb = mOutPixbuf[index];
-                mOutPixbuf[index] = 0;
-                if (mOut != null && index < mOut.length) mOut[index] = null;
-                mOutFree.add(index);
-            } else {
-                if (mOut != null && index >= 0 && index < mOut.length) { mOut[index] = null; mOutFree.add(index); }
-                return;
-            }
-        }
-        if (pb == 0) return;
-        long now = System.nanoTime();
-        if (PRESENT_TRACE) { traceEarly(renderTimestampNs - now); traceDue(renderTimestampNs); }
-        long due = renderTimestampNs;
-        if (due < now || due - now > 1_000_000_000L) due = now;   // late, or "not within a second": now
-        synchronized (mTimedLock) {
-            mTimed.addLast(new long[]{ pb, due });
-            if (mTimedThread == null) {
-                mTimedQuit = false;
-                mTimedThread = new Thread(this::timedPresentLoop, "MediaCodec:VideoPresent");
-                mTimedThread.setDaemon(true);
-                mTimedThread.start();
-            }
-            mTimedLock.notifyAll();
-        }
-    }
-    /** MACAPK_VIDEO_PRESENT_TRACE=1: every 120 presents, log the present-to-
-     *  present interval spread (the judder measure) and superseded drops. */
-    static final boolean PRESENT_TRACE = "1".equals(System.getenv("MACAPK_VIDEO_PRESENT_TRACE"));
-    private long mTraceLast, mTraceDrops, mTraceAppDrops;
-    private final long[] mTraceIv = new long[120];
-    private int mTraceN;
-    private long mOutLast; private final long[] mOutIv = new long[120]; private int mOutN;
-    private final long[] mEarly = new long[120]; private int mEarlyN;
-    private long mInLast; private final long[] mInIv = new long[120]; private int mInN;
-    private void traceIn() {
-        long t = System.nanoTime();
-        if (mInLast != 0) mInIv[mInN++] = t - mInLast;
-        mInLast = t;
-        if (mInN == mInIv.length) { traceSummary("decoder input", mInIv); mInN = 0; }
-    }
-    private long mDueLast; private final long[] mDueIv = new long[120]; private int mDueN;
-    private void traceDue(long due) {
-        if (mDueLast != 0) mDueIv[mDueN++] = due - mDueLast;
-        mDueLast = due;
-        if (mDueN == mDueIv.length) { traceSummary("release due-to-due", mDueIv); mDueN = 0; }
-    }
-    private void traceOut() {
-        long t = System.nanoTime();
-        if (mOutLast != 0) mOutIv[mOutN++] = t - mOutLast;
-        mOutLast = t;
-        if (mOutN == mOutIv.length) { traceSummary("decoder output", mOutIv); mOutN = 0; }
-    }
-    private void traceEarly(long early) {
-        mEarly[mEarlyN++] = early;
-        if (mEarlyN == mEarly.length) { traceSummary("release early(+)/late(-)", mEarly); mEarlyN = 0; }
-    }
-    private static void traceSummary(String what, long[] v) {
-        long[] a = v.clone(); java.util.Arrays.sort(a);
-        com.macapk.loader.NativeLog.i("MediaCodec", String.format("%s: p5=%.1fms p50=%.1f p95=%.1f min=%.1f max=%.1f",
-            what, a[6] / 1e6, a[60] / 1e6, a[113] / 1e6, a[0] / 1e6, a[119] / 1e6));
-    }
-    private void tracePresent() {
-        long t = System.nanoTime();
-        if (mTraceLast != 0) mTraceIv[mTraceN++] = t - mTraceLast;
-        mTraceLast = t;
-        if (mTraceN == mTraceIv.length) {
-            long[] a = mTraceIv.clone();
-            java.util.Arrays.sort(a);
-            double mean = 0; for (long v : a) mean += v; mean /= a.length;
-            double sd = 0; for (long v : a) sd += (v - mean) * (v - mean); sd = Math.sqrt(sd / a.length);
-            com.macapk.loader.NativeLog.i("MediaCodec", String.format(
-                "video present: n=%d mean=%.1fms sd=%.1fms p5=%.1f p50=%.1f p95=%.1f max=%.1f superseded=%d appDropped=%d timed=%b",
-                a.length, mean / 1e6, sd / 1e6, a[6] / 1e6, a[60] / 1e6, a[113] / 1e6, a[119] / 1e6,
-                mTraceDrops, mTraceAppDrops, VIDEO_TIMED_RELEASE));
-            mTraceN = 0; mTraceDrops = 0; mTraceAppDrops = 0;
-        }
-    }
-    static final boolean VIDEO_TIMED_RELEASE =
-        !"0".equals(System.getenv("MACAPK_VIDEO_TIMED_RELEASE"));
-    private final Object mTimedLock = new Object();
-    private final java.util.ArrayDeque<long[]> mTimed = new java.util.ArrayDeque<>();
-    private Thread mTimedThread;
-    private boolean mTimedQuit;
-
-    /** Present queued frames at their due time. When several are due at once
-     *  only the newest is shown and the older ones are released unshown --
-     *  SurfaceFlinger's latch rule. Frames are released in queue order, which
-     *  is ExoPlayer's presentation order. */
-    private void timedPresentLoop() {
-        synchronized (mTimedLock) {
-            while (!mTimedQuit) {
-                long[] head = mTimed.peekFirst();
-                if (head == null) {
-                    try { mTimedLock.wait(); } catch (InterruptedException e) { return; }
-                    continue;
-                }
-                long wait = head[1] - System.nanoTime();
-                if (wait > 0) {
-                    try { mTimedLock.wait(wait / 1_000_000L, (int) (wait % 1_000_000L)); }
-                    catch (InterruptedException e) { return; }
-                    continue;
-                }
-                long now = System.nanoTime();
-                long[] show = mTimed.pollFirst();
-                while (!mTimed.isEmpty() && mTimed.peekFirst()[1] <= now) {
-                    com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);   // superseded
-                    show = mTimed.pollFirst();
-                    if (PRESENT_TRACE) mTraceDrops++;
-                }
-                if (PRESENT_TRACE) tracePresent();
-                // Rendering under mTimedLock: drainTimedFrames (flush / stop /
-                // release) waits for an in-flight present instead of freeing
-                // the buffer underneath it.
-                try {
-                    com.macapk.loader.NativeMedia.nativeVidRender(show[0], mVidWidth, mVidHeight);
-                    com.macapk.loader.MediaStats.codecRendered(mStat);
-                } catch (Throwable ignored) {}
-                com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);
-            }
-        }
-    }
-
-    /** Release every queued, not-yet-shown frame (flush / stop / release). */
-    private void drainTimedFrames(boolean quit) {
-        synchronized (mTimedLock) {
-            for (long[] f : mTimed) com.macapk.loader.NativeMedia.nativeVidReleaseFrame(f[0]);
-            mTimed.clear();
-            if (quit) { mTimedQuit = true; mTimedThread = null; }
-            mTimedLock.notifyAll();
-        }
-    }
+    public void releaseOutputBuffer(int index, long renderTimestampNs) { releaseOutputBuffer(index, true); }
 
     public MediaFormat getOutputFormat() {
         if (mIsVideo) {

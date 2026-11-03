@@ -212,13 +212,6 @@ public final class MacApkFontFamilies {
      *  transcribed from), so a native font manager sees the families, faces,
      *  weights and aliases Java text already uses. */
     static String systemFontsXml() {
-        return systemFontsXml(java.util.List.of());
-    }
-
-    /** The same file with the host's CJK families (MacApkHostFonts) after the
-     *  bundled fallbacks, where the device file has its four CJK families: each
-     *  face by its published link name and its index in the collection. */
-    static String systemFontsXml(java.util.List<MacApkHostFonts.Family> host) {
         StringBuilder b = new StringBuilder(4096);
         b.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         b.append("<!-- Mac.apk: generated from android.graphics.MacApkFontFamilies -->\n");
@@ -241,16 +234,6 @@ public final class MacApkFontFamilies {
             b.append("    <family lang=\"").append(fb[0]).append("\">\n");
             for (int k = 1; k < fb.length; k++)
                 appendFont(b, fb[k].contains("-Bold") ? 700 : 400, false, fb[k]);
-            b.append("    </family>\n");
-        }
-        for (MacApkHostFonts.Family fam : host) {
-            b.append("    <family lang=\"").append(fam.lang).append("\">\n");
-            for (MacApkHostFonts.Face f : fam.faces) {
-                if (f.linkName == null || f.index < 0) continue;
-                b.append("        <font weight=\"").append(f.weight)
-                 .append("\" style=\"normal\" index=\"").append(f.index).append("\">")
-                 .append(f.linkName).append("</font>\n");
-            }
             b.append("    </family>\n");
         }
         b.append("</familyset>\n");

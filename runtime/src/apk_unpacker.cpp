@@ -795,20 +795,8 @@ static bool ArscVisitEntry(const uint8_t* b, size_t n, uint32_t resid, F&& visit
 // `rank_out` (optional) receives the chosen row's density rank so a caller
 // holding SEVERAL members' tables (base + density splits, v1.0.1590) can keep
 // the best across them: anydpi/nodpi rank 1, a real bucket ranks density+2.
-//
-// `xml_wins_out` (optional, v1.0.2239) is set when the id has an ANYDPI row
-// that is an XML file (an <adaptive-icon>, a <vector>). Android resolves such
-// an id to that XML at EVERY density: ResTable_config::isBetterThan settles
-// DENSITY_ANY before it compares buckets (frameworks/base android11-release,
-// libs/androidfw/ResourceTypes.cpp:2552, "We always prefer DENSITY_ANY over
-// scaling a density bucket", then `return true`). So the density rasters
-// beside it are what a pre-API-26 launcher would show, never what this device
-// shows. The raster is still returned, for the caller to keep as a fallback.
-// Measured on Rhythm 5.5.499 (issue #11): its mipmap-anydpi ic_launcher is the
-// real headphones icon while every mipmap-*dpi webp is Android Studio's default
-// robot, and the robot is what every Mac.apk install of it showed.
 std::string ArscBestRasterEntry(const std::string& arsc, uint32_t resid,
-                                uint32_t* rank_out, bool* xml_wins_out) {
+                                uint32_t* rank_out) {
     const uint8_t* b = reinterpret_cast<const uint8_t*>(arsc.data());
     const size_t n = arsc.size();
     for (int hop = 0; hop < 3 && resid != 0; ++hop) {
@@ -822,7 +810,6 @@ std::string ArscBestRasterEntry(const std::string& arsc, uint32_t resid,
                 size_t l = std::strlen(sfx);
                 return path.size() >= l && path.compare(path.size() - l, l, sfx) == 0;
             };
-            if (density == 0xfffe && ends(".xml") && xml_wins_out) *xml_wins_out = true;
             if (!(ends(".png") || ends(".webp") || ends(".jpg"))) return;
             // anydpi (0xfffe) / nodpi (0xffff) are not real buckets; rank
             // them below every bucket so a density PNG wins.
@@ -939,11 +926,6 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
     int  act_orientation = -2;
     bool act_main = false, act_launcher = false;
     bool launcher_found = false;
-    // An Android TV-only app has no LAUNCHER filter; Manifest.java then
-    // launches its MAIN + LEANBACK_LAUNCHER activity, so the first window has
-    // to take THAT activity's orientation (applied after the walk).
-    bool act_leanback = false, leanback_found = false;
-    int  leanback_orientation = -2;
 
     size_t off = u16(2);
     size_t total = std::min<size_t>(i32(4), n);
@@ -999,10 +981,6 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
                     info.launcher_orientation = act_orientation;
                     launcher_found = true;
                 }
-                if (!leanback_found && act_main && act_leanback) {
-                    leanback_orientation = act_orientation;
-                    leanback_found = true;
-                }
                 act_depth = -1;
             }
             if (depth > 0) --depth;
@@ -1017,7 +995,7 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
             bool is_filter_item = (tag == "action" || tag == "category");
             if (is_activity && act_depth < 0) {
                 act_depth = depth - 1;
-                act_orientation = -2; act_main = false; act_launcher = false; act_leanback = false;
+                act_orientation = -2; act_main = false; act_launcher = false;
             }
             if (is_manifest || is_application || is_activity || is_filter_item) {
                 uint32_t attrStart = u16(ext + 8);
@@ -1075,7 +1053,6 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
                             std::string v = str_val();
                             if (tag == "action" && v == "android.intent.action.MAIN") act_main = true;
                             if (tag == "category" && v == "android.intent.category.LAUNCHER") act_launcher = true;
-                            if (tag == "category" && v == "android.intent.category.LEANBACK_LAUNCHER") act_leanback = true;
                         }
                     }
                     if (is_manifest && an == "platformBuildVersionName" && dtype == 0x03)
@@ -1086,9 +1063,6 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
         }
         off += sz;
     }
-    // The TV-only fallback, the same rule as Manifest.java: no LAUNCHER entry
-    // anywhere -> the LEANBACK_LAUNCHER activity is the one that starts.
-    if (!launcher_found && leanback_found) info.launcher_orientation = leanback_orientation;
     // Absent versionCode reads as 0, matching AOSP (ApkLiteParseUtils /
     // PackageParser read the attribute with default 0, and
     // PackageInfo.versionCode is 0 when undeclared). Deliberately NO
@@ -1753,24 +1727,18 @@ void WriteAppMetadata(const fs::path& app_dir, const std::string& apk_path,
             }
         }
         std::string entry, entry_apk; uint32_t best_rank = 0;
-        // Any member's anydpi XML row for the icon id wins over every raster
-        // (ArscBestRasterEntry's header). An app bundle keeps that XML in base
-        // and the rasters in its density splits, so the flag has to span the
-        // whole set, not one member's table.
-        bool xml_wins = false;
         for (const std::string& m : members) {
             const std::string arsc = ReadZipEntry(m, "resources.arsc");
             if (arsc.empty()) continue;
             uint32_t rank = 0; std::string cand;
-            if (bin.icon_ref != 0)
-                cand = ArscBestRasterEntry(arsc, bin.icon_ref, &rank, &xml_wins);
-            if (cand.empty() && !xml_wins) {
+            if (bin.icon_ref != 0) cand = ArscBestRasterEntry(arsc, bin.icon_ref, &rank);
+            if (cand.empty()) {
                 for (const char* alt : { "mipmap/ic_launcher", "drawable/ic_launcher",
                                          "mipmap/icon",        "drawable/icon",
                                          "mipmap/app_icon",    "drawable/app_icon" }) {
                     std::string t(alt); size_t sl = t.find('/');
                     uint32_t id = ArscFindEntryId(arsc, t.substr(0, sl), t.substr(sl + 1));
-                    if (id != 0) cand = ArscBestRasterEntry(arsc, id, &rank, nullptr);
+                    if (id != 0) cand = ArscBestRasterEntry(arsc, id, &rank);
                     if (!cand.empty()) {
                         if (m == src_apk)
                             std::fprintf(stderr,
@@ -1784,31 +1752,16 @@ void WriteAppMetadata(const fs::path& app_dir, const std::string& apk_path,
                 best_rank = rank; entry = cand; entry_apk = m;
             }
         }
-        // When the anydpi XML wins, the raster is NOT the icon: icon.png is left
-        // to the framework rasterizer (Boot.writeLauncherIcon at launch,
-        // Boot.extractIconOnly at install), and the raster is kept under
-        // kIconRasterFallback for the install path to use only if that render
-        // produced nothing (main.cpp, after the install-time JVM). Without the
-        // fallback an adaptive icon our Drawable pipeline cannot paint would
-        // leave the placeholder where the app's own legacy raster used to show.
-        std::error_code fec;
-        fs::remove(app_dir / kIconRasterFallback, fec);
         if (!entry.empty()) {
             std::string bytes = ReadZipEntry(entry_apk, entry);
             if (!bytes.empty()) {
-                const fs::path dst = app_dir / (xml_wins ? kIconRasterFallback : "icon.png");
-                std::ofstream ic(dst, std::ios::binary);
+                std::ofstream ic(app_dir / "icon.png", std::ios::binary);
                 ic.write(bytes.data(), std::streamsize(bytes.size()));
                 if (!ic)
-                    std::fprintf(stderr, "[macapk] icon write %s failed\n", dst.c_str());
+                    std::fprintf(stderr, "[macapk] icon write %s failed\n",
+                                 (app_dir / "icon.png").c_str());
             }
         }
-        if (xml_wins)
-            std::fprintf(stderr,
-                "[macapk] launcher icon is an anydpi XML (adaptive/vector), which "
-                "Android prefers over every density raster; icon.png is left to the "
-                "framework rasterizer%s\n",
-                entry.empty() ? "" : " (the raster is kept as a fallback)");
     }
 
     std::ofstream out(app_dir / "meta.json");

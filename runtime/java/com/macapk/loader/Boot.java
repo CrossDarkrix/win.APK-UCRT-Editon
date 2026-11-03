@@ -804,6 +804,7 @@ public final class Boot {
 
     public static void run(String apkPath, String appJar, String appDir, String manifestPath) {
         bootClock("Boot.run entered");
+        installHostTrustAnchors();
         prefetchFrameworkResources();
         // MACAPK_BOOTSPEED_OVERLAP defers the AWT init to the resource-index
         // build below (buildResourceIndexWhileAwtInits) so the two overlap. Not
@@ -1238,7 +1239,11 @@ public final class Boot {
         // after VM init (verified: changing it post-init doesn't
         // disturb GC / classloader / module logic).
         System.setProperty("os.name", "Linux");
-        System.setProperty("os.arch", "aarch64");
+        // uname's machine, as Android reports it: x86_64 on an x86_64 host
+        // (Win.apk on Windows x64, whose apps are x86_64), aarch64 elsewhere.
+        String hostArch = System.getProperty("os.arch", "");
+        System.setProperty("os.arch",
+            "amd64".equals(hostArch) || "x86_64".equals(hostArch) ? "x86_64" : "aarch64");
         // os.name / os.arch / os.version are ONE triple on Android: libcore's
         // System.initUnchangeableSystemProperties fills all three from a single
         // uname() -- p.put("os.name", info.sysname); p.put("os.arch",
@@ -1255,23 +1260,6 @@ public final class Boot {
         System.setProperty("java.vm.name", "Dalvik");
         System.setProperty("java.vendor", "The Android Project");
         System.setProperty("java.runtime.name", "Android Runtime");
-        // The rest of the vendor/name set libcore documents as "always provided
-        // by the Dalvik VM" (AOSP libcore ojluni java/lang/System.java,
-        // getProperties javadoc table, android14-release). Versions are left at
-        // the host's on purpose: the JDK itself parses java.specification.version.
-        // Measured on SmartTube: J2V8's PlatformDetector.OS.getName() answers
-        // "android" only when java.specification.vendor contains "android";
-        // ours said the JDK vendor, so J2V8 took the desktop "linux" path, never
-        // loaded the APK's libj2v8.so, the nsig solver had no JS engine and no
-        // video stream URL could be decoded.
-        System.setProperty("java.vendor.url", "http://www.android.com/");
-        System.setProperty("java.specification.vendor", "The Android Project");
-        System.setProperty("java.specification.name", "Dalvik Core Library");
-        System.setProperty("java.vm.vendor", "The Android Project");
-        System.setProperty("java.vm.specification.vendor", "The Android Project");
-        System.setProperty("java.vm.specification.name", "Dalvik Virtual Machine Specification");
-        // AOSP RuntimeInit.commonInit sets the default HTTP User-Agent here.
-        HttpAgent.install();
 
         if (!NativeCocoa.init()) {
             NativeLog.e(TAG, "NativeCocoa.init() failed");
@@ -1811,22 +1799,11 @@ public final class Boot {
         }
         // /system/etc/fonts.xml + /system/fonts for a guest that draws text in
         // native code (Flutter's Skia reads them at engine start). Written once per
-        // font set, so a warm launch is the CoreText name lookups for the CJK
-        // candidates plus a stat each (~20 ms on a cold process, under 1 ms once
-        // CoreText's registry is up; the line below logs it). Same timing rule as
-        // the calls above: after RegisterNatives, before any guest code runs.
+        // font set, so a warm launch is one stat. Same timing rule as the calls
+        // above: after RegisterNatives, before any guest code runs.
         try {
-            // The resolver is CoreText (NativeCocoa.hostFontFile): the CJK
-            // families come from the Mac's own Chinese / Hiragino / Apple SD
-            // Gothic Neo (android.graphics.MacApkHostFonts).
-            long sysFontsT0 = System.nanoTime();
-            String sysFonts = android.graphics.MacApkSystemFonts.materialize(ps -> {
-                try { return NativeCocoa.hostFontFile(ps); }
-                catch (Throwable t) { return null; }   // a runtime without the native
-            });
+            String sysFonts = android.graphics.MacApkSystemFonts.materialize();
             if (sysFonts != null) NativeCocoa.setSystemFontsDir(sysFonts);
-            NativeLog.i(TAG, "system fonts: " + sysFonts + " ("
-                    + (System.nanoTime() - sysFontsT0) / 100_000 / 10.0 + " ms)");
         } catch (Throwable t) {
             NativeLog.w(TAG, "system fonts publish failed (/system/fonts stays absent): " + t);
         }
@@ -1854,14 +1831,6 @@ public final class Boot {
         // creates nothing in their place. Never throws.
         SharedStorage.mapUserFolders();
         SharedStorage.ensureDefaultFolders();
-        // One shared volume for every installed app (MACAPK_SHARED_SDCARD,
-        // SharedStorage.linkSharedVolume): the shared top-level folders appear in
-        // this app's volume as links; Android/ stays the app's own. Never throws.
-        SharedStorage.linkSharedVolume();
-        // ...and ONE path for that volume in every installed app, as on a device
-        // (SharedStorage.adoptCanonicalVolume; MACAPK_STORAGE_ONE_PATH=0 skips
-        // it), so a path one app hands another names the same file. Never throws.
-        SharedStorage.adoptCanonicalVolume();
 
         // ---- 3b. AndroidKeyStore JCE provider ----
         // Real Android registers the "AndroidKeyStore" security provider in
@@ -2236,7 +2205,9 @@ public final class Boot {
                 // would kill the process, but Mac.apk logs and continues so one
                 // unsupported line in an override cannot cost us the whole launch.
                 try {
-                    android.content.Context appBase = macapkRawBaseContext(application);
+                    // The field, not getBaseContext(): an app may override that
+                    // (WhatsApp's returns null until this very dispatch has run).
+                    android.content.Context appBase = application.macapkRawBaseContext();
                     if (appBase != null) {
                         // DIAGNOSTIC (MACAPK_STACK_PAD=<n>, default OFF): dispatch
                         // attachBaseContext through <n> extra nested frames so
@@ -2273,7 +2244,7 @@ public final class Boot {
                         // on it; see Application.java's constructor comment). Put
                         // it back rather than let a single override reintroduce a
                         // fixed bug process-wide.
-                        if (macapkRawBaseContext(application) == null) {
+                        if (application.macapkRawBaseContext() == null) {
                             application.macapkAttachBaseContext(appBase);
                             NativeLog.w(TAG, application.getClass().getName()
                                       + ".attachBaseContext nulled the base Context"
@@ -2587,7 +2558,7 @@ public final class Boot {
         // calls inside the activity (setContentView, etc.) hop to
         // main via dispatch_async in the bridge.
         final Intent intent = new Intent(Intent.ACTION_MAIN);
-        intent.addCategory(manifest.launchableCategory);
+        intent.addCategory(Intent.CATEGORY_LAUNCHER);
         intent.setClassName(manifest.packageName, manifest.launchableActivity);
         // Generic diagnostic launch override (env-gated, OFF by default).
         // Mirrors `adb shell am start -n <pkg>/<activity> -e k v ...` so a
@@ -2599,6 +2570,7 @@ public final class Boot {
         //   MACAPK_LAUNCH_ACTIVITY=<class>  (leading '.' => prefix package)
         //   MACAPK_LAUNCH_ACTION=<action>   (optional; default ACTION_MAIN)
         //   MACAPK_LAUNCH_EXTRAS=k1=v1;k2=v2 (optional; String extras)
+        //   MACAPK_LAUNCH_DATA=<uri>        (optional; the data Uri, `am start -d`)
         {
             String ovAct = System.getenv("MACAPK_LAUNCH_ACTIVITY");
             if (ovAct != null && !ovAct.isEmpty()) {
@@ -2618,8 +2590,11 @@ public final class Boot {
                         }
                     }
                 }
+                String data = System.getenv("MACAPK_LAUNCH_DATA");
+                if (data != null && !data.isEmpty()) intent.setData(android.net.Uri.parse(data));
                 NativeLog.i(TAG, "launch override -> " + cls
                         + " action=" + intent.getAction()
+                        + " data=" + intent.getDataString()
                         + " extras=" + extras);
             }
         }
@@ -2704,10 +2679,6 @@ public final class Boot {
         // install-time filter registration a device's PackageManager does), off
         // the boot path; a no-op in a dev run.
         HostUrlIntake.registerAsync(manifest.packageName, manifest);
-        // Verify this app's autoVerify App Link hosts (assetlinks.json against
-        // the APK's real signing certificate), as a device's verifier does.
-        AppLinks.verifyAsync(manifest.packageName, manifest,
-                application != null ? application.getPackageManager() : null);
         // appClFinal was already captured and applied as macapk-activity's
         // context ClassLoader further up (right before step 4, so it would
         // already be in place for the Application/provider-init task too --
@@ -2839,11 +2810,11 @@ public final class Boot {
     // app's attachBaseContext (and any executeVM it invokes) runs under a deeper
     // Java call stack. Distinct frame per recursion (real method frames).
     /** The Application's real base Context (ContextWrapper's private field),
-     *  read directly so an app that overrides getBaseContext() does not make
-     *  Boot skip dispatching attachBaseContext. WhatsApp's AppShell returns
-     *  null from getBaseContext() until its own attachBaseContext runs, so the
-     *  skip left its AppContext unset and every onCreate threw. Falls back to
-     *  the public getter if the field moves. */
+     *  read directly so an app that overrides getBaseContext() -- WhatsApp's
+     *  AppShell returns null there until its own attachBaseContext runs -- does
+     *  not make Boot skip dispatching attachBaseContext, which would leave the
+     *  app's AppContext unset and every onCreate throwing. Falls back to the
+     *  public getter if the field moves. */
     private static android.content.Context macapkRawBaseContext(android.app.Application application) {
         try {
             java.lang.reflect.Field f = android.content.ContextWrapper.class.getDeclaredField("baseContext");
@@ -2851,6 +2822,62 @@ public final class Boot {
             return (android.content.Context) f.get(application);
         } catch (Throwable t) {
             return application.getBaseContext();
+        }
+    }
+
+    /**
+     * On Windows, the trust anchors every TLS connection checks against are the
+     * JDK's CAs AND the ones Windows itself trusts. On a device the system store
+     * holds what the user's device trusts; on a PC that is the Windows root
+     * store, which also holds the root of a filtering proxy (NetFree), a
+     * company's TLS inspection or a locally installed CA. With the JDK's
+     * cacerts alone every app connection behind such a proxy failed with "PKIX
+     * path building failed". The Windows store alone is not enough either: it
+     * fetches public roots on demand, so one it never needed may be missing.
+     *
+     * The merged set is written to a PKCS12 file and made the JVM's default
+     * trust store, before anything initialises TLS: apps (OkHttp, Volley,
+     * Conscrypt-style code) build their trust managers from
+     * TrustManagerFactory.init((KeyStore) null), which reads exactly that
+     * default. An explicit javax.net.ssl.trustStore is left alone.
+     */
+    private static void installHostTrustAnchors() {
+        if (!System.getProperty("os.name", "").startsWith("Windows")) return;
+        if (System.getProperty("javax.net.ssl.trustStore") != null) return;
+        try {
+            java.security.KeyStore merged = java.security.KeyStore.getInstance("PKCS12");
+            merged.load(null, null);
+            int n = 0;
+            javax.net.ssl.TrustManagerFactory jdk = javax.net.ssl.TrustManagerFactory.getInstance(
+                javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+            jdk.init((java.security.KeyStore) null);
+            for (javax.net.ssl.TrustManager tm : jdk.getTrustManagers()) {
+                if (!(tm instanceof javax.net.ssl.X509TrustManager)) continue;
+                for (java.security.cert.X509Certificate c : ((javax.net.ssl.X509TrustManager) tm).getAcceptedIssuers()) {
+                    merged.setCertificateEntry("jdk-" + (n++), c);
+                }
+            }
+            int fromWindows = 0;
+            java.security.KeyStore win = java.security.KeyStore.getInstance("Windows-ROOT");
+            win.load(null, null);
+            for (java.util.Enumeration<String> e = win.aliases(); e.hasMoreElements();) {
+                java.security.cert.Certificate c = win.getCertificate(e.nextElement());
+                if (c == null || merged.getCertificateAlias(c) != null) continue;
+                merged.setCertificateEntry("windows-" + (fromWindows++), c);
+            }
+            java.io.File file = java.io.File.createTempFile("winapk-trust-", ".p12");
+            file.deleteOnExit();
+            char[] password = "winapk".toCharArray();
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+                merged.store(out, password);
+            }
+            System.setProperty("javax.net.ssl.trustStore", file.getAbsolutePath());
+            System.setProperty("javax.net.ssl.trustStoreType", "PKCS12");
+            System.setProperty("javax.net.ssl.trustStorePassword", "winapk");
+            NativeLog.i(TAG, "TLS trust anchors: " + n + " from the JDK + " + fromWindows
+                      + " more that Windows trusts");
+        } catch (Throwable t) {
+            NativeLog.w(TAG, "TLS trust anchors: kept the JDK's (" + t + ")");
         }
     }
 
@@ -3523,6 +3550,7 @@ public final class Boot {
             String[] candidates = {
                 "bin/macapk-translator",
                 "macapk-translator",
+                "bin/macapk-translator.exe",  // the Windows host's
             };
             for (String rel : candidates) {
                 File c = new File(buildDir, rel);
@@ -3731,8 +3759,11 @@ public final class Boot {
                     (android.content.ContentProvider) instance;
                 android.content.pm.ProviderInfo info =
                     new android.content.pm.ProviderInfo();
+                // The STRING a "@string/x" android:authorities names, as AOSP's
+                // parser hands it on (Manifest.ProviderEntry.resolvedAuthorities).
+                final String authorities = entry.resolvedAuthorities(application.getResources());
                 info.name        = entry.name;
-                info.authority   = entry.authorities;
+                info.authority   = authorities;
                 info.packageName = application.getPackageName();
                 info.initOrder   = entry.initOrder;
                 info.exported    = entry.exported;
@@ -3763,9 +3794,9 @@ public final class Boot {
                 // against a content:// URI actually dispatch to this
                 // provider. Manifest-driven (authorities come straight
                 // from android:authorities), so it is app-agnostic.
-                if (entry.authorities != null && !entry.authorities.isEmpty()) {
+                if (authorities != null && !authorities.isEmpty()) {
                     android.content.ContentProviderRegistry.register(
-                        entry.authorities, provider);
+                        authorities, provider);
                 }
             } catch (ClassNotFoundException cnf) {
                 // Many APKs declare optional providers (different

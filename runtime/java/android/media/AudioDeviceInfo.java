@@ -50,11 +50,31 @@ public final class AudioDeviceInfo {
     private final int mType;
     private final boolean mIsSink;
     private final int mId;
+    private final String mProductName;
+    private final String mAddress;
+    private final int[] mSampleRates;
+    private final int[] mChannelCounts;
 
-    public AudioDeviceInfo() { this(TYPE_BUILTIN_SPEAKER, true, 1); }
+    public AudioDeviceInfo() { this(TYPE_BUILTIN_SPEAKER, true, 1, "Mac.apk", "", new int[] {48000, 44100}, new int[] {2}); }
 
     private AudioDeviceInfo(int type, boolean isSink, int id) {
+        this(type, isSink, id, "Mac.apk", "", new int[] {48000, 44100}, isSink ? new int[] {2} : new int[] {1, 2});
+    }
+
+    static AudioDeviceInfo hostOutput(int type, int id, String name, String address,
+                                      int sampleRate, int channels) {
+        return new AudioDeviceInfo(type, true, id, name, address,
+                sampleRate > 0 ? new int[] {sampleRate} : new int[0],
+                channels > 0 ? new int[] {channels} : new int[0]);
+    }
+
+    private AudioDeviceInfo(int type, boolean isSink, int id, String name, String address,
+                            int[] sampleRates, int[] channelCounts) {
         mType = type; mIsSink = isSink; mId = id;
+        mProductName = name == null ? "" : name;
+        mAddress = address == null ? "" : address;
+        mSampleRates = sampleRates == null ? new int[0] : sampleRates.clone();
+        mChannelCounts = channelCounts == null ? new int[0] : channelCounts.clone();
     }
 
     /** The CoreAudio default output, as an output-direction descriptor. */
@@ -72,12 +92,12 @@ public final class AudioDeviceInfo {
 
     public int getId()                 { return mId; }
     public int getType()               { return mType; }
-    public CharSequence getProductName() { return "Mac.apk"; }
+    public CharSequence getProductName() { return mProductName; }
     public boolean isSink()            { return mIsSink; }
     public boolean isSource()          { return !mIsSink; }
-    public int[] getSampleRates()      { return new int[] { 48000, 44100 }; }
-    public int[] getChannelCounts()    { return mIsSink ? new int[] { 2 } : new int[] { 1, 2 }; }
-    public String getAddress()         { return ""; }
+    public int[] getSampleRates()      { return mSampleRates.clone(); }
+    public int[] getChannelCounts()    { return mChannelCounts.clone(); }
+    public String getAddress()         { return mAddress; }
     // AOSP getEncodings/getChannelMasks/getChannelIndexMasks describe the
     // device's supported PCM formats. CoreAudio's default output is 16-bit and
     // float PCM stereo; report that. The input side accepts the same encodings
