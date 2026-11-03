@@ -2974,6 +2974,7 @@ public final class ActivityHost {
     }
 
     public static void start(Intent intent) {
+        if (WindowsAppsBridge.launch(intent)) return;
         // v1.0.99 pinned the "main thread" to whatever thread ran this method,
         // because that thread constructed the Activity and androidx's
         // LifecycleRegistry.enforceMainThreadIfNeeded rejects an observer add

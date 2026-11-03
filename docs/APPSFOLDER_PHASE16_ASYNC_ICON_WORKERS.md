@@ -1,0 +1,2 @@
+# Phase 16 asynchronous icon workers
+Catalog/AUMID metadata is published as soon as enumeration finishes. Four daemon workers perform Shell icon extraction and populate existing caches without blocking app startup. Progress is logged every 32 completions. PowerShell stdout and stderr are drained concurrently while the process runs, preventing redirected-pipe backpressure from causing the Phase 15 timeout.

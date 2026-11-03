@@ -148,6 +148,7 @@ public final class MacApkPackageManager extends PackageManager {
 
     @Override public PackageInfo getPackageInfo(String packageName, int flags)
             throws NameNotFoundException {
+        WindowsAppsBridge.App wa=WindowsAppsBridge.byPackage(packageName);if(wa!=null)return WindowsAppsBridge.packageInfo(wa);
         // AOSP: getPackageInfo throws NameNotFoundException for a package that is
         // NOT installed. Mac.apk runs exactly one APK, so only the running app
         // (this.packageName) is installed -- a BROWSED / other package is not.
@@ -1056,6 +1057,7 @@ public final class MacApkPackageManager extends PackageManager {
 
     @Override public ApplicationInfo getApplicationInfo(String packageName, int flags)
             throws NameNotFoundException {
+        WindowsAppsBridge.App wa=WindowsAppsBridge.byPackage(packageName);if(wa!=null)return WindowsAppsBridge.applicationInfo(wa);
         // Same AOSP contract as getPackageInfo: a non-installed (non-self) package
         // throws NameNotFoundException. A NULL name is not our package either --
         // it names nothing, so it cannot be installed, and AOSP throws rather
@@ -1852,6 +1854,7 @@ public final class MacApkPackageManager extends PackageManager {
                 if (pi != null) out.add(pi);
             } catch (Throwable ignored) {}
         }
+        WindowsAppsBridge.appendPackages(out);
         return out;
     }
 
@@ -1868,6 +1871,7 @@ public final class MacApkPackageManager extends PackageManager {
                 if (pi != null && pi.applicationInfo != null) out.add(pi.applicationInfo);
             } catch (Throwable ignored) {}
         }
+        WindowsAppsBridge.appendApps(out);
         return out;
     }
 
@@ -1966,6 +1970,7 @@ public final class MacApkPackageManager extends PackageManager {
     @Override public android.content.pm.ActivityInfo getActivityInfo(
             ComponentName component, int flags)
             throws android.content.pm.PackageManager.NameNotFoundException {
+        WindowsAppsBridge.App wa=WindowsAppsBridge.byComponent(component);if(wa!=null)return WindowsAppsBridge.activityInfo(wa);
         return componentInfo(component, flags, false);
     }
 
@@ -2652,7 +2657,14 @@ public final class MacApkPackageManager extends PackageManager {
      *  bestMatchPriority). Disabled components are skipped, the same way
      *  PackageManagerService omits them (this is the same rule findLaunchable
      *  already applies for the launcher activity). */
+    @Override public CharSequence getApplicationLabel(ApplicationInfo i){WindowsAppsBridge.App a=i==null?null:WindowsAppsBridge.byPackage(i.packageName);return a!=null?a.label:super.getApplicationLabel(i);}
+    @Override public android.graphics.drawable.Drawable getApplicationIcon(ApplicationInfo i){WindowsAppsBridge.App a=i==null?null:WindowsAppsBridge.byPackage(i.packageName);android.graphics.drawable.Drawable d=a==null?null:WindowsAppsBridge.icon(a);return d!=null?d:super.getApplicationIcon(i);}
+    @Override public android.graphics.drawable.Drawable getApplicationIcon(String p){WindowsAppsBridge.App a=WindowsAppsBridge.byPackage(p);android.graphics.drawable.Drawable d=a==null?null:WindowsAppsBridge.icon(a);return d!=null?d:super.getApplicationIcon(p);}
+    @Override public android.graphics.drawable.Drawable getActivityIcon(ComponentName c)throws NameNotFoundException{WindowsAppsBridge.App a=WindowsAppsBridge.byComponent(c);android.graphics.drawable.Drawable d=a==null?null:WindowsAppsBridge.icon(a);return d!=null?d:super.getActivityIcon(c);}
+
     @Override public List<ResolveInfo> queryIntentActivities(Intent intent, int flags) {
+        java.util.List<ResolveInfo> wr=WindowsAppsBridge.query(intent);
+        if(intent!=null&&((intent.getComponent()!=null&&WindowsAppsBridge.isWindowsPackage(intent.getComponent().getPackageName()))||WindowsAppsBridge.isWindowsPackage(intent.getPackage())))return wr;
         Manifest m = manifest();
         if (m == null || intent == null) return Collections.emptyList();
         java.util.List<ResolveInfo> out = new java.util.ArrayList<>();
@@ -2859,6 +2871,7 @@ public final class MacApkPackageManager extends PackageManager {
                 if (listed) out.add(row);
             }
         }
+        WindowsAppsBridge.appendResolve(out,intent);
         return out;
     }
 

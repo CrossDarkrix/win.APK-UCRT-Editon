@@ -129,6 +129,11 @@ public final class NativeCocoa {
     // v1.0.690: open a URL/URI on the macOS host (NSWorkspace). The
     // resolution target for an implicit ACTION_VIEW/SENDTO/DIAL intent.
     public static native boolean openHostUrl(String url);
+    public static native String[] windowsAppsEnumerate();
+    public static native String[] windowsStartApps();
+    public static native int[] windowsAppIconArgb(String stableId, int size);
+    public static native int[] windowsAppIconArgbAumid(String stableId, String aumid, int size);
+    public static native boolean windowsAppLaunch(String stableId);
     /** Host URL intake (MACAPK_URL_SCHEMES): every URL LaunchServices handed this
      *  app through kAEGetURL since the last call, oldest first, and clears the
      *  queue. See HostUrlIntake. */

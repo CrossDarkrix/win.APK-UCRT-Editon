@@ -1,0 +1,2 @@
+# Phase 16.2 CLIXML progress suppression
+Sets PowerShell ProgressPreference, VerbosePreference, DebugPreference and InformationPreference to SilentlyContinue in the existing UTF-16LE EncodedCommand. Native stderr logging additionally ignores only successful CLIXML payloads containing progress records and no error records. Nonzero exits and actual error records remain warnings. Phase 16.1 thread header and Phase 16 asynchronous icon workers are unchanged.

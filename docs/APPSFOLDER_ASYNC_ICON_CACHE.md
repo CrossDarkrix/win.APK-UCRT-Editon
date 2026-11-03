@@ -1,0 +1,2 @@
+# AppsFolder asynchronous icon cache
+Icon extraction no longer runs on the Android UI caller. A bounded two-thread daemon executor prefetches up to 96 visible-candidate icons and caches Drawables by stable id and size. Missing icons are retried after 30 seconds. Native extraction is cached too. IShellItemImageFactory is primary; SHGetFileInfoW plus DrawIconEx is the fallback for namespace items whose image factory returns no bitmap.

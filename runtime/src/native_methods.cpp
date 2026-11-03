@@ -245,6 +245,12 @@ jlong Cocoa_getPlaceholderWindow(JNIEnv*, jclass) {
 // intent -- the honest Mac-native answer for "open this http/mailto/tel link"
 // when there is no in-APK component to hand it to. Returns true if the host
 // accepted it.
+jobjectArray Cocoa_windowsAppsEnumerate(JNIEnv* e,jclass){jclass c=e->FindClass("java/lang/String");return e->NewObjectArray(0,c,nullptr);}
+jobjectArray Cocoa_windowsStartApps(JNIEnv* e,jclass){jclass c=e->FindClass("java/lang/String");return e->NewObjectArray(0,c,nullptr);}
+jintArray Cocoa_windowsAppIconArgb(JNIEnv*,jclass,jstring,jint){return nullptr;}
+jintArray Cocoa_windowsAppIconArgbAumid(JNIEnv*,jclass,jstring,jstring,jint){return nullptr;}
+jboolean Cocoa_windowsAppLaunch(JNIEnv*,jclass,jstring){return JNI_FALSE;}
+
 jboolean Cocoa_openHostUrl(JNIEnv* env, jclass, jstring url_j) {
     if (!url_j) return JNI_FALSE;
     const char* url = env->GetStringUTFChars(url_j, nullptr);
@@ -764,6 +770,11 @@ const JNINativeMethod kNativeCocoaMethods[] = {
      reinterpret_cast<void*>(Cocoa_runLoop)},
     {const_cast<char*>("openHostUrl"),            const_cast<char*>("(Ljava/lang/String;)Z"),
      reinterpret_cast<void*>(Cocoa_openHostUrl)},
+    {const_cast<char*>("windowsAppsEnumerate"),const_cast<char*>("()[Ljava/lang/String;"),reinterpret_cast<void*>(Cocoa_windowsAppsEnumerate)},
+    {const_cast<char*>("windowsStartApps"),const_cast<char*>("()[Ljava/lang/String;"),reinterpret_cast<void*>(Cocoa_windowsStartApps)},
+    {const_cast<char*>("windowsAppIconArgb"),const_cast<char*>("(Ljava/lang/String;I)[I"),reinterpret_cast<void*>(Cocoa_windowsAppIconArgb)},
+    {const_cast<char*>("windowsAppIconArgbAumid"),const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;I)[I"),reinterpret_cast<void*>(Cocoa_windowsAppIconArgbAumid)},
+    {const_cast<char*>("windowsAppLaunch"),const_cast<char*>("(Ljava/lang/String;)Z"),reinterpret_cast<void*>(Cocoa_windowsAppLaunch)},
     {const_cast<char*>("takeHostUrls"),           const_cast<char*>("()[Ljava/lang/String;"),
      reinterpret_cast<void*>(Cocoa_takeHostUrls)},
     {const_cast<char*>("urlSchemeHandlers"),      const_cast<char*>("(Ljava/lang/String;)[Ljava/lang/String;"),

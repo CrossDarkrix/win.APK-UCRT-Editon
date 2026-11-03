@@ -1,0 +1,2 @@
+# Phase 15 Shell icon extraction
+Fixes CreateProcess exit=2 by launching the absolute System32\WindowsPowerShell\v1.0\powershell.exe path. Adds PIDL parent-folder IExtractIconW acquisition through SHBindToParent and IShellFolder::GetUIObjectOf. Uses GetIconLocation and Extract first, then ExtractIconExW when the handler returns a filename/index pair. HICON is rendered into a 32-bit DIB and cached as ARGB. Existing ImageFactory, SHGetFileInfo, AUMID and preload routes remain.
