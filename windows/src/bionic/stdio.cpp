@@ -11,6 +11,7 @@
 // elements stand for the same three streams.
 
 #include "bionic_internal.h"
+#include "../../host/audio_engine.h"
 #include "winapk/linker.h"
 
 #include <cerrno>
@@ -24,6 +25,13 @@
 #include <io.h>
 #include <sys/stat.h>
 #include <windows.h>
+#include <cstdint>
+#include <deque>
+#include <condition_variable>
+#include <chrono>
+#include <cmath>
+#include <memory>
+#include <unordered_set>
 #include <bcrypt.h>
 
 namespace winapk::bionic {
@@ -284,7 +292,128 @@ WINAPK_GUEST_ABI int g_fcntl(int fd, int cmd, int64_t arg) {
         default: (void)arg; *guest_errno() = kEINVAL; return -1;
     }
 }
+
+// Phase 20-B2.2: x86_64 usbdevfs URB ABI, failure-stop, cancellation and real-time pacing.
+namespace {
+constexpr int kP20FdBase=0x5A20,kP20FdLimit=0x7A20; int g_p20_active_fd=-1; uint64_t g_p20_session_id=0;
+constexpr uint32_t kP20Submit=0x8038550au,kP20Discard=0x0000550bu,kP20Reap=0x4008550cu,kP20ReapNd=0x4008550du;
+constexpr uint32_t kP20GetSpeed=0x0000551fu,kP20SetInterface=0x80085504u,kP20Claim=0x8004550fu,kP20Release=0x80045510u;
+struct P20Iso { uint32_t length,actual_length; int32_t status; };
+struct P20Urb { uint8_t type,endpoint; int32_t status; uint32_t flags; void* buffer; int32_t buffer_length,actual_length,start_frame,number_of_packets,error_count; uint32_t signr; void* usercontext; };
+static_assert(sizeof(P20Iso)==12,"usbdevfs_iso_packet_desc ABI");
+static_assert(sizeof(P20Urb)==56,"x86_64 usbdevfs_urb ABI");
+static_assert(offsetof(P20Urb,status)==4&&offsetof(P20Urb,flags)==8&&offsetof(P20Urb,buffer)==16&&offsetof(P20Urb,buffer_length)==24&&offsetof(P20Urb,number_of_packets)==36&&offsetof(P20Urb,usercontext)==48,"x86_64 usbdevfs_urb offsets");
+struct P20Pending { P20Urb* urb; void* submit_urb; void* submit_buffer; std::chrono::steady_clock::time_point ready; uint64_t generation,submit_id,pool_epoch; };
+std::mutex g_p20_lock; std::condition_variable g_p20_cv; std::deque<P20Pending> g_p20_pending; std::shared_ptr<winapk::audio::Stream> g_p20_stream;
+std::unordered_set<P20Urb*> g_p20_current_pool,g_p20_retired_pool;
+bool g_p20_pool_building=true,g_p20_alt_zero_boundary=false,g_p20_reap_gate=false;
+uint64_t g_p20_pool_epoch=1; size_t g_p20_gate_submits=0; std::chrono::steady_clock::time_point g_p20_gate_until{};
+uint64_t g_p20_bytes=0,g_p20_urbs=0,g_p20_generation=1,g_p20_submit_id=0,g_p20_stale_dropped=0,g_p20_duplicate_submit=0,g_p20_silent_urbs=0,g_p20_nonzero_urbs=0,g_p20_nonzero_frames=0,g_p20_pool_recoveries=0; bool g_p20_failed=false,g_p20_active=true,g_p20_first_nonzero_logged=false; uint32_t g_p20_alt=0; int g_p20_rate=96000; std::chrono::steady_clock::time_point g_p20_timeline{};
+int p20_rate_for_alt(uint32_t alt){static constexpr int rates[]={0,44100,48000,88200,96000,176400,192000};return alt<sizeof(rates)/sizeof(rates[0])?rates[alt]:0;}
+int p20_alt_for_rate(int rate){static constexpr int rates[]={0,44100,48000,88200,96000,176400,192000};for(int alt=1;alt<=6;alt++)if(rates[alt]==rate)return alt;return 0;}
+int p20_rate_from_urb(size_t bytes,int packets){
+ if(bytes==0||packets<=0)return 0;
+ const uint64_t estimate=(uint64_t(bytes)*8000ULL+uint64_t(packets)*3ULL)/(uint64_t(packets)*6ULL);
+ static constexpr int rates[]={44100,48000,88200,96000,176400,192000};
+ int best=0;uint64_t error=~uint64_t(0);
+ for(int rate:rates){uint64_t e=estimate>uint64_t(rate)?estimate-uint64_t(rate):uint64_t(rate)-estimate;if(e<error){error=e;best=rate;}}
+ return error<=1500?best:0;
+}
+void p20_dump(const void* p,size_t n){auto* b=static_cast<const uint8_t*>(p);std::fprintf(stderr,"[I] Phase20-B2.2: URB raw");for(size_t i=0;i<n;i++)std::fprintf(stderr,"%s%02x",i%16?" ":"\n  ",unsigned(b[i]));std::fputc('\n',stderr);}
+void p20_start(){if(!g_p20_stream){const int buffer_frames=(std::max)(g_p20_rate/10,1024);g_p20_stream=winapk::audio::usb_direct_stream_create(g_p20_rate,2,4,buffer_frames);if(g_p20_stream)winapk::audio::stream_play(g_p20_stream.get());std::fprintf(stderr,"[I] Phase20-B2.3.3.2: dedicated multirate PCM sink rate=%d alt=%u channels=2 float=%s bufferFrames=%d generation=%llu\n",g_p20_rate,g_p20_alt,g_p20_stream?"ok":"failed",buffer_frames,(unsigned long long)g_p20_generation);}}
+void p20_retire_pool_locked(){
+ g_p20_retired_pool.insert(g_p20_current_pool.begin(),g_p20_current_pool.end());
+ g_p20_current_pool.clear();
+ g_p20_pool_building=true;
+ ++g_p20_pool_epoch;
+}
+void p20_soft_boundary_locked(const char* reason){
+ const size_t old_pool=g_p20_current_pool.size(),pending=g_p20_pending.size();
+ // Do not clear pending completions and do not change generation. The blocking
+ // REAP remains attached to the same queue and can consume the old pool's
+ // already-scheduled completions before naturally moving to the replacement pool.
+ g_p20_retired_pool.insert(g_p20_current_pool.begin(),g_p20_current_pool.end());
+ g_p20_current_pool.clear();g_p20_pool_building=true;++g_p20_pool_epoch;g_p20_reap_gate=true;g_p20_gate_submits=0;g_p20_gate_until={};
+ if(g_p20_stream){winapk::audio::stream_stop(g_p20_stream.get());winapk::audio::stream_release(g_p20_stream);g_p20_stream.reset();}
+ g_p20_timeline={};++g_p20_pool_recoveries;g_p20_failed=false;g_p20_active=true;
+ std::fprintf(stderr,"[I] Phase20-B2.3.4.6: USB DAC soft boundary reason=%s oldPool=%zu pendingPreserved=%zu generation=%llu poolEpoch=%llu boundaries=%llu reapPreserved=1\\n",reason,old_pool,pending,(unsigned long long)g_p20_generation,(unsigned long long)g_p20_pool_epoch,(unsigned long long)g_p20_pool_recoveries);
+}
+void p20_stop_stream_locked(const char* reason){p20_soft_boundary_locked(reason);}
+void p20_observe_urb_pool_locked(P20Urb* u){
+ if(!u)return;
+ if(g_p20_pool_building){
+  const bool repeated=g_p20_current_pool.count(u)!=0;
+  g_p20_current_pool.insert(u);g_p20_retired_pool.erase(u);
+  if(repeated&&g_p20_current_pool.size()>=4){g_p20_pool_building=false;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: URB pool established size=%zu generation=%llu poolEpoch=%llu\n",g_p20_current_pool.size(),(unsigned long long)g_p20_generation,(unsigned long long)g_p20_pool_epoch);}
+  return;
+ }
+ if(g_p20_current_pool.count(u)){g_p20_retired_pool.erase(u);return;}
+ // Once a ring has repeated, one unseen pointer is enough to identify a new
+ // player/decoder pool. This deliberately favors recovery over preservation.
+ p20_soft_boundary_locked("first-unseen-urb-after-established-pool");
+ g_p20_current_pool.insert(u);g_p20_retired_pool.erase(u);
+}
+void p20_cancel_locked(const char* reason,bool reset){const size_t cancelled=g_p20_pending.size();for(auto& p:g_p20_pending)if(p.urb)p.urb->status=-2;g_p20_pending.clear();if(reset)p20_retire_pool_locked();if(g_p20_stream){winapk::audio::stream_stop(g_p20_stream.get());winapk::audio::stream_release(g_p20_stream);g_p20_stream.reset();}g_p20_timeline={};if(reset){g_p20_generation++;g_p20_failed=false;g_p20_active=true;}g_p20_cv.notify_all();fd_notify();std::fprintf(stderr,"[I] Phase20-B2.3.4.5: stop reason=%s cancelled=%zu pending=0 generation=%llu reset=%d poolEpoch=%llu staleDropped=%llu duplicateSubmit=%llu\n",reason,cancelled,(unsigned long long)g_p20_generation,reset?1:0,(unsigned long long)g_p20_pool_epoch,(unsigned long long)g_p20_stale_dropped,(unsigned long long)g_p20_duplicate_submit);}
+int p20_reject(P20Urb* u,const char* why){if(u)u->status=-22;g_p20_failed=true;g_p20_active=false;std::fprintf(stderr,"[E] Phase20-B2.2: SUBMIT rejected reason=%s session=FAILED_STOPPED generation=%llu\n",why,(unsigned long long)g_p20_generation);p20_cancel_locked("submit-invalid",false);*guest_errno()=22;return -1;}
+int p20_submit(void* arg){
+ if(!arg){*guest_errno()=14;g_p20_failed=true;g_p20_active=false;return -1;}auto* u=static_cast<P20Urb*>(arg);p20_observe_urb_pool_locked(u);
+ if(g_p20_urbs==0){std::fprintf(stderr,"[I] Phase20-B2.3: ABI=x86_64 size=56 type=%u ep=0x%02x status=%d flags=0x%x buffer=%p bufferLength=%d actual=%d start=%d packets=%d errors=%d signr=%u user=%p\n",unsigned(u->type),unsigned(u->endpoint),u->status,u->flags,u->buffer,u->buffer_length,u->actual_length,u->start_frame,u->number_of_packets,u->error_count,u->signr,u->usercontext);p20_dump(arg,56);}
+ if(g_p20_failed||!g_p20_active){*guest_errno()=32;return -1;}if(u->type!=0)return p20_reject(u,"type");if(u->endpoint!=1)return p20_reject(u,"endpoint");if(u->number_of_packets<=0||u->number_of_packets>1024)return p20_reject(u,"packet-count");if(!u->buffer||u->buffer_length<=0)return p20_reject(u,"buffer");
+ auto* src=static_cast<const uint8_t*>(u->buffer);auto* iso=reinterpret_cast<P20Iso*>(reinterpret_cast<uint8_t*>(u)+56);size_t off=0,total=0;std::vector<float> pcm;u->error_count=0;
+ for(int i=0;i<u->number_of_packets;i++){size_t n=iso[i].length;if(n>576||off+n>size_t(u->buffer_length))return p20_reject(u,"iso-range");size_t usable=n-n%6;pcm.reserve(pcm.size()+usable/3);for(size_t k=0;k<usable;k+=3){int32_t v=int32_t(src[off+k])|(int32_t(src[off+k+1])<<8)|(int32_t(src[off+k+2])<<16);if(v&0x800000)v|=~0xffffff;pcm.push_back(float(v)/8388608.0f);}iso[i].status=0;iso[i].actual_length=uint32_t(usable);off+=n;total+=usable;}
+ const int inferred_rate=p20_rate_from_urb(total,u->number_of_packets);
+ if(inferred_rate==0){std::fprintf(stderr,"[E] Phase20-B2.3.3.3: URB rate inference failed bytes=%zu packets=%d currentRate=%d currentAlt=%u\n",total,u->number_of_packets,g_p20_rate,g_p20_alt);return p20_reject(u,"rate-inference");}
+ const uint32_t inferred_alt=static_cast<uint32_t>(p20_alt_for_rate(inferred_rate));
+ if(g_p20_stream&&(g_p20_rate!=inferred_rate||g_p20_alt!=inferred_alt))p20_stop_stream_locked("urb-rate-change");
+ if(g_p20_rate!=inferred_rate||g_p20_alt!=inferred_alt||g_p20_urbs==0)std::fprintf(stderr,"[I] Phase20-B2.3.3.3: URB rate synchronized bytes=%zu packets=%d oldRate=%d oldAlt=%u newRate=%d newAlt=%u\n",total,u->number_of_packets,g_p20_rate,g_p20_alt,inferred_rate,inferred_alt);
+ g_p20_rate=inferred_rate;g_p20_alt=inferred_alt;g_p20_active=true;g_p20_failed=false;
+ double p20_sum_l=0,p20_sum_r=0;float p20_peak_l=0,p20_peak_r=0;size_t p20_nonzero=0,p20_frames=pcm.size()/2;for(size_t i=0;i+1<pcm.size();i+=2){float l=pcm[i],r=pcm[i+1];p20_peak_l=(std::max)(p20_peak_l,std::fabs(l));p20_peak_r=(std::max)(p20_peak_r,std::fabs(r));p20_sum_l+=double(l)*l;p20_sum_r+=double(r)*r;if(l!=0||r!=0)p20_nonzero++;}if(p20_nonzero){g_p20_nonzero_urbs++;g_p20_nonzero_frames+=p20_nonzero;}else g_p20_silent_urbs++;uint64_t p20_urb_no=g_p20_urbs+1;if(p20_urb_no==1||(!g_p20_first_nonzero_logged&&p20_nonzero)||(p20_urb_no%2500)==0){const char* kind=p20_nonzero?(!g_p20_first_nonzero_logged?"first-nonzero":"periodic-nonzero"):"silent";std::fprintf(stderr,"[I] Phase20-B2.3.1: PCM monitor kind=%s urb=%llu frames=%zu peakL=%.6f peakR=%.6f rmsL=%.6f rmsR=%.6f nonZero=%zu silentUrbs=%llu nonzeroUrbs=%llu nonzeroFrames=%llu\n",kind,(unsigned long long)p20_urb_no,p20_frames,p20_peak_l,p20_peak_r,p20_frames?std::sqrt(p20_sum_l/p20_frames):0.0,p20_frames?std::sqrt(p20_sum_r/p20_frames):0.0,p20_nonzero,(unsigned long long)g_p20_silent_urbs,(unsigned long long)g_p20_nonzero_urbs,(unsigned long long)g_p20_nonzero_frames);if(p20_nonzero)g_p20_first_nonzero_logged=true;}
+ p20_start();size_t wrote=g_p20_stream&&!pcm.empty()?winapk::audio::stream_write(g_p20_stream.get(),pcm.data(),pcm.size(),4,true):0;if(wrote<pcm.size()){u->status=-5;g_p20_failed=true;g_p20_active=false;p20_cancel_locked("wasapi-write",false);*guest_errno()=5;return -1;}
+ u->status=0;u->actual_length=int32_t(total);auto now=std::chrono::steady_clock::now();if(g_p20_timeline<now)g_p20_timeline=now;const uint64_t bytes_per_second=uint64_t((std::max)(1,g_p20_rate))*6ULL;auto duration=std::chrono::nanoseconds((total*1000000000ULL+bytes_per_second-1)/bytes_per_second);g_p20_timeline+=duration;for(auto it=g_p20_pending.begin();it!=g_p20_pending.end();){if(it->urb==u){if(it->urb)it->urb->status=-2;it=g_p20_pending.erase(it);g_p20_duplicate_submit++;}else ++it;}g_p20_current_pool.insert(u);g_p20_retired_pool.erase(u);const uint64_t submit_id=++g_p20_submit_id;g_p20_pending.push_back({u,u,u->buffer,g_p20_timeline,g_p20_generation,submit_id,g_p20_pool_epoch});if(g_p20_reap_gate){g_p20_gate_submits++;if(g_p20_gate_submits>=12&&g_p20_gate_until.time_since_epoch().count()==0){g_p20_gate_until=std::chrono::steady_clock::now()+std::chrono::milliseconds(20);g_p20_cv.notify_all();std::fprintf(stderr,"[I] Phase20-B2.3.4.8: REAP identity gate armed submitted=%zu delayMs=20 poolEpoch=%llu generation=%llu\n",g_p20_gate_submits,(unsigned long long)g_p20_pool_epoch,(unsigned long long)g_p20_generation);}}if(submit_id<=24||(submit_id%2500)==0)std::fprintf(stderr,"[I] Phase20-B2.3.4.8: SUBMIT identity urb=%p submitUrb=%p buffer=%p submit=%llu rate=%d poolEpoch=%llu pending=%zu\n",static_cast<void*>(u),static_cast<void*>(u),u->buffer,(unsigned long long)submit_id,g_p20_rate,(unsigned long long)g_p20_pool_epoch,g_p20_pending.size());g_p20_bytes+=total;g_p20_urbs++;g_p20_cv.notify_all();fd_notify();const int submit_errno_before=*guest_errno();*guest_errno()=0;if(submit_id<=24||(submit_id%2500)==0)std::fprintf(stderr,"[I] Phase20-B2.3.4.9: SUBMIT result urb=%p submit=%llu return=0 guestErrnoBefore=%d guestErrnoAfter=%d\n",static_cast<void*>(u),(unsigned long long)submit_id,submit_errno_before,*guest_errno());if(g_p20_urbs<=4||(g_p20_urbs%2500)==0)std::fprintf(stderr,"[I] Phase20-B2.3.1: SUBMIT accepted urb=%llu packets=%d pcmBytes=%zu rate=%d alt=%u queued=%zu paceUs=%lld generation=%llu submit=%llu duplicateSubmit=%llu\n",(unsigned long long)g_p20_urbs,u->number_of_packets,total,g_p20_rate,g_p20_alt,g_p20_pending.size(),(long long)std::chrono::duration_cast<std::chrono::microseconds>(duration).count(),(unsigned long long)g_p20_generation,(unsigned long long)submit_id,(unsigned long long)g_p20_duplicate_submit);return 0;
+}
+bool p20_is_fd(int fd){return fd>=kP20FdBase&&fd<kP20FdLimit;}
+void p20_activate_fd_locked(int fd,const char* reason){
+ if(fd==g_p20_active_fd)return;
+ const int old_fd=g_p20_active_fd;const size_t dropped=g_p20_pending.size();
+ for(auto& p:g_p20_pending)if(p.urb)p.urb->status=-2;
+ g_p20_pending.clear();g_p20_current_pool.clear();g_p20_retired_pool.clear();g_p20_pool_building=true;++g_p20_pool_epoch;g_p20_reap_gate=true;g_p20_gate_submits=0;g_p20_gate_until={};
+ if(g_p20_stream){winapk::audio::stream_stop(g_p20_stream.get());winapk::audio::stream_release(g_p20_stream);g_p20_stream.reset();}
+ g_p20_timeline={};g_p20_failed=false;g_p20_active=true;g_p20_alt=0;g_p20_active_fd=fd;++g_p20_session_id;
+ g_p20_cv.notify_all();fd_notify();
+ std::fprintf(stderr,"[W] Phase20-B2.3.4.7: USBFS session activated oldFd=0x%x newFd=0x%x session=%llu dropped=%zu reason=%s\\n",old_fd,fd,(unsigned long long)g_p20_session_id,dropped,reason);
+}
+int p20_success(const char* op){const int before=*guest_errno();*guest_errno()=0;std::fprintf(stderr,"[I] Phase20-B2.3.4.9: ioctl success op=%s return=0 guestErrnoBefore=%d guestErrnoAfter=%d\n",op,before,*guest_errno());return 0;}
+int p20_ioctl(int fd,int request,void* arg){std::unique_lock<std::mutex> hold(g_p20_lock);
+ if(g_p20_active_fd<0||fd>g_p20_active_fd)p20_activate_fd_locked(fd,"newer-virtual-connection");
+ if(fd!=g_p20_active_fd){*guest_errno()=19;if(uint32_t(request)!=kP20ReapNd)std::fprintf(stderr,"[I] Phase20-B2.3.4.7: stale USBFS session rejected fd=0x%x activeFd=0x%x op=0x%x\n",fd,g_p20_active_fd,request);return -1;}
+ if(uint32_t(request)!=kP20ReapNd&&uint32_t(request)!=kP20Submit)std::fprintf(stderr,"[I] Phase20-B2.3.4.7: ioctl fd=0x%x session=%llu op=0x%x arg=%p\n",fd,(unsigned long long)g_p20_session_id,request,arg);switch(uint32_t(request)){
+ case kP20GetSpeed:return 3;case kP20Claim:return 0;case kP20Release:p20_cancel_locked("release-interface",true);return 0;
+ case kP20SetInterface:{if(!arg){*guest_errno()=14;return -1;}auto* v=static_cast<uint32_t*>(arg);const int rate=v[0]==1?p20_rate_for_alt(v[1]):0;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: SETINTERFACE if=%u alt=%u rate=%d\n",v[0],v[1],rate);if(v[0]!=1||v[1]>6){*guest_errno()=22;return -1;}if(v[1]==0){g_p20_alt=0;g_p20_alt_zero_boundary=true;p20_soft_boundary_locked("alt-zero-track-boundary");}else{if(!g_p20_alt_zero_boundary&&g_p20_stream&&(g_p20_alt!=v[1]||g_p20_rate!=rate))p20_soft_boundary_locked("rate-alt-change-without-zero");g_p20_alt_zero_boundary=false;g_p20_alt=v[1];g_p20_rate=rate;g_p20_active=true;g_p20_failed=false;}return p20_success("SET_INTERFACE");}
+ case 0x5514:p20_cancel_locked("reset",true);return p20_success("RESET");case 0x5516:p20_cancel_locked("disconnect",true);return p20_success("DISCONNECT");case kP20Submit:return p20_submit(arg);
+ case kP20Reap:case kP20ReapNd:{if(!arg){*guest_errno()=14;return -1;}*static_cast<void**>(arg)=nullptr;const bool nd=uint32_t(request)==kP20ReapNd;const uint64_t reap_generation=g_p20_generation;for(;;){if(g_p20_reap_gate){if(g_p20_gate_submits<12||g_p20_gate_until.time_since_epoch().count()==0){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait(hold);continue;}const auto gate_now=std::chrono::steady_clock::now();if(gate_now<g_p20_gate_until){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait_until(hold,g_p20_gate_until);continue;}g_p20_reap_gate=false;std::fprintf(stderr,"[I] Phase20-B2.3.4.8: REAP identity gate opened submitted=%zu poolEpoch=%llu generation=%llu pending=%zu\n",g_p20_gate_submits,(unsigned long long)g_p20_pool_epoch,(unsigned long long)g_p20_generation,g_p20_pending.size());}if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.0: REAP epoch retired waitGeneration=%llu currentGeneration=%llu pending=%zu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation,g_p20_pending.size());return -1;}while(!g_p20_pending.empty()&&g_p20_pending.front().generation!=g_p20_generation){auto stale=g_p20_pending.front();g_p20_pending.pop_front();if(stale.urb)stale.urb->status=-2;g_p20_stale_dropped++;if(g_p20_stale_dropped<=8||(g_p20_stale_dropped%100)==0)std::fprintf(stderr,"[W] Phase20-B2.3.3.5: stale completion quarantined urb=%p submit=%llu oldGeneration=%llu currentGeneration=%llu total=%llu\n",static_cast<void*>(stale.urb),(unsigned long long)stale.submit_id,(unsigned long long)stale.generation,(unsigned long long)g_p20_generation,(unsigned long long)g_p20_stale_dropped);}if(g_p20_pending.empty()){if(nd||g_p20_failed||!g_p20_active){*guest_errno()=11;return -1;}g_p20_cv.wait(hold);if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: blocking REAP released by explicit reset/disconnect waitGeneration=%llu currentGeneration=%llu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation);return -1;}continue;}const auto ready=g_p20_pending.front().ready;const auto now=std::chrono::steady_clock::now();if(now<ready){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait_until(hold,ready);if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: timed REAP released by explicit reset/disconnect waitGeneration=%llu currentGeneration=%llu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation);return -1;}continue;}auto completed=g_p20_pending.front();g_p20_pending.pop_front();if(completed.generation!=g_p20_generation){if(completed.urb)completed.urb->status=-2;g_p20_stale_dropped++;continue;}const bool exact=completed.urb==completed.submit_urb;const bool current=g_p20_current_pool.count(completed.urb)!=0;const bool retired=g_p20_retired_pool.count(completed.urb)!=0;if(completed.submit_id<=24||(completed.submit_id%2500)==0||!exact)std::fprintf(stderr,"[I] Phase20-B2.3.4.8: REAP identity urb=%p submitUrb=%p buffer=%p submit=%llu exactMatch=%d current=%d retired=%d submitPoolEpoch=%llu currentPoolEpoch=%llu pending=%zu status=%d cancelled=%d\n",static_cast<void*>(completed.urb),completed.submit_urb,completed.submit_buffer,(unsigned long long)completed.submit_id,exact?1:0,current?1:0,retired?1:0,(unsigned long long)completed.pool_epoch,(unsigned long long)g_p20_pool_epoch,g_p20_pending.size(),completed.urb?completed.urb->status:0,(completed.urb&&completed.urb->status==-2)?1:0);if(!exact){if(completed.urb)completed.urb->status=-2;g_p20_stale_dropped++;continue;}const int reap_errno_before=*guest_errno();*guest_errno()=0;if(completed.submit_id<=24||(completed.submit_id%2500)==0)std::fprintf(stderr,"[I] Phase20-B2.3.4.9: REAP result urb=%p submit=%llu return=0 guestErrnoBefore=%d guestErrnoAfter=%d exactMatch=%d\n",completed.submit_urb,(unsigned long long)completed.submit_id,reap_errno_before,*guest_errno(),exact?1:0);*static_cast<void**>(arg)=completed.submit_urb;return 0;}}
+ case kP20Discard:{
+ auto* u=static_cast<P20Urb*>(arg);if(!u){*guest_errno()=14;return -1;}
+ bool preserved=false,already_cancelled=false;uint64_t discarded_submit=0;
+ for(auto& pending:g_p20_pending){
+  if(pending.urb!=u)continue;
+  discarded_submit=pending.submit_id;
+  if(u->status==-2){already_cancelled=true;break;}
+  u->status=-2;u->actual_length=0;u->error_count=0;
+  if(u->number_of_packets>0&&u->number_of_packets<=1024){auto* iso=reinterpret_cast<P20Iso*>(reinterpret_cast<uint8_t*>(u)+56);for(int i=0;i<u->number_of_packets;i++){iso[i].actual_length=0;iso[i].status=-2;}}
+  pending.ready=std::chrono::steady_clock::now();preserved=true;break;
+ }
+ const bool retired=g_p20_retired_pool.erase(u)!=0;const bool current=g_p20_current_pool.erase(u)!=0;
+ if(!preserved&&!already_cancelled)u->status=-2;
+ g_p20_cv.notify_all();fd_notify();
+ std::fprintf(stderr,"[I] Phase20-B2.3.4.10: DISCARD completion preservation urb=%p submit=%llu preserved=%d alreadyCancelled=%d current=%d retired=%d pending=%zu status=%d\n",static_cast<void*>(u),(unsigned long long)discarded_submit,preserved?1:0,already_cancelled?1:0,current?1:0,retired?1:0,g_p20_pending.size(),u->status);
+ const int discard_errno_before=*guest_errno();*guest_errno()=0;
+ std::fprintf(stderr,"[I] Phase20-B2.3.4.10: DISCARD result urb=%p return=0 guestErrnoBefore=%d guestErrnoAfter=%d completionRetained=%d\n",static_cast<void*>(u),discard_errno_before,*guest_errno(),(preserved||already_cancelled)?1:0);
+ return 0;}
+ default:std::fprintf(stderr,"[E] Phase20-B2.2: unsupported usbfs op=0x%x\n",request);*guest_errno()=25;return -1;}}
+}
+
 WINAPK_GUEST_ABI int g_ioctl(int fd, int request, void* arg) {
+    if (p20_is_fd(fd)) return p20_ioctl(fd,request,arg);
     if (auto o = fd_object(fd)) {
         if (request == 0x5421) {  // FIONBIO
             o->set_nonblocking(*static_cast<int*>(arg) != 0);
@@ -877,6 +1006,10 @@ const ShimSymbol kSymbols[] = {
 };
 
 }  // namespace
+
+extern "C" WINAPK_GUEST_ABI int winapk_phase20_usbfs_ioctl(int fd, int request, void* arg) {
+    return g_ioctl(fd, request, arg);
+}
 
 size_t file_write(void* f, const char* data, size_t n) { return std::fwrite(data, 1, n, host_file(f)); }
 int64_t fd_write(int fd, const void* data, size_t n) { return g_write(fd, data, n); }

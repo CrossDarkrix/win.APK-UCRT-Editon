@@ -105,6 +105,7 @@ const HostMethods kProviders[] = {
     native_camera_methods(),
     native_radios_methods(),
     native_usb_cd_methods(),
+    native_usb_direct_methods(),
     native_d2d_methods(),
 };
 

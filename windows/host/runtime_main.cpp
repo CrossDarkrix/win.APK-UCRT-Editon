@@ -3,7 +3,7 @@
 // The Windows counterpart of runtime/src/main.cpp, in the same order:
 //
 //   1. Find the runtime files: <root>/lib holds the jars that
-//      scripts/build_java.sh builds, <root>/jre (or JAVA_HOME) the JDK.
+//      scripts/build_java.sh builds, <root>/runtime first (then <root>/jre or environment fallbacks) the JDK.
 //   2. Convert the APK's DEX to <app dir>/classes.jar with upstream's
 //      converter (com.macapk.dex.Main), in a child java.exe, unless the cached
 //      jar was made from this APK by this converter (.macapk-dex-stamp).
@@ -173,8 +173,23 @@ HMODULE load_jvm(const fs::path& jdk) {
     const fs::path home = ansi_safe(jdk);
     // jvm.dll needs the DLLs next to java.exe (the VC runtime among them).
     SetDllDirectoryW((home / "bin").c_str());
-    HMODULE jvm = LoadLibraryW((home / "bin" / "server" / "jvm.dll").c_str());
-    if (!jvm) std::fprintf(stderr, "[win.apk] cannot load jvm.dll (error %lu)\n", GetLastError());
+    const fs::path jvm_path = home / "bin" / "server" / "jvm.dll";
+    HMODULE jvm = LoadLibraryW(jvm_path.c_str());
+    if (!jvm) {
+        std::fprintf(stderr, "[win.apk] cannot load jvm.dll from %s (error %lu)\n",
+                     utf8(jvm_path.wstring()).c_str(), GetLastError());
+        return nullptr;
+    }
+    std::vector<wchar_t> loaded_path(32768, L'\0');
+    const DWORD loaded_len = GetModuleFileNameW(
+        jvm, loaded_path.data(), static_cast<DWORD>(loaded_path.size()));
+    if (loaded_len > 0 && loaded_len < loaded_path.size()) {
+        std::fprintf(stderr, "[win.apk] loaded JVM: %s\n",
+                     utf8(std::wstring(loaded_path.data(), loaded_len)).c_str());
+    } else {
+        std::fprintf(stderr, "[win.apk] loaded JVM from %s (path query error %lu)\n",
+                     utf8(jvm_path.wstring()).c_str(), GetLastError());
+    }
     return jvm;
 }
 
@@ -182,7 +197,11 @@ using CreateVmFn = jint(JNICALL*)(JavaVM**, void**, void*);
 
 bool create_vm(HMODULE jvm, std::vector<std::string>& opts, JavaVM** vm, JNIEnv** env) {
     auto create = reinterpret_cast<CreateVmFn>(GetProcAddress(jvm, "JNI_CreateJavaVM"));
-    if (!create) return false;
+    if (!create) {
+        std::fprintf(stderr, "[win.apk] JNI_CreateJavaVM not found (error %lu)\n", GetLastError());
+        return false;
+    }
+    std::fprintf(stderr, "[win.apk] JNI_CreateJavaVM resolved\n");
     std::vector<JavaVMOption> jopts(opts.size());
     for (size_t i = 0; i < opts.size(); ++i) {
         jopts[i].optionString = &opts[i][0];
@@ -193,10 +212,12 @@ bool create_vm(HMODULE jvm, std::vector<std::string>& opts, JavaVM** vm, JNIEnv*
     args.nOptions = static_cast<jint>(jopts.size());
     args.options = jopts.data();
     args.ignoreUnrecognized = JNI_FALSE;
-    if (create(vm, reinterpret_cast<void**>(env), &args) != JNI_OK) {
-        std::fprintf(stderr, "[win.apk] JNI_CreateJavaVM failed\n");
+    const jint create_result = create(vm, reinterpret_cast<void**>(env), &args);
+    if (create_result != JNI_OK) {
+        std::fprintf(stderr, "[win.apk] JNI_CreateJavaVM failed: %d\n", create_result);
         return false;
     }
+    std::fprintf(stderr, "[win.apk] JNI_CreateJavaVM succeeded\n");
     return true;
 }
 
@@ -242,12 +263,35 @@ bool resolve_paths(Options* o) {
         return false;
     }
     if (o->jdk.empty()) {
-        if (!env_var(L"WINAPK_JAVA_HOME").empty()) o->jdk = env_var(L"WINAPK_JAVA_HOME");
-        else if (fs::exists(root / "jre" / "bin" / "server" / "jvm.dll", ec)) o->jdk = root / "jre";
-        else o->jdk = env_var(L"JAVA_HOME");
+        const fs::path bundled_runtime = root / "runtime";
+        const fs::path legacy_jre = root / "jre";
+        if (fs::is_regular_file(bundled_runtime / "bin" / "server" / "jvm.dll", ec)) {
+            o->jdk = bundled_runtime;
+            std::fprintf(stderr, "[win.apk] Java home: bundled runtime %s\n",
+                         utf8(o->jdk.wstring()).c_str());
+        } else if (fs::is_regular_file(legacy_jre / "bin" / "server" / "jvm.dll", ec)) {
+            o->jdk = legacy_jre;
+            std::fprintf(stderr, "[win.apk] Java home: legacy bundled jre %s\n",
+                         utf8(o->jdk.wstring()).c_str());
+        } else if (!env_var(L"WINAPK_JAVA_HOME").empty()) {
+            o->jdk = env_var(L"WINAPK_JAVA_HOME");
+            std::fprintf(stderr, "[win.apk] Java home: WINAPK_JAVA_HOME %s\n",
+                         utf8(o->jdk.wstring()).c_str());
+        } else {
+            o->jdk = env_var(L"JAVA_HOME");
+            if (!o->jdk.empty()) {
+                std::fprintf(stderr, "[win.apk] Java home: JAVA_HOME %s\n",
+                             utf8(o->jdk.wstring()).c_str());
+            }
+        }
+    } else {
+        std::fprintf(stderr, "[win.apk] Java home: --jdk %s\n",
+                     utf8(o->jdk.wstring()).c_str());
     }
-    if (!fs::exists(o->jdk / "bin" / "server" / "jvm.dll", ec)) {
-        std::fprintf(stderr, "[win.apk] no JDK with bin\\server\\jvm.dll (use --jdk or JAVA_HOME)\n");
+    if (!fs::is_regular_file(o->jdk / "bin" / "server" / "jvm.dll", ec)) {
+        std::fprintf(stderr,
+                     "[win.apk] no JDK with bin\\server\\jvm.dll "
+                     "(checked --jdk, bundled runtime, bundled jre, WINAPK_JAVA_HOME, JAVA_HOME)\n");
         return false;
     }
     if (o->data.empty()) {

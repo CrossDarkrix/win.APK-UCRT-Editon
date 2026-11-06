@@ -225,9 +225,9 @@ if(WINAPK_JNI_INCLUDE)
                               host/native_gamepad.cpp host/native_icu.cpp
                               host/native_audio_input.cpp host/native_photos.cpp
                               host/webview2_host.cpp host/native_browser_tab.cpp host/native_webview.cpp
-                              host/native_camera.cpp host/native_radios.cpp host/native_usb_cd.cpp host/ucrt_cd_bridge.cpp host/user_folders.cpp host/native_d2d.cpp
+                              host/native_camera.cpp host/native_radios.cpp host/native_usb_cd.cpp host/native_usb_direct.cpp host/ucrt_cd_bridge.cpp host/user_folders.cpp host/native_d2d.cpp
                               host/runtime.rc)
-  target_link_libraries(winapk-runtime PRIVATE setupapi winapk_jni winapk_sqlite webpdecoder winapk_stb_vorbis windowscodecs
+  target_link_libraries(winapk-runtime PRIVATE setupapi winusb winapk_jni winapk_sqlite webpdecoder winapk_stb_vorbis windowscodecs
                         ole32 d2d1 dwrite d3d11 dxgi mf mfplat mfreadwrite mfuuid shlwapi advapi32 shell32 uuid wlanapi bthprops)
   target_include_directories(winapk-runtime PRIVATE ${WINAPK_WEBP_DIR}/src)
   # Stage 1 GStreamer presenter: appsrc -> leaky queue -> D3D11 upload/sink.

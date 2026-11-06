@@ -1,31 +1,10 @@
-// android.hardware.usb.UsbRequest
-//
-// An async USB transfer request paired with a UsbDeviceConnection. Mac.apk
-// never opens a device, so initialize() always fails (no endpoint); the type
-// + method surface must resolve for async-transfer code to compile.
-// Mirrors frameworks/base/core/java/android/hardware/usb/UsbRequest.java.
 package android.hardware.usb;
-
 import java.nio.ByteBuffer;
-
-public class UsbRequest {
-    private UsbEndpoint mEndpoint;
-    private Object mClientData;
-
-    public UsbRequest() {}
-
-    /** AOSP returns false if the connection/endpoint cannot be bound; ours never can. */
-    public boolean initialize(UsbDeviceConnection connection, UsbEndpoint endpoint) {
-        mEndpoint = endpoint;
-        return false;
-    }
-
-    public UsbEndpoint getEndpoint() { return mEndpoint; }
-    public Object getClientData() { return mClientData; }
-    public void setClientData(Object data) { mClientData = data; }
-
-    public boolean queue(ByteBuffer buffer) { return false; }
-    public boolean queue(ByteBuffer buffer, int length) { return false; }
-    public boolean cancel() { return false; }
-    public void close() {}
+public class UsbRequest implements AutoCloseable{
+ private UsbDeviceConnection connection;private UsbEndpoint endpoint;private Object clientData;private volatile boolean cancelled,closed;
+ public UsbRequest(){} public boolean initialize(UsbDeviceConnection c,UsbEndpoint e){if(c==null||e==null||!c.isOpen())return false;connection=c;endpoint=e;return true;}
+ public UsbEndpoint getEndpoint(){return endpoint;}public Object getClientData(){return clientData;}public void setClientData(Object x){clientData=x;}
+ public boolean queue(ByteBuffer b){return queue(b,b==null?0:b.remaining());}public boolean queue(ByteBuffer b,int length){if(closed||cancelled||connection==null||b==null||length<0||length>b.remaining())return false;connection.submit(this,b,length);return true;}
+ void runTransfer(ByteBuffer b,int length){if(cancelled)return;byte[] a=new byte[length];boolean in=endpoint.getDirection()==UsbConstants.USB_DIR_IN;if(!in)b.get(a);int n=connection.bulkTransfer(endpoint,a,0,length,0);if(in&&n>0)b.put(a,0,n);}
+ public boolean cancel(){cancelled=true;return connection!=null&&endpoint!=null&&connection.cancel(endpoint);}public void close(){if(!closed){cancel();closed=true;connection=null;endpoint=null;}}
 }

@@ -58,6 +58,9 @@
 #include <windowsx.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propvarutil.h>
 
 #include <algorithm>
 #include <cmath>
@@ -429,6 +432,26 @@ const wchar_t* tr(const wchar_t* en) {
         if (wcscmp(en, L"Remove all") == 0) return L"すべて削除";
         if (wcscmp(en, L"Every app was removed.") == 0) return L"すべてのアプリを削除しました。";
         if (wcscmp(en, L"Settings") == 0) return L"設定";
+        if (wcscmp(en, L"Permissions") == 0) return L"権限";
+        if (wcscmp(en, L"Automatically grant declared runtime permissions") == 0) return L"宣言済み実行時権限を自動的に許可";
+        if (wcscmp(en, L"Compatibility mode for apps that expect Android runtime permission dialogs.") == 0) return L"Androidの実行時権限ダイアログを前提とするアプリ向けの互換モードです。";
+        if (wcscmp(en, L"Ask before media access") == 0) return L"メディアアクセス前に確認";
+        if (wcscmp(en, L"Show the runtime permission flow before apps access shared pictures, music and videos.") == 0) return L"共有の画像、音楽、動画へアクセスする前に権限確認を表示します。";
+        if (wcscmp(en, L"Require approval for all-files access") == 0) return L"すべてのファイルへのアクセスに承認を要求";
+        if (wcscmp(en, L"Require the special-access approval instead of granting broad file access automatically.") == 0) return L"広範なファイルアクセスを自動許可せず、特別なアクセスの承認を要求します。";
+        if (wcscmp(en, L"Check permission settings") == 0) return L"権限設定を確認";
+        if (wcscmp(en, L"Show the permission policy that will be applied to newly opened apps.") == 0) return L"次に開くアプリへ適用される権限ポリシーを表示します。";
+        if (wcscmp(en, L"Check") == 0) return L"確認";
+        if (wcscmp(en, L"Permission changes apply when an app is opened next. Already-running apps are not modified.") == 0) return L"権限の変更は次にアプリを開いたときに適用されます。実行中のアプリは変更されません。";
+        if (wcscmp(en, L"Permission check") == 0) return L"権限の確認";
+        if (wcscmp(en, L"Automatic runtime permissions") == 0) return L"実行時権限の自動許可";
+        if (wcscmp(en, L"Media permission prompts") == 0) return L"メディア権限の確認";
+        if (wcscmp(en, L"All-files approval") == 0) return L"すべてのファイルへの承認";
+        if (wcscmp(en, L"Enabled") == 0) return L"有効";
+        if (wcscmp(en, L"Disabled") == 0) return L"無効";
+        if (wcscmp(en, L"Required") == 0) return L"必須";
+        if (wcscmp(en, L"Compatibility mode") == 0) return L"互換モード";
+        if (wcscmp(en, L"These settings are applied the next time an app opens.") == 0) return L"これらの設定は次にアプリを開いたときに適用されます。";
         if (wcscmp(en, L"Identity") == 0) return L"識別情報";
         if (wcscmp(en, L"Name") == 0) return L"名前";
         if (wcscmp(en, L"Library name") == 0) return L"ライブラリ名";
@@ -675,6 +698,33 @@ void set_setting(const wchar_t* name, DWORD v) {
     RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_DWORD, &v, sizeof(v));
 }
 
+std::wstring string_setting(const wchar_t* name) {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || size < sizeof(wchar_t)) return L"";
+    std::wstring value(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_SZ, nullptr, value.data(), &size) != ERROR_SUCCESS) return L"";
+    while (!value.empty() && value.back() == L'\0') value.pop_back();
+    return value;
+}
+void set_string_setting(const wchar_t* name, const std::wstring& value) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_SZ, value.c_str(), DWORD((value.size() + 1) * sizeof(wchar_t)));
+}
+struct AudioEndpointChoice { std::wstring id, name; };
+std::vector<AudioEndpointChoice> render_endpoints() {
+    std::vector<AudioEndpointChoice> out{{L"", tr(L"Windows default device")}};
+    IMMDeviceEnumerator* en = nullptr; IMMDeviceCollection* col = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&en)))) return out;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col))) {
+        UINT count = 0; col->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice* dev = nullptr; LPWSTR id = nullptr; IPropertyStore* ps = nullptr; PROPVARIANT pv; PropVariantInit(&pv);
+            if (SUCCEEDED(col->Item(i, &dev)) && SUCCEEDED(dev->GetId(&id)) && SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && SUCCEEDED(ps->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) out.push_back({id, pv.pwszVal});
+            PropVariantClear(&pv); if (ps) ps->Release(); if (id) CoTaskMemFree(id); if (dev) dev->Release();
+        }
+    }
+    if (col) col->Release(); en->Release(); return out;
+}
+
 struct PhonePreset {
     const wchar_t* label;
     int w, h;  // dp; 0 x 0 is the runtime's own choice
@@ -702,9 +752,12 @@ void apply_runtime_env() {
     // shared-file access and notifications; INTERNET is a normal install-time
     // permission and already needs no runtime prompt. Set either variable to 1
     // before launching to restore the interactive storage permission flow.
-    SetEnvironmentVariableW(L"MACAPK_MEDIA_PERMS_ASK", L"0");
-    SetEnvironmentVariableW(L"MACAPK_ALLFILES_HONEST", L"0");
-    SetEnvironmentVariableW(L"WINAPK_UCRT_AUTO_PERMISSIONS", L"1");
+    const bool auto_permissions = setting(L"AutoRuntimePermissions", 1) != 0;
+    const bool ask_media = setting(L"AskMediaPermissions", 0) != 0;
+    const bool honest_all_files = setting(L"RequireAllFilesApproval", 0) != 0;
+    SetEnvironmentVariableW(L"MACAPK_MEDIA_PERMS_ASK", ask_media ? L"1" : L"0");
+    SetEnvironmentVariableW(L"MACAPK_ALLFILES_HONEST", honest_all_files ? L"1" : L"0");
+    SetEnvironmentVariableW(L"WINAPK_UCRT_AUTO_PERMISSIONS", auto_permissions ? L"1" : L"0");
 
     const DWORD i = setting(L"PhoneSize", 0);
     const bool landscape = setting(L"Landscape", 0) != 0;
@@ -3293,6 +3346,26 @@ Row text_row(std::wstring title, std::wstring value, std::wstring detail = L"") 
 void apply_theme();
 void apply_language(bool keep_selected = false);
 
+std::wstring permission_policy_report() {
+    const bool auto_permissions = setting(L"AutoRuntimePermissions", 1) != 0;
+    const bool ask_media = setting(L"AskMediaPermissions", 0) != 0;
+    const bool honest_all_files = setting(L"RequireAllFilesApproval", 0) != 0;
+    std::wstring report;
+    report += std::wstring(tr(L"Automatic runtime permissions")) + L": " +
+              tr(auto_permissions ? L"Enabled" : L"Disabled") + L"\r\n";
+    report += std::wstring(tr(L"Media permission prompts")) + L": " +
+              tr(ask_media ? L"Enabled" : L"Disabled") + L"\r\n";
+    report += std::wstring(tr(L"All-files approval")) + L": " +
+              tr(honest_all_files ? L"Required" : L"Compatibility mode") + L"\r\n\r\n";
+    report += tr(L"These settings are applied the next time an app opens.");
+    return report;
+}
+
+void show_permission_policy() {
+    const std::wstring report = permission_policy_report();
+    MessageBoxW(g_main, report.c_str(), tr(L"Permission check"), MB_OK | MB_ICONINFORMATION);
+}
+
 std::vector<Section> settings_sections() {
     std::vector<Section> out;
 
@@ -3353,6 +3426,16 @@ std::vector<Section> settings_sections() {
     out.push_back({tr(L"Screen"), {size, orient},
                    tr(L"Used the next time an app opens, from here or from its shortcut. Sizes are in dp, as on a phone.")});
 
+    const auto endpoints = render_endpoints();
+    const std::wstring saved_endpoint = string_setting(L"UsbDirectOutputEndpointId");
+    Row usb_output; usb_output.kind = Row::kChoice; usb_output.title = tr(L"USB Direct PCM output"); usb_output.choice = 0;
+    for (size_t i = 0; i < endpoints.size(); ++i) { usb_output.choices.push_back(endpoints[i].name); if (endpoints[i].id == saved_endpoint) usb_output.choice = int(i); }
+    if (!saved_endpoint.empty() && usb_output.choice == 0) { usb_output.choices.push_back(string_setting(L"UsbDirectOutputFriendlyName") + L" (" + tr(L"Disconnected") + L")"); usb_output.choice = int(usb_output.choices.size() - 1); }
+    usb_output.act = [endpoints](int i) { if (i >= 0 && i < int(endpoints.size())) { set_string_setting(L"UsbDirectOutputEndpointId", endpoints[size_t(i)].id); set_string_setting(L"UsbDirectOutputFriendlyName", endpoints[size_t(i)].name); } };
+    Row usb_fallback; usb_fallback.kind = Row::kToggle; usb_fallback.title = tr(L"Use shared mode on the same device if exclusive mode fails"); usb_fallback.on = setting(L"UsbDirectAllowSharedFallback", 1) != 0; usb_fallback.act = [](int on) { set_setting(L"UsbDirectAllowSharedFallback", on ? 1 : 0); };
+    Row usb_gain; usb_gain.kind = Row::kChoice; usb_gain.title = tr(L"USB Direct internal gain"); usb_gain.choices = {L"0 dB (default)",L"+3 dB",L"+6 dB",L"+9 dB",L"+12 dB (recommended test)",L"+15 dB",L"+18 dB"}; usb_gain.choice = int((std::min)(setting(L"UsbDirectGainStep",0),6ul)); usb_gain.act=[](int i){set_setting(L"UsbDirectGainStep",DWORD((std::max)(0,(std::min)(i,6))));};
+    out.push_back({tr(L"Audio output"), {usb_output, usb_fallback, usb_gain}, tr(L"The selected endpoint is used the next time an app opens. Internal gain affects only USB Direct; start at 0 dB and test +12 dB if needed.")});
+
     Row desktop;
     desktop.kind = Row::kToggle;
     desktop.title = tr(L"Desktop shortcut for new apps");
@@ -3365,6 +3448,30 @@ std::vector<Section> settings_sections() {
                               set_status(tr(L"The Start menu shortcuts were made again."), kSuccess);
                           });
     out.push_back({tr(L"Shortcuts"), {desktop, redo}, L""});
+
+    Row auto_perms;
+    auto_perms.kind = Row::kToggle;
+    auto_perms.title = tr(L"Automatically grant declared runtime permissions");
+    auto_perms.detail = tr(L"Compatibility mode for apps that expect Android runtime permission dialogs.");
+    auto_perms.on = setting(L"AutoRuntimePermissions", 1) != 0;
+    auto_perms.act = [](int on) { set_setting(L"AutoRuntimePermissions", static_cast<DWORD>(on)); apply_runtime_env(); };
+    Row media_perms;
+    media_perms.kind = Row::kToggle;
+    media_perms.title = tr(L"Ask before media access");
+    media_perms.detail = tr(L"Show the runtime permission flow before apps access shared pictures, music and videos.");
+    media_perms.on = setting(L"AskMediaPermissions", 0) != 0;
+    media_perms.act = [](int on) { set_setting(L"AskMediaPermissions", static_cast<DWORD>(on)); apply_runtime_env(); };
+    Row all_files;
+    all_files.kind = Row::kToggle;
+    all_files.title = tr(L"Require approval for all-files access");
+    all_files.detail = tr(L"Require the special-access approval instead of granting broad file access automatically.");
+    all_files.on = setting(L"RequireAllFilesApproval", 0) != 0;
+    all_files.act = [](int on) { set_setting(L"RequireAllFilesApproval", static_cast<DWORD>(on)); apply_runtime_env(); };
+    Row check_perms = button_row(tr(L"Check permission settings"),
+                                 tr(L"Show the permission policy that will be applied to newly opened apps."),
+                                 tr(L"Check"), [] { show_permission_policy(); });
+    out.push_back({tr(L"Permissions"), {auto_perms, media_perms, all_files, check_perms},
+                   tr(L"Permission changes apply when an app is opened next. Already-running apps are not modified.")});
 
     out.push_back({tr(L"Logs"),
                    {button_row(tr(L"Diagnostics"),

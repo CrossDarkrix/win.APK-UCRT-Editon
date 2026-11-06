@@ -605,6 +605,7 @@ int64_t guest_futex(uint32_t* uaddr, int op, uint32_t val, const GuestTimespec* 
 }
 WINAPK_GUEST_ABI int64_t g_syscall(int64_t nr, int64_t a, int64_t b, int64_t c, int64_t d, int64_t e) {
     switch (nr) {
+        case 16: return winapk_phase20_usbfs_ioctl(static_cast<int>(a),static_cast<int>(b),reinterpret_cast<void*>(c));  // x86_64 Linux ioctl
         case 202: return guest_futex(reinterpret_cast<uint32_t*>(a), static_cast<int>(b), static_cast<uint32_t>(c),
                                      reinterpret_cast<const GuestTimespec*>(d));
         case 186: return static_cast<int64_t>(GetCurrentThreadId());  // gettid

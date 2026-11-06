@@ -124,6 +124,7 @@ bool fd_close(int fd);
 int fd_dup(int fd, int to);  // to < 0: lowest free number
 // Something became readable/writable: wakes poll, select and epoll_wait.
 void fd_notify();
+extern "C" WINAPK_GUEST_ABI int winapk_phase20_usbfs_ioctl(int fd, int request, void* arg);
 // poll(2) over guest descriptors, for other modules (looper.cpp).
 struct PollFd {
     int fd;

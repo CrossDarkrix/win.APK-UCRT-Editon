@@ -32,6 +32,8 @@
 #include <string>
 
 #include <windows.h>
+#include <chrono>
+#include <cmath>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -57,6 +59,19 @@ std::atomic<int> g_phone_w{360};
 std::atomic<int> g_phone_h{640};
 std::atomic<jlong> g_next_handle{1};
 std::atomic<long> g_frames{0};
+std::atomic<int> g_present_hz{0};
+int detected_present_hz() {
+    int cached=g_present_hz.load(std::memory_order_acquire);if(cached>0)return cached;
+    int requested=0;if(const char* e=std::getenv("WINAPK_MAX_FPS")){char* end=nullptr;long v=std::strtol(e,&end,10);if(end!=e&&v>=30&&v<=240)requested=(int)v;}
+    DEVMODEW dm{};dm.dmSize=sizeof(dm);int panel=0;
+    if(EnumDisplaySettingsW(nullptr,ENUM_CURRENT_SETTINGS,&dm)&&dm.dmDisplayFrequency>1&&dm.dmDisplayFrequency<1000)panel=(int)dm.dmDisplayFrequency;
+    // Never ask Windows to present invisible frames above the active monitor. A high-refresh panel uses at least 75 Hz and at most 120 Hz by default.
+    int hz=requested>0?requested:(panel>=75?(std::min)(panel,120):(panel>1?panel:120));
+    hz=(std::max)(30,(std::min)(hz,240));g_present_hz.store(hz,std::memory_order_release);
+    std::fprintf(stderr,"[I] Win.apk.FramePacer: panelHz=%d requested=%d targetHz=%d targetMs=%.3f\n",panel,requested,hz,1000.0/double(hz));
+    return hz;
+}
+
 
 jlong new_handle() { return g_next_handle.fetch_add(1); }
 
@@ -213,7 +228,7 @@ void JNICALL Cocoa_setPhoneSize(JNIEnv*, jclass, jint w, jint h) {
 
 jint JNICALL Cocoa_phoneWidth(JNIEnv*, jclass) { return g_phone_w; }
 jint JNICALL Cocoa_phoneHeight(JNIEnv*, jclass) { return g_phone_h; }
-jint JNICALL Cocoa_displayHz(JNIEnv*, jclass) { return 60; }
+jint JNICALL Cocoa_displayHz(JNIEnv*, jclass) { return detected_present_hz(); }
 float device_density(JNIEnv* env);
 
 // Surface pixels per point. TouchDispatcher multiplies view points by it, and
@@ -786,21 +801,34 @@ DWORD WINAPI render_thread(void*) {
     const jmethodID changed = env->GetMethodID(cls, "macapkSurfaceChanged", "(II)V");
     const jmethodID draw = env->GetMethodID(cls, "macapkDrawFrame", "()V");
     env->DeleteLocalRef(cls);
+    const int target_hz=detected_present_hz();
+    const auto period=std::chrono::nanoseconds(1000000000LL/target_hz);
+    auto next_tick=std::chrono::steady_clock::now();
+    auto stat_start=next_tick;uint64_t stat_ticks=0,stat_late=0;double stat_worst_ms=0.0;
+    HANDLE frame_timer=CreateWaitableTimerExW(nullptr,nullptr,0x00000002,TIMER_MODIFY_STATE|SYNCHRONIZE);
+    if(!frame_timer)frame_timer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
     for (;;) {
-        Sleep(16);
+        next_tick+=period;
+        auto now=std::chrono::steady_clock::now();
+        if(next_tick<now-period*2)next_tick=now;
+        auto wait_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(next_tick-now).count();
+        if(wait_ns>0&&frame_timer){LARGE_INTEGER due{};due.QuadPart=-(wait_ns/100);if(SetWaitableTimer(frame_timer,&due,0,nullptr,nullptr,FALSE))WaitForSingleObject(frame_timer,INFINITE);else Sleep((DWORD)(wait_ns/1000000));}
+        else if(wait_ns>0)Sleep((DWORD)(wait_ns/1000000));
+        now=std::chrono::steady_clock::now();double late_ms=std::chrono::duration<double,std::milli>(now-next_tick).count();if(late_ms>0.5)stat_late++;if(late_ms>stat_worst_ms)stat_worst_ms=late_ms;stat_ticks++;
+        double span=std::chrono::duration<double>(now-stat_start).count();if(span>=5.0){std::fprintf(stderr,"[I] Win.apk.FramePacer: target=%d actual=%.2f late=%llu/%llu worstLateMs=%.2f renderers=%zu\n",target_hz,stat_ticks/span,(unsigned long long)stat_late,(unsigned long long)stat_ticks,stat_worst_ms,g_renderers.size());stat_start=now;stat_ticks=stat_late=0;stat_worst_ms=0.0;}
         const int w = static_cast<int>(g_phone_w * density + 0.5f), h = static_cast<int>(g_phone_h * density + 0.5f);
         g_content_w = w;
         g_content_h = h;
         if (g_guest_last_ms.load() != 0) pull_guest_layer_z(env);
-        std::vector<std::pair<jlong, jobject>> now;
+        std::vector<std::pair<jlong, jobject>> renderer_callbacks;
         std::vector<jlong> dropped;
         {
             std::lock_guard<std::mutex> hold(g_renderer_lock);
-            for (auto& [view, r] : g_renderers) now.emplace_back(view, env->NewLocalRef(r.callbacks));
+            for (auto& [view, r] : g_renderers) renderer_callbacks.emplace_back(view, env->NewLocalRef(r.callbacks));
             dropped.swap(g_released_gl_views);
         }
         for (jlong view : dropped) gl_view_release(view);
-        for (auto& [view, callbacks] : now) {
+        for (auto& [view, callbacks] : renderer_callbacks) {
             Renderer r;
             {
                 std::lock_guard<std::mutex> hold(g_renderer_lock);

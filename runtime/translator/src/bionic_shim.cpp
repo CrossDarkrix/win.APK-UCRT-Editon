@@ -48161,6 +48161,16 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
     // -1 where it had returned 1024, and the failure was invisible until the syscall census
     // printed a negative. Untagging here is the bridge between the two ABIs and belongs at
     // this boundary, which is the only place the guest's pointers cross into the host kernel.
+    if (number == 29 && static_cast<int>(a1) == 0x5A20) {
+        std::fprintf(stderr,"[Phase20-B1.1] ARM64 direct syscall ioctl fd=0x%lx op=0x%lx arg=0x%lx\n",a1,a2,a3);
+        if (static_cast<uint32_t>(a2) == 0x0000551fu) {
+            std::fprintf(stderr,"[Phase20-B1.1] ARM64 direct USBDEVFS_GET_SPEED -> HIGH\n");
+            return 3;
+        }
+        std::fprintf(stderr,"[Phase20-B1.1] ARM64 direct unsupported usbfs op=0x%lx -> ENOTTY\n",a2);
+        errno=ENOTTY;
+        return -1;
+    }
     switch (number) {
         case 178: {  // SYS_gettid on Linux aarch64
             uint64_t tid = 0;
@@ -51252,8 +51262,47 @@ constexpr uint32_t kLinuxFIONBIO    = 0x5421;
 constexpr uint32_t kLinuxFIOASYNC   = 0x5452;
 }  // namespace
 
+
+// Phase 20-B1 app-local virtual usbfs session. This only completes the
+// management/open pipeline; USBDEVFS_SUBMITURB remains intentionally unsupported
+// until the PCM bridge phase.
+static constexpr int kPhase20VirtualUsbFd = 0x5A20;
+static constexpr uint32_t kUsbdevfsSetInterface = 0x80085504u;
+static constexpr uint32_t kUsbdevfsGetDriver = 0x41045508u;
+static constexpr uint32_t kUsbdevfsClaimInterface = 0x8004550fu;
+static constexpr uint32_t kUsbdevfsReleaseInterface = 0x80045510u;
+static constexpr uint32_t kUsbdevfsConnectInfo = 0x40085511u;
+static constexpr uint32_t kUsbdevfsReset = 0x00005514u;
+static constexpr uint32_t kUsbdevfsDisconnect = 0x00005516u;
+static constexpr uint32_t kUsbdevfsGetSpeed = 0x0000551fu;
+static constexpr int kUsbdevfsSpeedHigh = 3;
+static int phase20_usbfs32(uint32_t op,uint32_t argp){
+    std::fprintf(stderr,"[Phase20-B1.1] ARM32 ioctl fd=0x%x op=0x%x argp=0x%x\n",kPhase20VirtualUsbFd,op,argp);
+    void* p=argp?static_cast<void*>(gptr(argp)):nullptr;
+    switch(op){
+      case kUsbdevfsGetSpeed: std::fprintf(stderr,"[Phase20-B1.1] ARM32 USBDEVFS_GET_SPEED -> HIGH\n");return kUsbdevfsSpeedHigh;
+      case kUsbdevfsConnectInfo:{if(!p){errno=EFAULT;return -1;}uint32_t* q=(uint32_t*)p;q[0]=1;((uint8_t*)p)[4]=0;std::fprintf(stderr,"[Phase20-B1] USBDEVFS_CONNECTINFO speed=high\n");return 0;}
+      case kUsbdevfsClaimInterface:case kUsbdevfsReleaseInterface:case kUsbdevfsSetInterface:case kUsbdevfsReset:case kUsbdevfsDisconnect:
+        std::fprintf(stderr,"[Phase20-B1] usbfs management op=0x%x ok\n",op);return 0;
+      case kUsbdevfsGetDriver: errno=ENODATA;return -1;
+      default: std::fprintf(stderr,"[Phase20-B1] usbfs unsupported op=0x%x -> ENOTTY\n",op);errno=ENOTTY;return -1;
+    }
+}
+static int phase20_usbfs64(uint32_t op,void* p){
+    std::fprintf(stderr,"[Phase20-B1.1] ARM64 ioctl fd=0x%x op=0x%x argp=%p\n",kPhase20VirtualUsbFd,op,p);
+    switch(op){
+      case kUsbdevfsGetSpeed: std::fprintf(stderr,"[Phase20-B1.1] ARM64 USBDEVFS_GET_SPEED -> HIGH\n");return kUsbdevfsSpeedHigh;
+      case kUsbdevfsConnectInfo:{if(!p){errno=EFAULT;return -1;}uint32_t* q=(uint32_t*)p;q[0]=1;((uint8_t*)p)[4]=0;std::fprintf(stderr,"[Phase20-B1] ARM64 USBDEVFS_CONNECTINFO speed=high\n");return 0;}
+      case kUsbdevfsClaimInterface:case kUsbdevfsReleaseInterface:case kUsbdevfsSetInterface:case kUsbdevfsReset:case kUsbdevfsDisconnect:
+        std::fprintf(stderr,"[Phase20-B1] ARM64 usbfs management op=0x%x ok\n",op);return 0;
+      case kUsbdevfsGetDriver: errno=ENODATA;return -1;
+      default: std::fprintf(stderr,"[Phase20-B1] ARM64 usbfs unsupported op=0x%x -> ENOTTY\n",op);errno=ENOTTY;return -1;
+    }
+}
 uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
                                uint32_t) {
+    std::fprintf(stderr,"[Phase20-B1.1] ARM32 ioctl entry fd=%d op=0x%x\n",static_cast<int>(fd),op);
+    if (static_cast<int>(fd) == kPhase20VirtualUsbFd) return static_cast<uint32_t>(phase20_usbfs32(op,argp));
     unsigned long host_op = 0;
     switch (op) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -51288,6 +51337,8 @@ uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
 // one variadic argument arrives in x2 under AAPCS64, which is where this
 // non-variadic signature reads it.
 extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
+    std::fprintf(stderr,"[Phase20-B1.1] ARM64 ioctl entry fd=%d op=0x%x\n",fd,static_cast<uint32_t>(op));
+    if (fd == kPhase20VirtualUsbFd) return phase20_usbfs64(static_cast<uint32_t>(op),argp);
     unsigned long host_op = 0;
     switch (static_cast<uint32_t>(op)) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;

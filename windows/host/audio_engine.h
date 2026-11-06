@@ -36,6 +36,8 @@ constexpr int kStopped = 1, kPaused = 2, kPlaying = 3;
 class Stream;
 // encoding: AudioFormat.ENCODING_PCM_16BIT 2, PCM_8BIT 3, PCM_FLOAT 4.
 std::shared_ptr<Stream> stream_create(int rate, int channels, int encoding, int buffer_frames);
+// Dedicated USB Direct stream: separate mixer and the configured physical endpoint.
+std::shared_ptr<Stream> usb_direct_stream_create(int rate, int channels, int encoding, int buffer_frames);
 void stream_release(const std::shared_ptr<Stream>& s);
 // Appends `count` samples (of the stream's encoding; `samples` points at them)
 // and returns how many were taken. Blocking waits for room; non-blocking takes

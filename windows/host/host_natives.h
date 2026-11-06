@@ -54,6 +54,7 @@ HostMethods native_webview_methods();   // native_webview.cpp
 HostMethods native_camera_methods();    // native_camera.cpp
 HostMethods native_radios_methods();
 HostMethods native_usb_cd_methods();
+HostMethods native_usb_direct_methods();
 HostMethods native_d2d_methods();    // native_d2d.cpp    // native_radios.cpp
 
 // The app's directory under the data directory, where Boot renders the

@@ -1,0 +1,3 @@
+# Phase 19-A.2 UCRT integration
+
+Uses the attached UCRT source as the compatibility target. Enumerates every WinUSB associated interface and alternate setting, maps bInterfaceNumber to the correct WinUSB handle, routes interface/endpoint-recipient control requests by bmRequestType and wIndex, routes pipe transfers and cancellation to the owning interface, returns device plus configuration raw descriptors, implements claim ownership, and corrects getFileDescriptor() to Android's int ABI. Windows cannot provide a Linux usbfs file descriptor, so getFileDescriptor returns -1; UCRT raw isochronous streaming remains intentionally unavailable and audio must use the planned WASAPI path.

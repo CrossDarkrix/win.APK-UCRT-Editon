@@ -1,0 +1,2 @@
+# Phase 18-A Launcher permission settings
+Adds a Permissions section to the native launcher Settings sheet. Three persistent HKCU toggles control the existing runtime permission environment variables: automatic declared runtime grants, media permission prompts, and honest all-files special-access approval. A Check button displays the exact effective policy. Changes apply to newly opened apps; running processes are not mutated. Japanese UI strings are included.

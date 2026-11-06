@@ -1,0 +1,3 @@
+# Phase 19-B3 Exclusive PCM Format Negotiation
+
+Negotiates stereo integer PCM exclusive-event formats using WAVEFORMATEXTENSIBLE. Rate order is the current AudioTrack source rate, shared mix rate, 192000, 176400, 96000, 88200, 48000, 44100 with duplicates removed. Layout order is 24 valid bits in a 32-bit container, 32-bit PCM, packed 24-bit PCM, then 16-bit PCM. Every IsFormatSupported result is logged. The first supported candidate is initialized with equal nonzero exclusive buffer duration and periodicity. If negotiation or exclusive initialization fails, the B2 shared event-driven fallback remains active. Rendering supports float32 shared output and integer PCM16, packed PCM24, PCM24-in-32 with left-aligned valid bits, and PCM32.

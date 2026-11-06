@@ -183,7 +183,30 @@ int32_t UCRT_CD_CALL ucrt_cd_enumerate(ucrt_cd_device_info* devices,uint32_t cap
         }
         ++total;
     }
-    SetupDiDestroyDeviceInfoList(set); *count=total;
+    SetupDiDestroyDeviceInfoList(set);
+    // Some Windows optical stacks expose a usable CD-ROM volume before (or without) a
+    // GUID_DEVINTERFACE_CDROM interface. Preserve SetupAPI results, then add unique
+    // drive-letter device paths as a compatibility fallback.
+    const DWORD drive_mask=GetLogicalDrives();
+    const bool need_drive_letter_fallback=(total==0);
+    for(wchar_t letter=L'A';need_drive_letter_fallback&&letter<=L'Z';++letter){
+        if((drive_mask&(1u<<(letter-L'A')))==0)continue;
+        wchar_t root[4]={letter,L':',L'\\',L'\0'};
+        if(GetDriveTypeW(root)!=DRIVE_CDROM)continue;
+        wchar_t device_path[7]={L'\\',L'\\',L'.',L'\\',letter,L':',L'\0'};
+        bool duplicate=false;
+        if(devices){for(uint32_t j=0;j<(std::min)(total,capacity);++j)if(_wcsicmp(devices[j].device_path,device_path)==0){duplicate=true;break;}}
+        if(duplicate)continue;
+        if(devices&&total<capacity){
+            std::memset(&devices[total],0,sizeof(devices[total]));
+            copy_wide(devices[total].device_path,UCRT_CD_MAX_PATH,device_path);
+            std::wstring name=L"Windows optical drive ";name.push_back(letter);name.push_back(L':');
+            copy_wide(devices[total].friendly_name,UCRT_CD_MAX_NAME,name);
+        }
+        ++total;
+    }
+    *count=total;
+    std::fprintf(stderr,"[I] Phase20-B2.3.3.7: CD enumerate total=%u capacity=%u setupApiPresent=%d driveLetterFallback=%d driveMask=0x%08lx\n",total,capacity,need_drive_letter_fallback?0:1,need_drive_letter_fallback?1:0,(unsigned long)drive_mask);
     if(devices && capacity<total) return fail(error,UCRT_CD_BUFFER_TOO_SMALL,0,"Device array is too small");
     return UCRT_CD_OK;
 }
