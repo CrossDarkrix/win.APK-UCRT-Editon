@@ -1412,6 +1412,15 @@ int wmain(int argc, wchar_t** argv) {
     if (argc > 1 && std::wstring(argv[1]) == L"--java-main") return java_main(argc, argv);
     if ((argc == 3 || (argc == 5 && std::wstring(argv[3]) == L"--cache")) && std::wstring(argv[1]) == L"--aot-translate")
         return aot_translate_main(argv[2], argc == 5 ? fs::path(argv[4]) : fs::path());
+
+    // Give the interactive Win.apk runtime a modest process-wide scheduling
+    // preference. Helper/AOT modes return above and keep their existing lower
+    // priorities. Real-time audio scheduling remains thread-scoped via MMCSS.
+    const BOOL process_priority_ok = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    std::fprintf(stderr, "[win.apk] process priority: ABOVE_NORMAL success=%d error=%lu\n",
+                 process_priority_ok ? 1 : 0,
+                 process_priority_ok ? 0UL : static_cast<unsigned long>(GetLastError()));
+
     BootArgs b;
     if (!parse_args(argc, argv, &b.options)) {
         std::fprintf(stderr, "usage: winapk-runtime --apk <file.apk|.apkm|.xapk|.apks> [--data <dir>] [--jdk <dir>] [--lib <dir>] "

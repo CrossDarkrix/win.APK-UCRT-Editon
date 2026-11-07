@@ -161,13 +161,22 @@ private:
         // Resolve MMCSS dynamically so existing build/link settings remain unchanged.
         HMODULE avrt = LoadLibraryW(L"avrt.dll");
         using AvSetFn = HANDLE (WINAPI*)(LPCWSTR, LPDWORD);
+        using AvPriorityFn = BOOL (WINAPI*)(HANDLE, int);
         auto av_set = avrt ? reinterpret_cast<AvSetFn>(GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")) : nullptr;
+        auto av_priority = avrt ? reinterpret_cast<AvPriorityFn>(GetProcAddress(avrt, "AvSetMmThreadPriority")) : nullptr;
         DWORD mmcss_task_index = 0;
         HANDLE mmcss = av_set ? av_set(L"Pro Audio", &mmcss_task_index) : nullptr;
-        const BOOL priority_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        b2_log("Audio mixer thread started CoInitializeEx=0x%08lX mmcss=%s taskIndex=%lu timeCritical=%d",
+        // AVRT_PRIORITY_CRITICAL is 2. Prefer MMCSS so Windows can prioritize
+        // this time-sensitive render thread without starving unrelated work.
+        const BOOL mmcss_priority_ok = mmcss && av_priority ? av_priority(mmcss, 2) : FALSE;
+        // If MMCSS is unavailable, retain a bounded conventional priority boost.
+        // Do not use TIME_CRITICAL outside MMCSS because it can starve system work.
+        const BOOL fallback_priority_ok = mmcss ? TRUE :
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        b2_log("Audio mixer thread started CoInitializeEx=0x%08lX mmcss=%s taskIndex=%lu mmcssCritical=%d fallbackHighest=%d",
                static_cast<unsigned long>(co_hr), mmcss ? "Pro Audio" : "unavailable",
-               static_cast<unsigned long>(mmcss_task_index), priority_ok ? 1 : 0);
+               static_cast<unsigned long>(mmcss_task_index), mmcss_priority_ok ? 1 : 0,
+               (!mmcss && fallback_priority_ok) ? 1 : 0);
         for (;;) {
             if (!run_device()) {
                 // Keep streams alive while an endpoint is temporarily unavailable.
