@@ -24,6 +24,60 @@ from typing import Any, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MODULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*$")
+# Required roots for the bundled Windows runtime. jdeps discovers static use,
+# while TLS/JCA providers are also service-driven and must be retained explicitly.
+REQUIRED_RUNTIME_MODULES = (
+    "java.base", "java.logging", "java.naming", "java.net.http",
+    "java.security.jgss", "jdk.crypto.ec", "jdk.crypto.cryptoki",
+    "jdk.crypto.mscapi",
+)
+CRYPTO_SELF_TEST_SOURCE = r"""
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.KeyPairGenerator;
+import java.security.Security;
+import javax.crypto.KeyAgreement;
+import javax.net.ssl.SSLContext;
+
+public final class RuntimeCryptoSelfTest {
+  private static void require(boolean ok, String message) {
+    if (!ok) throw new IllegalStateException(message);
+  }
+  public static void main(String[] args) throws Exception {
+    require(Security.getProvider("SunJSSE") != null, "SunJSSE provider missing");
+    require(Security.getProvider("SunEC") != null, "SunEC provider missing");
+    SSLContext context = SSLContext.getInstance("TLS");
+    context.init(null, null, null);
+    require(context.getSocketFactory().getDefaultCipherSuites().length > 0,
+            "TLS has no default cipher suites");
+    String[] keyPairs = {"X25519", "XDH", "EC"};
+    for (String name : keyPairs) {
+      KeyPairGenerator kpg = KeyPairGenerator.getInstance(name);
+      require(!"Conscrypt".equals(kpg.getProvider().getName()),
+              "synthetic Conscrypt selected for KeyPairGenerator." + name);
+      if (name.equals("X25519")) kpg.generateKeyPair();
+    }
+    String[] agreements = {"X25519", "XDH", "ECDH"};
+    for (String name : agreements) {
+      KeyAgreement ka = KeyAgreement.getInstance(name);
+      require(!"Conscrypt".equals(ka.getProvider().getName()),
+              "synthetic Conscrypt selected for KeyAgreement." + name);
+    }
+    if (args.length == 1 && !args[0].isBlank()) {
+      HttpRequest request = HttpRequest.newBuilder(URI.create(args[0]))
+          .header("User-Agent", "Win.apk runtime crypto preflight")
+          .method("HEAD", HttpRequest.BodyPublishers.noBody()).build();
+      HttpResponse<Void> response = HttpClient.newBuilder()
+          .sslContext(context).followRedirects(HttpClient.Redirect.NORMAL).build()
+          .send(request, HttpResponse.BodyHandlers.discarding());
+      require(response.statusCode() > 0, "HTTPS preflight returned no status");
+    }
+    System.out.println("RUNTIME_CRYPTO_SELF_TEST=PASS");
+  }
+}
+"""
 
 
 class BuildError(RuntimeError):
@@ -79,9 +133,9 @@ def discover_jdk(explicit: Path | None) -> Path:
         if key in seen:
             continue
         seen.add(key)
-        if all((home / "bin" / exe(tool)).is_file() for tool in ("java", "jlink")):
+        if all((home / "bin" / exe(tool)).is_file() for tool in ("java", "javac", "jlink")):
             return home
-    raise BuildError("java/jlinkを備えたJDKを検出できません。--jdkで指定してください。")
+    raise BuildError("java/javac/jlinkを備えたJDKを検出できません。--jdkで指定してください。")
 
 
 def parse_feature_version(text: str) -> int | None:
@@ -218,6 +272,7 @@ def markdown(report: dict[str, Any]) -> str:
         f"- `java --version`: **{'PASS' if report['verification']['javaVersionPassed'] else 'FAIL'}**",
         f"- `java --list-modules`: **{'PASS' if report['verification']['moduleListPassed'] else 'FAIL'}**",
         f"- 要求モジュール包含: **{'PASS' if report['verification']['requestedModulesPassed'] else 'FAIL'}**",
+        f"- TLS/EC自己診断: **{'PASS' if report['verification']['cryptoSelfTestPassed'] else 'FAIL'}**",
         "", "## A3の範囲", "",
         "jlink runtime imageの生成と静的・起動検証のみを行います。Win.apk-UCRTへの組込みやNSIS生成は行いません。", "",
     ]
@@ -233,7 +288,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--image-name", default="runtime-image")
     parser.add_argument("--expected-jdk", type=int, default=21)
     parser.add_argument("--compress", choices=("0", "1", "2"), default="2")
-    parser.add_argument("--bind-services", action="store_true")
+    parser.add_argument("--bind-services", action="store_true", default=True)
+    parser.add_argument("--crypto-test-url", default="https://musicbrainz.org/")
+    parser.add_argument("--skip-online-crypto-test", action="store_true")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--keep-debug", action="store_true")
     return parser.parse_args(argv)
@@ -253,8 +310,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise BuildError("--image-nameは単一のディレクトリ名で指定してください。")
         output = output_dir / args.image_name
         report, modules, a2_report_path, modules_path = load_a2(a2_dir)
+        modules = sorted(set(modules).union(REQUIRED_RUNTIME_MODULES))
         jdk = discover_jdk(args.jdk)
         java = jdk / "bin" / exe("java")
+        javac = jdk / "bin" / exe("javac")
         jlink = jdk / "bin" / exe("jlink")
         jmods = jdk / "jmods"
         if not jmods.is_dir():
@@ -285,8 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         if not args.keep_debug:
             command.append("--strip-debug")
-        if args.bind_services:
-            command.append("--bind-services")
+        command.append("--bind-services")
         linked = run("jlink", command)
         commands.append(asdict(linked))
         if linked.returncode != 0:
@@ -308,6 +366,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing_modules = sorted(set(modules) - set(image_modules))
         if missing_modules:
             raise BuildError("生成runtimeに要求モジュールがありません: " + ", ".join(missing_modules))
+
+        # Compile with the full JDK, execute with the generated runtime. A bad
+        # image is rejected before atomic_publish, so an incomplete runtime can
+        # never replace a previously valid one.
+        self_test_src = work_parent / "RuntimeCryptoSelfTest.java"
+        self_test_classes = work_parent / "crypto-self-test"
+        self_test_classes.mkdir()
+        self_test_src.write_text(CRYPTO_SELF_TEST_SOURCE, encoding="utf-8", newline="\n")
+        compiled = run("compile-runtime-crypto-self-test", [
+            str(javac), "--release", str(args.expected_jdk), "-d",
+            str(self_test_classes), str(self_test_src)
+        ])
+        commands.append(asdict(compiled))
+        if compiled.returncode != 0:
+            raise BuildError("runtime暗号自己診断のコンパイルに失敗:\n" + compiled.stderr)
+        test_command = [str(image_java), "-cp", str(self_test_classes), "RuntimeCryptoSelfTest"]
+        if not args.skip_online_crypto_test:
+            test_command.append(args.crypto_test_url)
+        crypto_test = run("runtime-crypto-self-test", test_command, timeout=120)
+        commands.append(asdict(crypto_test))
+        if crypto_test.returncode != 0 or "RUNTIME_CRYPTO_SELF_TEST=PASS" not in crypto_test.stdout:
+            raise BuildError("生成runtimeのTLS/EC自己診断に失敗。runtimeは公開しません。\n"
+                             f"stdout={crypto_test.stdout}\nstderr={crypto_test.stderr}")
 
         files, total_bytes = image_manifest(temp_image)
         if not files or total_bytes <= 0:
@@ -337,7 +418,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "stripDebug": not args.keep_debug,
                 "noHeaderFiles": True,
                 "noManPages": True,
-                "bindServices": args.bind_services,
+                "bindServices": True,
+                "requiredRuntimeModules": list(REQUIRED_RUNTIME_MODULES),
+                "cryptoTestUrl": None if args.skip_online_crypto_test else args.crypto_test_url,
                 "savedOptions": saved_opts_text,
             },
             "modules": {"requested": modules, "image": image_modules, "missing": []},
@@ -346,6 +429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "javaVersionPassed": image_version.returncode == 0,
                 "moduleListPassed": listed.returncode == 0,
                 "requestedModulesPassed": True,
+                "cryptoSelfTestPassed": True,
             },
             "image": {"fileCount": len(files), "totalBytes": total_bytes, "files": files},
             "commands": commands,

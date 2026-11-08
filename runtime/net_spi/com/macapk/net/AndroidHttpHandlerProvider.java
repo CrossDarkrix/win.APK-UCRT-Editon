@@ -159,6 +159,17 @@ public final class AndroidHttpHandlerProvider extends URLStreamHandlerProvider {
         java.net.HttpURLConnection jdkConnection(URL u, Proxy proxy) throws IOException {
             URL viaBuiltin = new URL(null, u.toExternalForm(), builtin);
             URLConnection c = proxy == null ? viaBuiltin.openConnection() : viaBuiltin.openConnection(proxy);
+            // Apply the Android-compatible TLS factory to the actual JDK HTTPS
+            // connection. This is the path used by guest HttpURLConnection calls;
+            // configuring android.net.SSLCertificateSocketFactory alone is not enough.
+            if (c instanceof javax.net.ssl.HttpsURLConnection) {
+                javax.net.ssl.HttpsURLConnection https =
+                        (javax.net.ssl.HttpsURLConnection) c;
+                https.setSSLSocketFactory(
+                        new EcdhFallbackSSLSocketFactory(30000));
+                System.err.println("[I] Win.apk.TLS: installed ECDH retry factory for HTTPS host="
+                        + u.getHost());
+            }
             return (java.net.HttpURLConnection) c;
         }
     }

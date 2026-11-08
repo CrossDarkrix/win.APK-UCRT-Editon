@@ -58,6 +58,17 @@ public final class MacApkConscryptProvider extends Provider {
             // Skip ourselves if somehow already installed (idempotency).
             if (p instanceof MacApkConscryptProvider) continue;
             for (Provider.Service svc : p.getServices()) {
+                String serviceType = svc.getType();
+                String algorithm = svc.getAlgorithm().toUpperCase(java.util.Locale.ROOT);
+                if ((serviceType.equalsIgnoreCase("KeyPairGenerator")
+                        || serviceType.equalsIgnoreCase("KeyAgreement")
+                        || serviceType.equalsIgnoreCase("KeyFactory")
+                        || serviceType.equalsIgnoreCase("AlgorithmParameters"))
+                        && (algorithm.equals("EC") || algorithm.equals("ECDH")
+                            || algorithm.equals("XDH") || algorithm.equals("X25519")
+                            || algorithm.equals("X448"))) {
+                    continue;
+                }
                 String key = svc.getType() + "." + svc.getAlgorithm();
                 if (getService(svc.getType(), svc.getAlgorithm()) != null) {
                     continue; // first provider wins, mirrors platform precedence

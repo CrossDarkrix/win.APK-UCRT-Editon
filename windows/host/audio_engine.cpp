@@ -137,8 +137,8 @@ private:
             }
             RegCloseKey(key);
         }
-        DWORD gain_step=0,gain_bytes=sizeof(gain_step);if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\Win.apk",L"UsbDirectGainStep",RRF_RT_REG_DWORD,nullptr,&gain_step,&gain_bytes)!=ERROR_SUCCESS)gain_step=0;gain_step=(std::min)(gain_step,6ul);usb_gain_db_=float(gain_step*3);usb_gain_target_=std::pow(10.0f,usb_gain_db_/20.0f);usb_gain_current_=1.0f;
-        b2_log("Phase20-B2.3.3 USB Direct configured endpoint=%s gainDb=%.1f linearTarget=%.6f", endpoint_id_.empty() ? "MISSING" : endpoint_id_.c_str(),double(usb_gain_db_),double(usb_gain_target_));
+        DWORD gain_step=0,gain_bytes=sizeof(gain_step);if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\Win.apk",L"UsbDirectGainStep",RRF_RT_REG_DWORD,nullptr,&gain_step,&gain_bytes)!=ERROR_SUCCESS)gain_step=0;gain_step=(std::min)(gain_step,6ul);usb_gain_db_=float(gain_step*3);usb_gain_target_=std::pow(10.0f,usb_gain_db_/20.0f);usb_gain_current_=1.0f;DWORD punch=3,punch_bytes=sizeof(punch);if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\Win.apk",L"UsbDirectPunchLevel",RRF_RT_REG_DWORD,nullptr,&punch,&punch_bytes)!=ERROR_SUCCESS)punch=3;usb_punch_level_=(std::min)(punch,3ul);
+        b2_log("Phase20-B2.3.3 USB Direct configured endpoint=%s gainDb=%.1f linearTarget=%.6f", endpoint_id_.empty() ? "MISSING" : endpoint_id_.c_str(),double(usb_gain_db_),double(usb_gain_target_)); b2_log("Audio Punch configured level=%lu", static_cast<unsigned long>(usb_punch_level_));
         std::thread([this] { run(); }).detach();
     }
 
@@ -169,11 +169,12 @@ private:
         // AVRT_PRIORITY_CRITICAL is 2. Prefer MMCSS so Windows can prioritize
         // this time-sensitive render thread without starving unrelated work.
         const BOOL mmcss_priority_ok = mmcss && av_priority ? av_priority(mmcss, 2) : FALSE;
-        // If MMCSS is unavailable, retain a bounded conventional priority boost.
-        // Do not use TIME_CRITICAL outside MMCSS because it can starve system work.
+        // If MMCSS is unavailable, use the requested second scheduling boost for
+        // this render thread. The process stays HIGH rather than REALTIME so the
+        // operating system retains priority over the application as a whole.
         const BOOL fallback_priority_ok = mmcss ? TRUE :
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-        b2_log("Audio mixer thread started CoInitializeEx=0x%08lX mmcss=%s taskIndex=%lu mmcssCritical=%d fallbackHighest=%d",
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        b2_log("Audio mixer thread started CoInitializeEx=0x%08lX mmcss=%s taskIndex=%lu mmcssCritical=%d fallbackTimeCritical=%d",
                static_cast<unsigned long>(co_hr), mmcss ? "Pro Audio" : "unavailable",
                static_cast<unsigned long>(mmcss_task_index), mmcss_priority_ok ? 1 : 0,
                (!mmcss && fallback_priority_ok) ? 1 : 0);
@@ -288,14 +289,21 @@ private:
             hr = client->GetDevicePeriod(&default_period, &minimum_period);
             if (SUCCEEDED(hr)) {
                 const REFERENCE_TIME period = default_period > 0 ? default_period : minimum_period;
-                hr = period > 0 ? client->Initialize(
+                const REFERENCE_TIME stable_period = period > 0 ? period * 2 : 0;
+                hr = stable_period > 0 ? client->Initialize(
                     AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    period, period, &selected.Format, nullptr) : E_INVALIDARG;
-                b2_log("Exclusive selected rate=%lu container=%d valid=%d blockAlign=%d Initialize=0x%08lX period100ns=%lld",
+                    stable_period, stable_period, &selected.Format, nullptr) : E_INVALIDARG;
+                if (FAILED(hr) && period > 0) {
+                    b2_log("Exclusive two-period Initialize rejected hr=0x%08lX; retrying device period", static_cast<unsigned long>(hr));
+                    hr = client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, period,
+                        &selected.Format, nullptr);
+                }
+                b2_log("Exclusive selected rate=%lu container=%d valid=%d blockAlign=%d Initialize=0x%08lX period100ns=%lld requestedStable100ns=%lld",
                        static_cast<unsigned long>(selected.Format.nSamplesPerSec),
                        selected.Format.wBitsPerSample, selected.Samples.wValidBitsPerSample,
                        selected.Format.nBlockAlign, static_cast<unsigned long>(hr),
-                       static_cast<long long>(period));
+                       static_cast<long long>(period), static_cast<long long>(stable_period));
                 if (SUCCEEDED(hr)) { exclusive = true; active = &selected.Format; }
             } else {
                 b2_error("GetDevicePeriod", hr);
@@ -334,6 +342,7 @@ private:
         bool ok = ready && SUCCEEDED(event_hr) && SUCCEEDED(size_hr) && SUCCEEDED(render_hr);
         HRESULT volume_hr = S_FALSE;
         if (!exclusive && ok) { volume_hr = client->GetService(__uuidof(ISimpleAudioVolume), reinterpret_cast<void**>(&session_volume)); ok = SUCCEEDED(volume_hr); if(ok&&usb_direct_){const HRESULT vh=session_volume->SetMasterVolume(1.0f,nullptr);const HRESULT mh=session_volume->SetMute(FALSE,nullptr);ok=SUCCEEDED(vh)&&SUCCEEDED(mh);b2_log("Phase20-B2.3.2 unity session volume=1.0 mute=0 volumeHr=0x%08lX muteHr=0x%08lX",static_cast<unsigned long>(vh),static_cast<unsigned long>(mh));} }
+        b2_log("Audio Space2 Stability2 actualBuffer frames=%lu durationMs=%.3f exclusive=%d", static_cast<unsigned long>(buffer_frames), output_rate > 0 ? 1000.0 * double(buffer_frames) / double(output_rate) : 0.0, exclusive ? 1 : 0);
         b2_log("Phase20-B2.3.1 services event=0x%08lX bufferSize=0x%08lX frames=%lu render=0x%08lX renderClient=%s volume=0x%08lX",static_cast<unsigned long>(event_hr),static_cast<unsigned long>(size_hr),static_cast<unsigned long>(buffer_frames),static_cast<unsigned long>(render_hr),render?"yes":"no",static_cast<unsigned long>(volume_hr));
         // Prime the exclusive endpoint before Start. Starting an empty hardware buffer
         // makes the first event arrive only after the endpoint has already underrun.
@@ -453,7 +462,51 @@ private:
                 ? (requested_session_mute_.load(std::memory_order_acquire) ? 0.0f
                    : requested_session_volume_.load(std::memory_order_acquire))
                 : 1.0f);
-            if(usb_direct_){constexpr float threshold=0.90f,ceiling=0.98f;const bool bypass=usb_gain_db_==0.0f;const size_t ramp_samples=static_cast<size_t>((std::max)(1,output_rate/10))*2;double input_peak=0,pre_peak=0,out_peak=0;uint64_t limited=0;for(float& sample:mixbuf){input_peak=(std::max)(input_peak,std::fabs(double(sample)));if(bypass){usb_gain_current_=1.0f;pre_peak=(std::max)(pre_peak,std::fabs(double(sample)));out_peak=(std::max)(out_peak,std::fabs(double(sample)));continue;}const float delta=usb_gain_target_-usb_gain_current_;if(std::fabs(delta)>0.000001f)usb_gain_current_+=delta/float((std::max)(size_t(1),ramp_samples));else usb_gain_current_=usb_gain_target_;const float pre=sample*usb_gain_current_;const float magnitude=std::fabs(pre);pre_peak=(std::max)(pre_peak,double(magnitude));if(magnitude<=threshold)sample=pre;else{++limited;const float range=ceiling-threshold;const float compressed=threshold+range*(1.0f-std::exp(-(magnitude-threshold)/range));sample=std::copysign((std::min)(compressed,ceiling),pre);}out_peak=(std::max)(out_peak,std::fabs(double(sample)));}usb_limited_samples_+=limited;usb_diag_frames_+=frames;if(usb_diag_frames_>=uint64_t((std::max)(1,output_rate)*10)){const double reduction_db=pre_peak>0.0&&out_peak>0.0?20.0*std::log10(out_peak/pre_peak):0.0;b2_log("Phase20-B2.3.3.1 USB Direct gain configuredDb=%.1f target=%.6f current=%.6f inputPeak=%.9f postGainPeak=%.9f outputPeak=%.9f gainReductionDb=%.6f limitedSamples=%llu totalLimited=%llu bypass=%d",double(usb_gain_db_),double(usb_gain_target_),double(usb_gain_current_),input_peak,pre_peak,out_peak,reduction_db,(unsigned long long)limited,(unsigned long long)usb_limited_samples_,bypass?1:0);usb_diag_frames_=0;}}
+            if (usb_direct_) {
+                // Phase-coherent two-crossover M/S shaping. Below 110 Hz stays
+                // centered; low-mid and mid/high side energy are widened without
+                // Haas delay or polarity tricks. Pre-trim preserves limiter headroom.
+                const float rate_f = float((std::max)(1, output_rate));
+                const float a110 = 1.0f - std::exp(-2.0f * 3.14159265358979323846f * 110.0f / rate_f);
+                const float a450 = 1.0f - std::exp(-2.0f * 3.14159265358979323846f * 450.0f / rate_f);
+                constexpr float low_mid_gain = 1.12f;
+                constexpr float body_mid_gain = 1.08f;
+                constexpr float body_side_gain = 1.08f;
+                constexpr float upper_side_gain = 1.12f;
+                constexpr float headroom = 0.84f;
+                for (size_t i = 0; i + 1 < mixbuf.size(); i += 2) {
+                    const float l = mixbuf[i], r = mixbuf[i + 1];
+                    const float mid = 0.5f * (l + r);
+                    const float side = 0.5f * (l - r);
+                    usb_space_mid110_ += a110 * (mid - usb_space_mid110_);
+                    usb_space_mid450_ += a450 * (mid - usb_space_mid450_);
+                    usb_space_side110_ += a110 * (side - usb_space_side110_);
+                    usb_space_side450_ += a450 * (side - usb_space_side450_);
+                    const float mid_low = usb_space_mid110_;
+                    const float mid_body = usb_space_mid450_ - usb_space_mid110_;
+                    const float mid_upper = mid - usb_space_mid450_;
+                    const float side_low = usb_space_side110_;
+                    const float side_body = usb_space_side450_ - usb_space_side110_;
+                    const float side_upper = side - usb_space_side450_;
+                    const float shaped_mid = mid_low * low_mid_gain + mid_body * body_mid_gain + mid_upper;
+                    const float shaped_side = side_low + side_body * body_side_gain + side_upper * upper_side_gain;
+                    mixbuf[i] = (shaped_mid + shaped_side) * headroom;
+                    mixbuf[i + 1] = (shaped_mid - shaped_side) * headroom;
+                }
+            }
+            if (usb_direct_ && usb_punch_level_ > 0) {
+                const float cutoff_hz = 145.0f;
+                const float alpha = 1.0f - std::exp(-2.0f * 3.14159265358979323846f * cutoff_hz / float((std::max)(1, output_rate)));
+                const float bass_gain = 0.18f * float(usb_punch_level_);
+                const float body_gain = 1.0f + 0.025f * float(usb_punch_level_);
+                for (size_t i = 0; i + 1 < mixbuf.size(); i += 2) {
+                    usb_bass_l_ += alpha * (mixbuf[i] - usb_bass_l_);
+                    usb_bass_r_ += alpha * (mixbuf[i + 1] - usb_bass_r_);
+                    mixbuf[i] = mixbuf[i] * body_gain + usb_bass_l_ * bass_gain;
+                    mixbuf[i + 1] = mixbuf[i + 1] * body_gain + usb_bass_r_ * bass_gain;
+                }
+            }
+            if(usb_direct_){constexpr float threshold=0.90f,ceiling=0.98f;const bool bypass=usb_gain_db_==0.0f && usb_punch_level_==0;const size_t ramp_samples=static_cast<size_t>((std::max)(1,output_rate/10))*2;double input_peak=0,pre_peak=0,out_peak=0;uint64_t limited=0;for(float& sample:mixbuf){input_peak=(std::max)(input_peak,std::fabs(double(sample)));if(bypass){usb_gain_current_=1.0f;pre_peak=(std::max)(pre_peak,std::fabs(double(sample)));out_peak=(std::max)(out_peak,std::fabs(double(sample)));continue;}const float delta=usb_gain_target_-usb_gain_current_;if(std::fabs(delta)>0.000001f)usb_gain_current_+=delta/float((std::max)(size_t(1),ramp_samples));else usb_gain_current_=usb_gain_target_;const float pre=sample*usb_gain_current_;const float magnitude=std::fabs(pre);pre_peak=(std::max)(pre_peak,double(magnitude));if(magnitude<=threshold)sample=pre;else{++limited;const float range=ceiling-threshold;const float compressed=threshold+range*(1.0f-std::exp(-(magnitude-threshold)/range));sample=std::copysign((std::min)(compressed,ceiling),pre);}out_peak=(std::max)(out_peak,std::fabs(double(sample)));}usb_limited_samples_+=limited;usb_diag_frames_+=frames;if(usb_diag_frames_>=uint64_t((std::max)(1,output_rate)*10)){const double reduction_db=pre_peak>0.0&&out_peak>0.0?20.0*std::log10(out_peak/pre_peak):0.0;b2_log("Phase20-B2.3.3.1 USB Direct gain configuredDb=%.1f target=%.6f current=%.6f inputPeak=%.9f postGainPeak=%.9f outputPeak=%.9f gainReductionDb=%.6f limitedSamples=%llu totalLimited=%llu bypass=%d",double(usb_gain_db_),double(usb_gain_target_),double(usb_gain_current_),input_peak,pre_peak,out_peak,reduction_db,(unsigned long long)limited,(unsigned long long)usb_limited_samples_,bypass?1:0);usb_diag_frames_=0;}}
             if (exclusive) {
                 observed_session_volume_.store(requested_session_volume_.load(std::memory_order_acquire),
                                                std::memory_order_release);
@@ -567,6 +620,10 @@ private:
 
     const bool usb_direct_;
     float usb_gain_db_=0.0f,usb_gain_target_=1.0f,usb_gain_current_=1.0f;
+    DWORD usb_punch_level_=3;
+    float usb_bass_l_=0.0f,usb_bass_r_=0.0f;
+    float usb_space_mid110_=0.0f,usb_space_mid450_=0.0f;
+    float usb_space_side110_=0.0f,usb_space_side450_=0.0f;
     uint64_t usb_limited_samples_=0,usb_diag_frames_=0;
     std::mutex lock_;
     std::vector<std::shared_ptr<Source>> sources_;
@@ -602,7 +659,7 @@ class Stream final : public Source {
 public:
     Stream(int rate, int channels, int buffer_frames)
         : base_rate_(rate), rate_(rate), channels_(channels),
-          capacity_(static_cast<size_t>(std::max(buffer_frames, rate / 5))) {
+          capacity_(static_cast<size_t>(std::max(buffer_frames, (rate * 2) / 5))) {
         if (rate > 0) g_preferred_source_rate.store(rate, std::memory_order_release);
     }
 

@@ -1416,7 +1416,7 @@ int wmain(int argc, wchar_t** argv) {
     // Give the interactive Win.apk runtime a modest process-wide scheduling
     // preference. Helper/AOT modes return above and keep their existing lower
     // priorities. Real-time audio scheduling remains thread-scoped via MMCSS.
-    const BOOL process_priority_ok = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    const BOOL process_priority_ok = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     std::fprintf(stderr, "[win.apk] process priority: ABOVE_NORMAL success=%d error=%lu\n",
                  process_priority_ok ? 1 : 0,
                  process_priority_ok ? 0UL : static_cast<unsigned long>(GetLastError()));
