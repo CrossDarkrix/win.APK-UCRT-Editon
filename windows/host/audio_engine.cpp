@@ -473,7 +473,7 @@ private:
                 constexpr float body_mid_gain = 1.08f;
                 constexpr float body_side_gain = 1.08f;
                 constexpr float upper_side_gain = 1.12f;
-                constexpr float headroom = 0.84f;
+                constexpr float headroom = 0.92f;
                 for (size_t i = 0; i + 1 < mixbuf.size(); i += 2) {
                     const float l = mixbuf[i], r = mixbuf[i + 1];
                     const float mid = 0.5f * (l + r);
@@ -506,7 +506,48 @@ private:
                     mixbuf[i + 1] = mixbuf[i + 1] * body_gain + usb_bass_r_ * bass_gain;
                 }
             }
-            if(usb_direct_){constexpr float threshold=0.90f,ceiling=0.98f;const bool bypass=usb_gain_db_==0.0f && usb_punch_level_==0;const size_t ramp_samples=static_cast<size_t>((std::max)(1,output_rate/10))*2;double input_peak=0,pre_peak=0,out_peak=0;uint64_t limited=0;for(float& sample:mixbuf){input_peak=(std::max)(input_peak,std::fabs(double(sample)));if(bypass){usb_gain_current_=1.0f;pre_peak=(std::max)(pre_peak,std::fabs(double(sample)));out_peak=(std::max)(out_peak,std::fabs(double(sample)));continue;}const float delta=usb_gain_target_-usb_gain_current_;if(std::fabs(delta)>0.000001f)usb_gain_current_+=delta/float((std::max)(size_t(1),ramp_samples));else usb_gain_current_=usb_gain_target_;const float pre=sample*usb_gain_current_;const float magnitude=std::fabs(pre);pre_peak=(std::max)(pre_peak,double(magnitude));if(magnitude<=threshold)sample=pre;else{++limited;const float range=ceiling-threshold;const float compressed=threshold+range*(1.0f-std::exp(-(magnitude-threshold)/range));sample=std::copysign((std::min)(compressed,ceiling),pre);}out_peak=(std::max)(out_peak,std::fabs(double(sample)));}usb_limited_samples_+=limited;usb_diag_frames_+=frames;if(usb_diag_frames_>=uint64_t((std::max)(1,output_rate)*10)){const double reduction_db=pre_peak>0.0&&out_peak>0.0?20.0*std::log10(out_peak/pre_peak):0.0;b2_log("Phase20-B2.3.3.1 USB Direct gain configuredDb=%.1f target=%.6f current=%.6f inputPeak=%.9f postGainPeak=%.9f outputPeak=%.9f gainReductionDb=%.6f limitedSamples=%llu totalLimited=%llu bypass=%d",double(usb_gain_db_),double(usb_gain_target_),double(usb_gain_current_),input_peak,pre_peak,out_peak,reduction_db,(unsigned long long)limited,(unsigned long long)usb_limited_samples_,bypass?1:0);usb_diag_frames_=0;}}
+            if (usb_direct_) {
+                // Loudness1: linked-stereo RMS bus compressor. One gain envelope
+                // is applied to both channels, preserving stereo image and punch.
+                const float fs = float((std::max)(1, output_rate));
+                const float rms_coeff = 1.0f - std::exp(-1.0f / (0.050f * fs));
+                const float attack_coeff = 1.0f - std::exp(-1.0f / (0.020f * fs));
+                const float release_coeff = 1.0f - std::exp(-1.0f / (0.180f * fs));
+                constexpr float threshold_db = -12.0f;
+                constexpr float ratio = 1.5f;
+                constexpr float max_reduction_db = 2.5f;
+                constexpr float makeup_db = 2.0f;
+                const float makeup = std::pow(10.0f, makeup_db / 20.0f);
+                float block_max_reduction_db = 0.0f;
+                double block_reduction_sum_db = 0.0;
+                uint64_t block_reduction_samples = 0;
+                for (size_t i = 0; i + 1 < mixbuf.size(); i += 2) {
+                    const float l = mixbuf[i], r = mixbuf[i + 1];
+                    const float energy = 0.5f * (l * l + r * r);
+                    usb_comp_rms_sq_ += rms_coeff * (energy - usb_comp_rms_sq_);
+                    const float rms = std::sqrt((std::max)(usb_comp_rms_sq_, 1.0e-12f));
+                    const float level_db = 20.0f * std::log10(rms);
+                    float reduction_db = 0.0f;
+                    if (level_db > threshold_db) {
+                        reduction_db = (level_db - threshold_db) * (1.0f - 1.0f / ratio);
+                        reduction_db = (std::min)(reduction_db, max_reduction_db);
+                    }
+                    const float target_gain = std::pow(10.0f, -reduction_db / 20.0f);
+                    const float coeff = target_gain < usb_comp_gain_ ? attack_coeff : release_coeff;
+                    usb_comp_gain_ += coeff * (target_gain - usb_comp_gain_);
+                    const float linked_gain = usb_comp_gain_ * makeup;
+                    mixbuf[i] = l * linked_gain;
+                    mixbuf[i + 1] = r * linked_gain;
+                    const float actual_reduction_db = -20.0f * std::log10((std::max)(usb_comp_gain_, 1.0e-6f));
+                    block_max_reduction_db = (std::max)(block_max_reduction_db, actual_reduction_db);
+                    block_reduction_sum_db += actual_reduction_db;
+                    ++block_reduction_samples;
+                }
+                usb_comp_max_reduction_db_ = (std::max)(usb_comp_max_reduction_db_, block_max_reduction_db);
+                usb_comp_reduction_sum_db_ += block_reduction_sum_db;
+                usb_comp_reduction_samples_ += block_reduction_samples;
+            }
+            if(usb_direct_){constexpr float threshold=0.92f,ceiling=0.97f;const bool bypass=usb_gain_db_==0.0f && usb_punch_level_==0;const size_t ramp_samples=static_cast<size_t>((std::max)(1,output_rate/10))*2;double input_peak=0,pre_peak=0,out_peak=0;uint64_t limited=0;for(float& sample:mixbuf){input_peak=(std::max)(input_peak,std::fabs(double(sample)));if(bypass){usb_gain_current_=1.0f;pre_peak=(std::max)(pre_peak,std::fabs(double(sample)));out_peak=(std::max)(out_peak,std::fabs(double(sample)));continue;}const float delta=usb_gain_target_-usb_gain_current_;if(std::fabs(delta)>0.000001f)usb_gain_current_+=delta/float((std::max)(size_t(1),ramp_samples));else usb_gain_current_=usb_gain_target_;const float pre=sample*usb_gain_current_;const float magnitude=std::fabs(pre);pre_peak=(std::max)(pre_peak,double(magnitude));if(magnitude<=threshold)sample=pre;else{++limited;const float range=ceiling-threshold;const float compressed=threshold+range*(1.0f-std::exp(-(magnitude-threshold)/range));sample=std::copysign((std::min)(compressed,ceiling),pre);}out_peak=(std::max)(out_peak,std::fabs(double(sample)));}usb_limited_samples_+=limited;usb_diag_frames_+=frames;if(usb_diag_frames_>=uint64_t((std::max)(1,output_rate)*10)){const double reduction_db=pre_peak>0.0&&out_peak>0.0?20.0*std::log10(out_peak/pre_peak):0.0;b2_log("Phase20-B2.3.3.1 USB Direct gain configuredDb=%.1f target=%.6f current=%.6f inputPeak=%.9f postGainPeak=%.9f outputPeak=%.9f gainReductionDb=%.6f limitedSamples=%llu totalLimited=%llu bypass=%d compressorMaxReductionDb=%.3f compressorAverageReductionDb=%.3f",double(usb_gain_db_),double(usb_gain_target_),double(usb_gain_current_),input_peak,pre_peak,out_peak,reduction_db,(unsigned long long)limited,(unsigned long long)usb_limited_samples_,bypass?1:0,double(usb_comp_max_reduction_db_),usb_comp_reduction_samples_?usb_comp_reduction_sum_db_/double(usb_comp_reduction_samples_):0.0);usb_diag_frames_=0;usb_comp_max_reduction_db_=0.0f;usb_comp_reduction_sum_db_=0.0;usb_comp_reduction_samples_=0;}}
             if (exclusive) {
                 observed_session_volume_.store(requested_session_volume_.load(std::memory_order_acquire),
                                                std::memory_order_release);
@@ -624,6 +665,9 @@ private:
     float usb_bass_l_=0.0f,usb_bass_r_=0.0f;
     float usb_space_mid110_=0.0f,usb_space_mid450_=0.0f;
     float usb_space_side110_=0.0f,usb_space_side450_=0.0f;
+    float usb_comp_rms_sq_=0.0f,usb_comp_gain_=1.0f,usb_comp_max_reduction_db_=0.0f;
+    double usb_comp_reduction_sum_db_=0.0;
+    uint64_t usb_comp_reduction_samples_=0;
     uint64_t usb_limited_samples_=0,usb_diag_frames_=0;
     std::mutex lock_;
     std::vector<std::shared_ptr<Source>> sources_;
