@@ -945,6 +945,27 @@ void apply_aot_clang_env() {
     }
 }
 
+
+
+// Explicitly opt performance-critical Win.apk work out of inferred EcoQoS.
+// Resolve the APIs dynamically so the same binary can still start on systems
+// where this process/thread information class is unavailable.
+bool disable_process_efficiency_mode(HANDLE process, DWORD* error) {
+    using SetProcessInformationFn = BOOL (WINAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    auto set_info = kernel32 ? reinterpret_cast<SetProcessInformationFn>(
+        GetProcAddress(kernel32, "SetProcessInformation")) : nullptr;
+    if (!set_info) { if (error) *error = ERROR_CALL_NOT_IMPLEMENTED; return false; }
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = 0;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL ok = set_info(process, ProcessPowerThrottling, &state, sizeof(state));
+    if (error) *error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok != FALSE;
+}
+
 HANDLE start_runtime(const std::wstring& args, const fs::path& log) {
     std::error_code ec;
     fs::create_directories(log.parent_path(), ec);
@@ -962,8 +983,20 @@ HANDLE start_runtime(const std::wstring& args, const fs::path& log) {
     PROCESS_INFORMATION pi{};
     const BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
                                    root().c_str(), &si, &pi);
-    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
-    if (!ok) return nullptr;
+    if (!ok) { if (out != INVALID_HANDLE_VALUE) CloseHandle(out); return nullptr; }
+    DWORD throttle_error = ERROR_SUCCESS;
+    const bool throttle_off = disable_process_efficiency_mode(pi.hProcess, &throttle_error);
+    const BOOL high_priority = SetPriorityClass(pi.hProcess, HIGH_PRIORITY_CLASS);
+    if (out != INVALID_HANDLE_VALUE) {
+        const std::string line = "Win.apk performance policy efficiencyModeOff=" +
+            std::to_string(throttle_off ? 1 : 0) + " powerThrottleError=" +
+            std::to_string(static_cast<unsigned long>(throttle_error)) +
+            " highPriority=" + std::to_string(high_priority ? 1 : 0) +
+            " priorityError=" + std::to_string(high_priority ? 0ul : static_cast<unsigned long>(GetLastError())) + "\r\n";
+        DWORD written = 0;
+        WriteFile(out, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+        CloseHandle(out);
+    }
     CloseHandle(pi.hThread);
     return pi.hProcess;
 }
@@ -4962,6 +4995,9 @@ int helper_main(int argc, wchar_t** argv) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+    DWORD launcher_throttle_error = ERROR_SUCCESS;
+    disable_process_efficiency_mode(GetCurrentProcess(), &launcher_throttle_error);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     g_inst = inst;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     OleInitialize(nullptr);

@@ -156,6 +156,24 @@ private:
     }
 
     void run() {
+        DWORD thread_throttle_error = ERROR_SUCCESS;
+        bool thread_throttle_off = false;
+        using SetThreadInformationFn = BOOL (WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        auto set_thread_info = kernel32 ? reinterpret_cast<SetThreadInformationFn>(
+            GetProcAddress(kernel32, "SetThreadInformation")) : nullptr;
+        if (set_thread_info) {
+            THREAD_POWER_THROTTLING_STATE state{};
+            state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+            state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+            state.StateMask = 0;
+            SetLastError(ERROR_SUCCESS);
+            thread_throttle_off = set_thread_info(GetCurrentThread(), ThreadPowerThrottling,
+                                                   &state, sizeof(state)) != FALSE;
+            thread_throttle_error = thread_throttle_off ? ERROR_SUCCESS : GetLastError();
+        } else {
+            thread_throttle_error = ERROR_CALL_NOT_IMPLEMENTED;
+        }
         const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         // Keep the render service loop from being delayed by normal UI/background work.
         // Resolve MMCSS dynamically so existing build/link settings remain unchanged.
@@ -174,10 +192,11 @@ private:
         // operating system retains priority over the application as a whole.
         const BOOL fallback_priority_ok = mmcss ? TRUE :
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        b2_log("Audio mixer thread started CoInitializeEx=0x%08lX mmcss=%s taskIndex=%lu mmcssCritical=%d fallbackTimeCritical=%d",
+        b2_log("Audio mixer thread started CoInitializeEx=0x%08lX mmcss=%s taskIndex=%lu mmcssCritical=%d fallbackTimeCritical=%d efficiencyModeOff=%d powerThrottleError=%lu",
                static_cast<unsigned long>(co_hr), mmcss ? "Pro Audio" : "unavailable",
                static_cast<unsigned long>(mmcss_task_index), mmcss_priority_ok ? 1 : 0,
-               (!mmcss && fallback_priority_ok) ? 1 : 0);
+               (!mmcss && fallback_priority_ok) ? 1 : 0,
+               thread_throttle_off ? 1 : 0, static_cast<unsigned long>(thread_throttle_error));
         for (;;) {
             if (!run_device()) {
                 // Keep streams alive while an endpoint is temporarily unavailable.
