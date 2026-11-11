@@ -117,6 +117,15 @@ public final class NativeAudio {
     // endpointId \u001f friendlyName \u001f isDefault \u001f sampleRate \u001f channels.
     public static native String[] nativeGetAudioOutputDevices();
     public static native boolean nativeSetAudioOutputDevice(String endpointId);
+    // ---- Visualizer (Phase20-B2.3.6.4.21) ----
+    // Output-mix tap behind android.media.audiofx.Visualizer. Both fill
+    // the caller's array completely and return Visualizer.SUCCESS (0) or
+    // ERROR_BAD_VALUE (-4). nativeVizGetSamplingRateMilliHz answers the
+    // tap's rate in milliHz (AOSP Visualizer.getSamplingRate units).
+    public static native int nativeVizGetWaveForm(byte[] out);
+    public static native int nativeVizGetFft(byte[] out);
+    public static native int nativeVizGetSamplingRateMilliHz();
+
     public static native void nativeSetSessionVolume(float volume);
     public static native float nativeGetSessionVolume();
     public static native void nativeSetSessionMute(boolean muted);

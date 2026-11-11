@@ -435,9 +435,40 @@ struct P20AudioHostClient {
   cmd.push_back(L'"');
   cmd.push_back(L' ');
   cmd += std::to_wstring(pid);
+  // Phase20-B2.3.6.4.16: give the audio host a log of its own. Until now it
+  // was created with bInheritHandles=FALSE and no standard handles, so its
+  // stderr -- the WASAPI underrun lines, the bridge summary (readable /
+  // underruns / overruns / bridgeShortWrites), CONFIGURE_COMMIT and the
+  // host-bridge QoS line -- went nowhere. last-run.log therefore contained
+  // only the runtime process's view, and the one process that can say why
+  // a buffer was late was invisible (log of 2026-11-12: 8.5 minutes of
+  // playback, zero audio-host lines). Append its stdout/stderr to
+  // winapk-audio-host.log next to the executable instead.
+  std::wstring log_path = p;
+  { const auto slash = log_path.find_last_of(L"\\/");
+    log_path = (slash == std::wstring::npos ? std::wstring() : log_path.substr(0, slash + 1)) + L"winapk-audio-host.log"; }
+  SECURITY_ATTRIBUTES log_sa{sizeof(log_sa), nullptr, TRUE};
+  HANDLE log_file = CreateFileW(log_path.c_str(), FILE_APPEND_DATA,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, &log_sa,
+                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE nul_input = log_file != INVALID_HANDLE_VALUE
+      ? CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    &log_sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)
+      : INVALID_HANDLE_VALUE;
   STARTUPINFOW si{sizeof(si)};
+  if (log_file != INVALID_HANDLE_VALUE) {
+   si.dwFlags = STARTF_USESTDHANDLES;
+   si.hStdOutput = log_file;
+   si.hStdError = log_file;
+   si.hStdInput = nul_input != INVALID_HANDLE_VALUE ? nul_input : log_file;
+  }
   PROCESS_INFORMATION pi{};
-  BOOL ok = CreateProcessW(p.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | HIGH_PRIORITY_CLASS, nullptr, nullptr, &si, &pi);
+  BOOL ok = CreateProcessW(p.c_str(), cmd.data(), nullptr, nullptr, log_file != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW | HIGH_PRIORITY_CLASS, nullptr, nullptr, &si, &pi);
+  if (log_file != INVALID_HANDLE_VALUE) {
+   std::fprintf(stderr, "[I] Phase20-B2.3.6.4.16: audio host log file=%ls\n", log_path.c_str());
+   CloseHandle(log_file);
+  }
+  if (nul_input != INVALID_HANDLE_VALUE) CloseHandle(nul_input);
   if (!ok) { h->last_error = GetLastError(); return false; }
   process = pi.hProcess;
   CloseHandle(pi.hThread);
@@ -467,8 +498,62 @@ struct P20AudioHostClient {
  }
  bool route_ready(uint64_t gen) const{return h&&h->host_ready&&!h->host_failed&&h->state==winapk::audio_ipc::kRunning&&uint64_t(h->generation)==gen;}
  bool write(const float* p,size_t frames,uint64_t gen){if(!route_ready(gen))return false;if(uint64_t(h->generation)!=gen){InterlockedIncrement64(&h->stale_drops);return true;}LONG64 w=InterlockedCompareExchange64(&h->write_pos,0,0),r=InterlockedCompareExchange64(&h->read_pos,0,0);uint64_t free=h->capacity_frames-(w>=r?uint64_t(w-r):0);if(frames>free){InterlockedIncrement64(&h->overruns);return false;}float* q=winapk::audio_ipc::pcm(h);for(size_t i=0;i<frames;i++){size_t d=size_t((uint64_t(w)+i)%h->capacity_frames)*2;q[d]=p[i*2];q[d+1]=p[i*2+1];}MemoryBarrier();InterlockedExchange64(&h->write_pos,w+LONG64(frames));InterlockedIncrement64(&h->producer_seq);InterlockedIncrement64(&h->parent_heartbeat);SetEvent(data);return true;}
+ // Phase20-B2.3.6.4.17: latency the audio host currently reports.
+ long long output_latency_frames(){return h?static_cast<long long>(h->output_latency_frames):0;}
 };
 P20AudioHostClient& p20_audio_host(){static P20AudioHostClient* c=new P20AudioHostClient();return *c;}
+// Phase20-B2.3.6.4.17: how long a normally-completing URB's completion is
+// held back so the app observes consumption at the moment the samples are
+// actually audible. The app drives its progress bar, remaining time and
+// spectrum analyser from its USB submit/completion pipeline; without this
+// offset all of them run ahead of the sound by the whole downstream
+// buffering (source ring ~1 s preroll + WASAPI endpoint 250 ms + queues).
+// The offset is measured, not fixed: the audio host publishes its current
+// output latency into the IPC header (fallback: ask the local stream).
+// Cancelled URBs (status -2) are never delayed.
+//
+// Phase20-B2.3.6.4.18: .17 applied the full measured offset (~1.3 s) from
+// the very first completion. last-run-3.log shows the result: 15 submits,
+// 3 reaps, then the app's stream thread never comes back -- a ~1.3 s
+// completion gap at startup trips UCRT's USB supervision and playback
+// never starts. The offset is therefore ramped in per pool epoch: it
+// starts at the 48 ms the 12-deep URB pool already implies and grows at
+// 0.2x realtime, so completions keep arriving every ~5 ms (never a
+// suspicious gap) while the app-visible clock slides onto the audible
+// output over a few seconds. It is also capped (default 800 ms, safely
+// below the gap that killed .17's startup). WINAPK_USB_LATENCY_SYNC_MS
+// now sets the cap in ms: 0 disables the sync; a larger value (e.g.
+// 1300) allows fuller sync, to test how much completion latency the app
+// actually tolerates.
+//
+// Phase20-B2.3.6.4.19: .18 still broke playback, differently: it now
+// played ~1 s, stopped, and repeated. The ramp keeps completions
+// arriving, but at 0.8x realtime -- and UCRT's stream supervision
+// evidently also validates the consumption *rate* (a DAC consuming 20%
+// slow looks broken), resetting the stream about once a second. Any
+// completion-timing distortion is therefore unusable with this app:
+// the sync is now OFF unless explicitly opted in with
+// WINAPK_USB_LATENCY_SYNC_MS=<cap ms>. The supported way to shrink the
+// UI lead is WINAPK_USB_PREROLL_MS (audio_engine.cpp), which reduces
+// the real buffering instead of lying about consumption timing.
+static std::chrono::nanoseconds p20_latency_offset(const P20Pending* front){
+ static std::once_flag once;static long cap_ms=-1;
+ std::call_once(once,[]{const char* e=std::getenv("WINAPK_USB_LATENCY_SYNC_MS");if(e){cap_ms=std::atol(e);std::fprintf(stderr,"[I] Phase20-B2.3.6.4.19: URB completion latency sync capMs=%ld (opt-in)\n",cap_ms);}});
+ if(cap_ms<=0)return std::chrono::nanoseconds(0);
+ long long frames=p20_audio_host().output_latency_frames();
+ if(frames<=0&&g_p20_stream)frames=winapk::audio::stream_output_latency_frames(g_p20_stream.get());
+ long long target_ns=0;
+ if(frames>0&&g_p20_rate>0){target_ns=frames*1000000000LL/g_p20_rate;if(target_ns>2500000000LL)target_ns=2500000000LL;}
+ target_ns=(std::min)(target_ns,(long long)cap_ms*1000000LL);
+ if(!front)return std::chrono::nanoseconds(target_ns);
+ static uint64_t ramp_epoch=0;static std::chrono::steady_clock::time_point ramp_start{};
+ static std::mutex ramp_lock;std::lock_guard<std::mutex> guard(ramp_lock);
+ const auto now=std::chrono::steady_clock::now();
+ if(ramp_epoch!=g_p20_pool_epoch){ramp_epoch=g_p20_pool_epoch;ramp_start=now;}
+ const long long elapsed_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(now-ramp_start).count();
+ const long long allowed_ns=48000000LL+elapsed_ns/5;
+ return std::chrono::nanoseconds((std::min)(target_ns,allowed_ns));
+}
 struct P20AudioHostWarmup {
  P20AudioHostWarmup(){
   std::thread([]{
@@ -481,7 +566,66 @@ P20AudioHostWarmup g_p20_audio_host_warmup;
 struct P20PcmJob { std::shared_ptr<winapk::audio::Stream> stream; std::vector<float> pcm; uint64_t generation; };
 struct P20PcmQueue { std::mutex lock; std::condition_variable cv; std::deque<P20PcmJob> jobs; };
 P20PcmQueue& p20_pcm_queue(){static P20PcmQueue* q=new P20PcmQueue();return *q;}
+struct P20ProducerQosState {
+ bool process_throttling_off=false;
+ bool thread_throttling_off=false;
+ bool mmcss_high=false;
+ bool priority_boost_disabled=false;
+ bool fallback_highest=false;
+ DWORD process_error=ERROR_SUCCESS;
+ DWORD thread_error=ERROR_SUCCESS;
+ DWORD mmcss_index=0;
+ HANDLE mmcss=nullptr;
+};
+P20ProducerQosState& p20_configure_producer_qos(){
+ thread_local P20ProducerQosState state;
+ thread_local bool configured=false;
+ if(configured)return state;
+ configured=true;
+ HMODULE kernel32=GetModuleHandleW(L"kernel32.dll");
+ using SetProcessInformationFn=BOOL (WINAPI*)(HANDLE,PROCESS_INFORMATION_CLASS,LPVOID,DWORD);
+ using SetThreadInformationFn=BOOL (WINAPI*)(HANDLE,THREAD_INFORMATION_CLASS,LPVOID,DWORD);
+ auto set_process_info=kernel32?reinterpret_cast<SetProcessInformationFn>(GetProcAddress(kernel32,"SetProcessInformation")):nullptr;
+ auto set_thread_info=kernel32?reinterpret_cast<SetThreadInformationFn>(GetProcAddress(kernel32,"SetThreadInformation")):nullptr;
+ if(set_process_info){
+  PROCESS_POWER_THROTTLING_STATE power{};
+  power.Version=PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  power.ControlMask=PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+  power.StateMask=0;
+  SetLastError(ERROR_SUCCESS);
+  state.process_throttling_off=set_process_info(GetCurrentProcess(),ProcessPowerThrottling,&power,sizeof(power))!=FALSE;
+  state.process_error=state.process_throttling_off?ERROR_SUCCESS:GetLastError();
+ }else state.process_error=ERROR_CALL_NOT_IMPLEMENTED;
+ if(set_thread_info){
+  THREAD_POWER_THROTTLING_STATE power{};
+  power.Version=THREAD_POWER_THROTTLING_CURRENT_VERSION;
+  power.ControlMask=THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+  power.StateMask=0;
+  SetLastError(ERROR_SUCCESS);
+  state.thread_throttling_off=set_thread_info(GetCurrentThread(),ThreadPowerThrottling,&power,sizeof(power))!=FALSE;
+  state.thread_error=state.thread_throttling_off?ERROR_SUCCESS:GetLastError();
+ }else state.thread_error=ERROR_CALL_NOT_IMPLEMENTED;
+ HMODULE avrt=LoadLibraryW(L"avrt.dll");
+ using AvSetFn=HANDLE (WINAPI*)(LPCWSTR,LPDWORD);
+ using AvPriorityFn=BOOL (WINAPI*)(HANDLE,int);
+ auto av_set=avrt?reinterpret_cast<AvSetFn>(GetProcAddress(avrt,"AvSetMmThreadCharacteristicsW")):nullptr;
+ auto av_priority=avrt?reinterpret_cast<AvPriorityFn>(GetProcAddress(avrt,"AvSetMmThreadPriority")):nullptr;
+ state.mmcss=av_set?av_set(L"Pro Audio",&state.mmcss_index):nullptr;
+ state.mmcss_high=state.mmcss&&av_priority&&av_priority(state.mmcss,1)!=FALSE;
+ if(!state.mmcss)state.fallback_highest=SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_HIGHEST)!=FALSE;
+ state.priority_boost_disabled=SetThreadPriorityBoost(GetCurrentThread(),TRUE)!=FALSE;
+ std::fprintf(stderr,"[I] Phase20-B2.3.6.4.10: producer QoS processThrottleOff=%d processError=%lu threadThrottleOff=%d threadError=%lu mmcss=%d mmcssHigh=%d taskIndex=%lu fallbackHighest=%d boostDisabled=%d threadPriority=%d processPriority=0x%08lX\n",state.process_throttling_off?1:0,state.process_error,state.thread_throttling_off?1:0,state.thread_error,state.mmcss?1:0,state.mmcss_high?1:0,state.mmcss_index,state.fallback_highest?1:0,state.priority_boost_disabled?1:0,GetThreadPriority(GetCurrentThread()),GetPriorityClass(GetCurrentProcess()));
+ return state;
+}
+bool p20_runtime_is_foreground(){
+ HWND foreground=GetForegroundWindow();
+ if(!foreground)return false;
+ DWORD pid=0;GetWindowThreadProcessId(foreground,&pid);
+ return pid==GetCurrentProcessId();
+}
 void p20_pcm_worker(){
+ auto& qos=p20_configure_producer_qos();
+ (void)qos;
  auto& q=p20_pcm_queue();
  for(;;){
   P20PcmJob job;
@@ -494,7 +638,7 @@ void p20_pcm_worker(){
   const uint64_t us=static_cast<uint64_t>((std::max)(int64_t(0),std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count()));
   g_p20_async_jobs.fetch_add(1,std::memory_order_relaxed);g_p20_async_written_samples.fetch_add(wrote,std::memory_order_relaxed);g_p20_async_write_sum_us.fetch_add(us,std::memory_order_relaxed);
   uint64_t old=g_p20_async_write_max_us.load(std::memory_order_relaxed);while(old<us&&!g_p20_async_write_max_us.compare_exchange_weak(old,us,std::memory_order_relaxed)){}
-  static auto last_summary=std::chrono::steady_clock::now();const auto summary_now=std::chrono::steady_clock::now();if(summary_now-last_summary>=std::chrono::seconds(30)){last_summary=summary_now;const uint64_t writes=g_p20_async_jobs.load();std::fprintf(stderr,"[I] Phase20-B2.3.6.0: USB stall summary producerGapMaxUs=%llu gapOver10=%llu gapOver25=%llu gapOver50=%llu queueDepthMax=%llu queueDrops=%llu asyncWrites=%llu asyncWriteAvgUs=%.3f asyncWriteMaxUs=%llu writtenSamples=%llu\n",(unsigned long long)g_p20_producer_gap_max_us.load(),(unsigned long long)g_p20_producer_gap_over10.load(),(unsigned long long)g_p20_producer_gap_over25.load(),(unsigned long long)g_p20_producer_gap_over50.load(),(unsigned long long)g_p20_async_queue_depth_max.load(),(unsigned long long)g_p20_async_queue_drops.load(),(unsigned long long)writes,writes?double(g_p20_async_write_sum_us.load())/double(writes):0.0,(unsigned long long)g_p20_async_write_max_us.load(),(unsigned long long)g_p20_async_written_samples.load());}
+  static auto last_summary=std::chrono::steady_clock::now();const auto summary_now=std::chrono::steady_clock::now();if(summary_now-last_summary>=std::chrono::seconds(30)){last_summary=summary_now;const uint64_t writes=g_p20_async_jobs.load();std::fprintf(stderr,"[I] Phase20-B2.3.6.0: USB stall summary producerGapMaxUs=%llu gapOver10=%llu gapOver25=%llu gapOver50=%llu queueDepthMax=%llu queueDrops=%llu asyncWrites=%llu asyncWriteAvgUs=%.3f asyncWriteMaxUs=%llu writtenSamples=%llu foreground=%d\n",(unsigned long long)g_p20_producer_gap_max_us.load(),(unsigned long long)g_p20_producer_gap_over10.load(),(unsigned long long)g_p20_producer_gap_over25.load(),(unsigned long long)g_p20_producer_gap_over50.load(),(unsigned long long)g_p20_async_queue_depth_max.load(),(unsigned long long)g_p20_async_queue_drops.load(),(unsigned long long)writes,writes?double(g_p20_async_write_sum_us.load())/double(writes):0.0,(unsigned long long)g_p20_async_write_max_us.load(),(unsigned long long)g_p20_async_written_samples.load(),p20_runtime_is_foreground()?1:0);std::fprintf(stderr,"[I] Phase20-B2.3.6.4.19: latency sync targetMs=%lld\n",(long long)std::chrono::duration_cast<std::chrono::milliseconds>(p20_latency_offset(nullptr)).count());}
  }
 }
 bool p20_enqueue_pcm(const std::shared_ptr<winapk::audio::Stream>& stream,std::vector<float>& pcm,uint64_t generation){
@@ -621,7 +765,7 @@ int p20_ioctl(int fd,int request,void* arg){
  case kP20GetSpeed:return 3;case kP20Claim:return 0;case kP20Release:p20_cancel_locked("release-interface",true);return 0;
  case kP20SetInterface:{if(!arg){*guest_errno()=14;return -1;}auto* v=static_cast<uint32_t*>(arg);const int rate=v[0]==1?p20_rate_for_alt(v[1]):0;if(p20_diag_enabled())std::fprintf(stderr,"[I] Phase20-B2.3.4.6: SETINTERFACE if=%u alt=%u rate=%d\n",v[0],v[1],rate);if(v[0]!=1||v[1]>6){*guest_errno()=22;return -1;}if(v[1]==0){g_p20_alt=0;g_p20_alt_zero_boundary=true;p20_soft_boundary_locked("alt-zero-track-boundary");}else{if(!g_p20_alt_zero_boundary&&g_p20_stream&&(g_p20_alt!=v[1]||g_p20_rate!=rate))p20_soft_boundary_locked("rate-alt-change-without-zero");g_p20_alt_zero_boundary=false;g_p20_alt=v[1];g_p20_rate=rate;g_p20_active=true;g_p20_failed=false;}return p20_success("SET_INTERFACE");}
  case 0x5514:p20_cancel_locked("reset",true);return p20_success("RESET");case 0x5516:p20_cancel_locked("disconnect",true);return p20_success("DISCONNECT");case kP20Submit:return p20_submit(arg);
- case kP20Reap:case kP20ReapNd:{if(!arg){*guest_errno()=14;return -1;}*static_cast<void**>(arg)=nullptr;const bool nd=uint32_t(request)==kP20ReapNd;const uint64_t reap_generation=g_p20_generation;for(;;){if(g_p20_reap_gate){if(g_p20_gate_submits<12||g_p20_gate_until.time_since_epoch().count()==0){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait(hold);continue;}const auto gate_now=std::chrono::steady_clock::now();if(gate_now<g_p20_gate_until){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait_until(hold,g_p20_gate_until);continue;}g_p20_reap_gate=false;if(p20_diag_enabled())std::fprintf(stderr,"[I] Phase20-B2.3.4.8: REAP identity gate opened submitted=%zu poolEpoch=%llu generation=%llu pending=%zu\n",g_p20_gate_submits,(unsigned long long)g_p20_pool_epoch,(unsigned long long)g_p20_generation,g_p20_pending.size());}if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.0: REAP epoch retired waitGeneration=%llu currentGeneration=%llu pending=%zu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation,g_p20_pending.size());return -1;}while(!g_p20_pending.empty()&&g_p20_pending.front().generation!=g_p20_generation){auto stale=g_p20_pending.front();g_p20_pending.pop_front();if(stale.urb)stale.urb->status=-2;g_p20_stale_dropped++;if(g_p20_stale_dropped<=8||(g_p20_stale_dropped%100)==0)std::fprintf(stderr,"[W] Phase20-B2.3.3.5: stale completion quarantined urb=%p submit=%llu oldGeneration=%llu currentGeneration=%llu total=%llu\n",static_cast<void*>(stale.urb),(unsigned long long)stale.submit_id,(unsigned long long)stale.generation,(unsigned long long)g_p20_generation,(unsigned long long)g_p20_stale_dropped);}if(g_p20_pending.empty()){if(nd||g_p20_failed||!g_p20_active){*guest_errno()=11;return -1;}g_p20_cv.wait(hold);if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: blocking REAP released by explicit reset/disconnect waitGeneration=%llu currentGeneration=%llu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation);return -1;}continue;}const auto ready=g_p20_pending.front().ready;const auto now=std::chrono::steady_clock::now();if(now<ready){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait_until(hold,ready);if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: timed REAP released by explicit reset/disconnect waitGeneration=%llu currentGeneration=%llu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation);return -1;}continue;}auto completed=g_p20_pending.front();
+ case kP20Reap:case kP20ReapNd:{if(!arg){*guest_errno()=14;return -1;}*static_cast<void**>(arg)=nullptr;const bool nd=uint32_t(request)==kP20ReapNd;const uint64_t reap_generation=g_p20_generation;for(;;){if(g_p20_reap_gate){if(g_p20_gate_submits<12||g_p20_gate_until.time_since_epoch().count()==0){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait(hold);continue;}const auto gate_now=std::chrono::steady_clock::now();if(gate_now<g_p20_gate_until){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait_until(hold,g_p20_gate_until);continue;}g_p20_reap_gate=false;if(p20_diag_enabled())std::fprintf(stderr,"[I] Phase20-B2.3.4.8: REAP identity gate opened submitted=%zu poolEpoch=%llu generation=%llu pending=%zu\n",g_p20_gate_submits,(unsigned long long)g_p20_pool_epoch,(unsigned long long)g_p20_generation,g_p20_pending.size());}if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.0: REAP epoch retired waitGeneration=%llu currentGeneration=%llu pending=%zu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation,g_p20_pending.size());return -1;}while(!g_p20_pending.empty()&&g_p20_pending.front().generation!=g_p20_generation){auto stale=g_p20_pending.front();g_p20_pending.pop_front();if(stale.urb)stale.urb->status=-2;g_p20_stale_dropped++;if(g_p20_stale_dropped<=8||(g_p20_stale_dropped%100)==0)std::fprintf(stderr,"[W] Phase20-B2.3.3.5: stale completion quarantined urb=%p submit=%llu oldGeneration=%llu currentGeneration=%llu total=%llu\n",static_cast<void*>(stale.urb),(unsigned long long)stale.submit_id,(unsigned long long)stale.generation,(unsigned long long)g_p20_generation,(unsigned long long)g_p20_stale_dropped);}if(g_p20_pending.empty()){if(nd||g_p20_failed||!g_p20_active){*guest_errno()=11;return -1;}g_p20_cv.wait(hold);if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: blocking REAP released by explicit reset/disconnect waitGeneration=%llu currentGeneration=%llu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation);return -1;}continue;}const auto ready=g_p20_pending.front().ready+((g_p20_pending.front().urb&&g_p20_pending.front().urb->status==-2)?std::chrono::nanoseconds(0):p20_latency_offset(&g_p20_pending.front()));const auto now=std::chrono::steady_clock::now();if(now<ready){if(nd){*guest_errno()=11;return -1;}g_p20_cv.wait_until(hold,ready);if(reap_generation!=g_p20_generation){*guest_errno()=11;std::fprintf(stderr,"[I] Phase20-B2.3.4.6: timed REAP released by explicit reset/disconnect waitGeneration=%llu currentGeneration=%llu\n",(unsigned long long)reap_generation,(unsigned long long)g_p20_generation);return -1;}continue;}auto completed=g_p20_pending.front();
  const auto completion_now=std::chrono::steady_clock::now();
  const auto completion_late_us=std::chrono::duration_cast<std::chrono::microseconds>(completion_now-completed.ready).count();
  const size_t pending_before_reap=g_p20_pending.size();

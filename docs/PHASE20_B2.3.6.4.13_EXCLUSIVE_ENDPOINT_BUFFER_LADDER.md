@@ -1,0 +1,3 @@
+# Phase 20-B2.3.6.4.13 Exclusive Endpoint Buffer Ladder
+
+Built from Phase 20-B2.3.6.4.11 to remove the later high-volume diagnostic instrumentation. The exclusive event-mode Initialize path now requests equal buffer duration and periodicity in this order: 160 ms, 120 ms, 80 ms, 40 ms, two device periods, one device period. Duplicate derived periods are skipped. The first successful period is retained. If all exclusive attempts fail, the existing shared-mode fallback remains unchanged. One accepted or failed summary line is written to stderr. PCM format negotiation, four-second shared ring, two-second Source ring, 500 ms preroll, host bridge QoS, and WASAPI startup prefill remain unchanged.

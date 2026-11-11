@@ -57,6 +57,24 @@ bool stream_timestamp(Stream* s, int64_t* frames, int64_t* nanos);
 // here: a resampler, no time stretcher).
 bool stream_set_rate(Stream* s, int hz);
 int stream_rate(Stream* s);
+// Phase20-B2.3.6.4.17: current output latency of the stream in source-rate
+// frames (source ring occupancy floored at the preroll target while
+// playing, plus the endpoint buffer rescaled to the source rate).
+long long stream_output_latency_frames(Stream* s);
+// Phase20-B2.3.6.4.21: output-mix tap for android.media.audiofx.Visualizer.
+// Session 0 is the output mix in Android semantics, and it is the only
+// session this host has (AudioTrack.getAudioSessionId() returns 0), so a
+// single global tap is the correct source. Mixer::mix feeds every rendered
+// stereo frame here (downmixed to mono). visualizer_waveform fills `count`
+// unsigned 8-bit PCM samples (0x80 = silence) with the most recent tap
+// audio; visualizer_fft fills `count` bytes (power of two, 128..2048) in
+// AOSP's Visualizer FFT layout ([dc, nyquist, re1, im1, re2, im2, ...]).
+// Both return the tap rate in Hz, 0 when nothing has rendered yet (the
+// buffer is still filled, with silence / zeros).
+int visualizer_waveform(uint8_t* out, int count);
+int visualizer_fft(int8_t* out, int count);
+int visualizer_rate();
+
 // Selects the process-wide WASAPI render endpoint. Empty selects the Windows default.
 // Returns only after the endpoint ID has been validated by MMDevice.
 bool set_output_endpoint(const std::string& endpoint_id);

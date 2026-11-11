@@ -59,6 +59,69 @@ const GUID kSubtypeFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa,
 const GUID kSubtypePcm = {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 static std::atomic<int> g_preferred_source_rate{48000};
 
+// Phase20-B2.3.6.4.19: the USB Direct preroll target is the single largest
+// component of the pipeline latency that makes the app UI run ahead of
+// the sound (~1000 ms of the ~1300 ms total). It is now tunable via
+// WINAPK_USB_PREROLL_MS (50..3000, default 1000 = historical behaviour)
+// so the lead can be shrunk safely -- by buffering less, not by
+// distorting URB completion timing, which UCRT's stream supervision
+// rejects (.17/.18). Shorter values trade skip margin for sync.
+static int usb_preroll_target_ms() {
+    static const int ms = [] {
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("WINAPK_USB_PREROLL_MS", value, static_cast<DWORD>(sizeof(value)));
+        if (n != 0 && n < sizeof(value)) {
+            const int parsed = std::atoi(value);
+            if (parsed >= 50 && parsed <= 3000) return parsed;
+        }
+        return 1000;
+    }();
+    return ms;
+}
+
+// Phase20-B2.3.6.4.20: second real-latency knob. The exclusive endpoint
+// buffer (250 ms by default) is the other large fixed component of the
+// UI lead. WINAPK_USB_ENDPOINT_MS (25..250, default 250 = historical
+// ladder) caps the ladder; the device period itself is always allowed
+// so negotiation cannot fail purely because of the cap. Shorter values
+// trade WASAPI stall margin for less lead, exactly like the preroll.
+static int usb_endpoint_target_ms() {
+    static const int ms = [] {
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("WINAPK_USB_ENDPOINT_MS", value, static_cast<DWORD>(sizeof(value)));
+        if (n != 0 && n < sizeof(value)) {
+            const int parsed = std::atoi(value);
+            if (parsed >= 25 && parsed <= 250) return parsed;
+        }
+        return 250;
+    }();
+    return ms;
+}
+
+// Phase20-B2.3.6.4.23: the NORMAL mixer's exclusive ladder was the
+// spectrum killer on the speaker route. With a 250 ms exclusive buffer
+// the render loop can only consume the source rings in ~250 ms quanta,
+// so AudioTrack positions and blocked app writers advance in 4 Hz
+// steps -- and an app-side spectrum tap fed by that cadence steps with
+// it (the USB-DAC route is immune: the app taps its own 4 ms URBs).
+// The normal mixer therefore uses WASAPI SHARED mode by default
+// (40 ms buffer, ~10 ms device-period consumption quanta, the cadence
+// Android's own AudioTrack HAL works at). WINAPK_SPEAKER_EXCLUSIVE_MS
+// (25..250) restores the exclusive ladder for this mixer, capped at
+// the given size, for low-spec machines that need the reservoir.
+static int speaker_exclusive_cap_ms() {
+    static const int ms = [] {
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("WINAPK_SPEAKER_EXCLUSIVE_MS", value, static_cast<DWORD>(sizeof(value)));
+        if (n != 0 && n < sizeof(value)) {
+            const int parsed = std::atoi(value);
+            if (parsed >= 25 && parsed <= 250) return parsed;
+        }
+        return 0;  // 0 = shared mode
+    }();
+    return ms;
+}
+
 static bool b2_verbose_log_enabled() {
     static const bool enabled = [] {
         char value[8]{};
@@ -85,6 +148,52 @@ static void b2_error(const char* operation, HRESULT hr) {
                  operation, static_cast<unsigned long>(hr));
     std::fflush(stderr);
 }
+
+// ---- Phase20-B2.3.6.4.21: Visualizer output tap -------------------------
+// The upstream Visualizer.java was an honest stub: getWaveForm returned
+// silence, getFft zeros, and the data-capture listener never fired,
+// because "the mixer has no per-session tap". Apps that draw a spectrum
+// for ordinary (non-USB) playback have no other Android API to get it
+// from, so on speaker output their analyser starved while the same app
+// in USB mode (its own tap) animated smoothly. This is that tap: a
+// lock-free mono ring fed from Mixer::mix's final output. Session 0 is
+// the output mix, and it is the only session here, so one ring is
+// exactly the right source.
+namespace viz {
+constexpr size_t kCap = 8192;  // mono frames; >= 4x the largest capture
+float ring[kCap]{};
+std::atomic<uint64_t> written{0};
+std::atomic<int> rate{0};
+
+void feed(const float* stereo, size_t frames, int r) {
+    if (!frames || r <= 0) return;
+    rate.store(r, std::memory_order_relaxed);
+    uint64_t w = written.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < frames; ++i) {
+        ring[w % kCap] = 0.5f * (stereo[i * 2] + stereo[i * 2 + 1]);
+        ++w;
+    }
+    written.store(w, std::memory_order_release);
+}
+
+// Copies the most recent `count` mono samples (oldest first) into dst.
+// Returns the tap rate, or 0 when fewer than count samples exist so far
+// (the head is silence-padded in that case, like a capture that starts
+// before the stream does).
+int snapshot(float* dst, int count) {
+    if (count <= 0) return 0;
+    uint64_t w = written.load(std::memory_order_acquire);
+    const int r = rate.load(std::memory_order_relaxed);
+    const uint64_t avail = w < static_cast<uint64_t>(count) ? w : static_cast<uint64_t>(count);
+    const uint64_t start = w - avail;
+    const int pad = count - static_cast<int>(avail);
+    for (int i = 0; i < pad; ++i) dst[i] = 0.0f;
+    for (uint64_t i = 0; i < avail; ++i)
+        dst[pad + static_cast<int>(i)] = ring[(start + i) % kCap];
+    return w >= static_cast<uint64_t>(count) || r > 0 ? r : 0;
+}
+}  // namespace viz
+
 
 class Mixer {
 public:
@@ -127,6 +236,11 @@ public:
         session_volume_dirty_.store(true, std::memory_order_release);
     }
     float session_volume() const { return observed_session_volume_.load(std::memory_order_acquire); }
+    // Phase20-B2.3.6.4.17: endpoint buffer depth for output-latency
+    // reporting (written by the render thread at device setup; a plain
+    // read is fine for a telemetry value).
+    uint32_t endpoint_buffer_frames() const { return endpoint_buffer_frames_.load(std::memory_order_relaxed); }
+    int endpoint_rate() const { return endpoint_rate_.load(std::memory_order_relaxed); }
     void set_session_mute(bool muted) {
         requested_session_mute_.store(muted, std::memory_order_relaxed);
         observed_session_mute_.store(muted, std::memory_order_release);
@@ -174,6 +288,9 @@ private:
             if (!s->mix(out, frames, rate_.load())) remove(s.get());
         }
         for (size_t i = 0; i < frames * 2; ++i) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+        // Phase20-B2.3.6.4.21: feed the Visualizer output tap with the
+        // final mix exactly as rendered (post-clamp, pre-device).
+        viz::feed(out, frames, rate_.load());
     }
 
     void run() {
@@ -324,27 +441,78 @@ private:
 
         bool exclusive = false;
         WAVEFORMATEX* active = mix_format;
-        if (have_selected) {
+        // Phase20-B2.3.6.4.23: only the USB Direct mixer always tries
+        // exclusive; the normal (speaker) mixer tries it only when the
+        // user opted in via WINAPK_SPEAKER_EXCLUSIVE_MS, and otherwise
+        // goes straight to the shared fallback below.
+        const bool try_exclusive = have_selected &&
+            (usb_direct_ || speaker_exclusive_cap_ms() > 0);
+        const int effective_cap_ms = usb_direct_ ? usb_endpoint_target_ms()
+                                                 : speaker_exclusive_cap_ms();
+        if (try_exclusive) {
             REFERENCE_TIME default_period = 0, minimum_period = 0;
             hr = client->GetDevicePeriod(&default_period, &minimum_period);
             if (SUCCEEDED(hr)) {
                 const REFERENCE_TIME period = default_period > 0 ? default_period : minimum_period;
-                const REFERENCE_TIME stable_period = period > 0 ? period * 2 : 0;
-                hr = stable_period > 0 ? client->Initialize(
-                    AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    stable_period, stable_period, &selected.Format, nullptr) : E_INVALIDARG;
-                if (FAILED(hr) && period > 0) {
-                    b2_log("Exclusive two-period Initialize rejected hr=0x%08lX; retrying device period", static_cast<unsigned long>(hr));
-                    hr = client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, period,
-                        &selected.Format, nullptr);
+                // Phase 20-B2.3.6.4.14: low-spec PCs can experience longer DPC,
+                // storage, graphics, or scheduler stalls. Prefer a 250 ms endpoint
+                // reservoir, then descend through the proven 4.13 ladder. This is
+                // independent from the upper source-ring preroll and preserves the
+                // existing shared-mode fallback when the driver rejects every size.
+                const REFERENCE_TIME requested_periods[] = {
+                    2500000,  // 250 ms
+                    2000000,  // 200 ms
+                    1600000,  // 160 ms
+                    1200000,  // 120 ms
+                    800000,   // 80 ms
+                    400000,   // 40 ms
+                    period > 0 ? period * 2 : 0,
+                    period
+                };
+                REFERENCE_TIME accepted_period = 0;
+                REFERENCE_TIME attempted_periods[8]{};
+                size_t attempted_count = 0;
+                HRESULT last_initialize_hr = E_INVALIDARG;
+                const REFERENCE_TIME endpoint_cap =
+                    static_cast<REFERENCE_TIME>(effective_cap_ms) * 10000;
+                for (REFERENCE_TIME requested : requested_periods) {
+                    if (requested <= 0) continue;
+                    // Phase20-B2.3.6.4.20: honour WINAPK_USB_ENDPOINT_MS
+                    // (the bare device period is always attempted).
+                    if (requested > endpoint_cap && requested != period) continue;
+                    bool duplicate = false;
+                    for (size_t i = 0; i < attempted_count; ++i) {
+                        if (attempted_periods[i] == requested) { duplicate = true; break; }
+                    }
+                    if (duplicate) continue;
+                    attempted_periods[attempted_count++] = requested;
+                    last_initialize_hr = client->Initialize(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        requested, requested, &selected.Format, nullptr);
+                    if (SUCCEEDED(last_initialize_hr)) {
+                        accepted_period = requested;
+                        break;
+                    }
                 }
-                b2_log("Exclusive selected rate=%lu container=%d valid=%d blockAlign=%d Initialize=0x%08lX period100ns=%lld requestedStable100ns=%lld",
-                       static_cast<unsigned long>(selected.Format.nSamplesPerSec),
-                       selected.Format.wBitsPerSample, selected.Samples.wValidBitsPerSample,
-                       selected.Format.nBlockAlign, static_cast<unsigned long>(hr),
-                       static_cast<long long>(period), static_cast<long long>(stable_period));
-                if (SUCCEEDED(hr)) { exclusive = true; active = &selected.Format; }
+                hr = last_initialize_hr;
+                if (SUCCEEDED(hr)) {
+                    exclusive = true;
+                    active = &selected.Format;
+                    std::fprintf(stderr,
+                        "[I] Phase20-B2.3.6.4.13: exclusive endpoint buffer accepted rate=%lu requestedMs=%.3f container=%d valid=%d capMs=%d\n",
+                        static_cast<unsigned long>(selected.Format.nSamplesPerSec),
+                        static_cast<double>(accepted_period) / 10000.0,
+                        selected.Format.wBitsPerSample,
+                        selected.Samples.wValidBitsPerSample,
+                        effective_cap_ms);
+                    std::fflush(stderr);
+                } else {
+                    std::fprintf(stderr,
+                        "[W] Phase20-B2.3.6.4.13: exclusive endpoint buffer ladder failed hr=0x%08lX; shared fallback follows\n",
+                        static_cast<unsigned long>(hr));
+                    std::fflush(stderr);
+                }
             } else {
                 b2_error("GetDevicePeriod", hr);
             }
@@ -359,7 +527,9 @@ private:
             if (FAILED(hr)) { CoTaskMemFree(mix_format); b2_error("Shared Activate", hr); return false; }
             hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                     400000, 0, mix_format, nullptr);
-            b2_log("Shared fallback Initialize hr=0x%08lX", static_cast<unsigned long>(hr));
+            b2_log("Shared Initialize hr=0x%08lX reason=%s", static_cast<unsigned long>(hr),
+                   usb_direct_ ? "exclusive-failed"
+                               : (speaker_exclusive_cap_ms() > 0 ? "exclusive-failed" : "speaker-default-phase23"));
             if (FAILED(hr)) { CoTaskMemFree(mix_format); return false; }
             active = mix_format;
         }
@@ -380,6 +550,12 @@ private:
         const HRESULT size_hr = SUCCEEDED(event_hr) ? client->GetBufferSize(&buffer_frames) : event_hr;
         const HRESULT render_hr = SUCCEEDED(size_hr) ? client->GetService(IID_PPV_ARGS(&render)) : size_hr;
         bool ok = ready && SUCCEEDED(event_hr) && SUCCEEDED(size_hr) && SUCCEEDED(render_hr);
+        // Phase20-B2.3.6.4.17: remember the live endpoint geometry for
+        // output-latency reporting (cleared again if this device fails).
+        if (ok) {
+            endpoint_buffer_frames_.store(buffer_frames, std::memory_order_relaxed);
+            endpoint_rate_.store(output_rate, std::memory_order_relaxed);
+        }
         HRESULT volume_hr = S_FALSE;
         if (!exclusive && ok) { volume_hr = client->GetService(__uuidof(ISimpleAudioVolume), reinterpret_cast<void**>(&session_volume)); ok = SUCCEEDED(volume_hr); if(ok&&usb_direct_){const HRESULT vh=session_volume->SetMasterVolume(1.0f,nullptr);const HRESULT mh=session_volume->SetMute(FALSE,nullptr);ok=SUCCEEDED(vh)&&SUCCEEDED(mh);b2_log("Phase20-B2.3.2 unity session volume=1.0 mute=0 volumeHr=0x%08lX muteHr=0x%08lX",static_cast<unsigned long>(vh),static_cast<unsigned long>(mh));} }
         b2_log("Audio Space2 Stability2 actualBuffer frames=%lu durationMs=%.3f exclusive=%d", static_cast<unsigned long>(buffer_frames), output_rate > 0 ? 1000.0 * double(buffer_frames) / double(output_rate) : 0.0, exclusive ? 1 : 0);
@@ -723,6 +899,9 @@ private:
     std::atomic<bool> observed_session_mute_{false};
     std::atomic<bool> session_volume_dirty_{false};
     std::atomic<bool> session_mute_dirty_{false};
+    // Phase20-B2.3.6.4.17: live endpoint geometry for latency reporting.
+    std::atomic<uint32_t> endpoint_buffer_frames_{0};
+    std::atomic<int> endpoint_rate_{0};
 };
 
 }  // namespace
@@ -738,6 +917,73 @@ void set_session_volume(float volume) { Mixer::get().set_session_volume(volume);
 float session_volume() { return Mixer::get().session_volume(); }
 void set_session_mute(bool muted) { Mixer::get().set_session_mute(muted); }
 bool session_mute() { return Mixer::get().session_mute(); }
+
+// Phase20-B2.3.6.4.21 (link fix in .22): the Visualizer readers must
+// live OUTSIDE the anonymous namespace above -- inside it they get
+// internal linkage and the exported winapk::audio symbols vanish.
+int visualizer_rate() { return viz::rate.load(std::memory_order_relaxed); }
+
+int visualizer_waveform(uint8_t* out, int count) {
+    if (!out || count <= 0) return 0;
+    std::vector<float> buf(static_cast<size_t>(count));
+    const int r = viz::snapshot(buf.data(), count);
+    for (int i = 0; i < count; ++i) {
+        const float v = std::clamp(buf[static_cast<size_t>(i)], -1.0f, 1.0f);
+        out[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(128.0f + 127.0f * v)), 0, 255));
+    }
+    return r;
+}
+
+int visualizer_fft(int8_t* out, int count) {
+    if (!out || count < 128 || count > 2048 || (count & (count - 1)) != 0) return 0;
+    std::vector<float> buf(static_cast<size_t>(count));
+    const int r = viz::snapshot(buf.data(), count);
+    // Iterative radix-2 DFT (rectangular window, like AOSP's HAL tap).
+    const int n = count;
+    std::vector<float> re(static_cast<size_t>(n)), im(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) re[static_cast<size_t>(i)] = buf[static_cast<size_t>(i)];
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            std::swap(re[static_cast<size_t>(i)], re[static_cast<size_t>(j)]);
+            std::swap(im[static_cast<size_t>(i)], im[static_cast<size_t>(j)]);
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        const float ang = -2.0f * 3.14159265358979323846f / static_cast<float>(len);
+        const float wr = std::cos(ang), wi = std::sin(ang);
+        for (int i = 0; i < n; i += len) {
+            float cwr = 1.0f, cwi = 0.0f;
+            for (int k = 0; k < len / 2; ++k) {
+                const size_t a = static_cast<size_t>(i + k);
+                const size_t b = a + static_cast<size_t>(len / 2);
+                const float vr = re[b] * cwr - im[b] * cwi;
+                const float vi = re[b] * cwi + im[b] * cwr;
+                re[b] = re[a] - vr; im[b] = im[a] - vi;
+                re[a] += vr;        im[a] += vi;
+                const float nwr = cwr * wr - cwi * wi;
+                cwi = cwr * wi + cwi * wr;
+                cwr = nwr;
+            }
+        }
+    }
+    // AOSP layout: [0]=Re(DC), [1]=Re(Nyquist), then Re/Im pairs for
+    // bins 1..N/2-1. Scale: a full-scale sine peaks at |X|=N/2, and
+    // 256/N maps that to ~128, matching the magnitude range apps expect.
+    const float scale = 256.0f / static_cast<float>(n);
+    auto byte_of = [scale](float v) {
+        return static_cast<int8_t>(std::clamp(static_cast<int>(std::lround(v * scale)), -128, 127));
+    };
+    out[0] = byte_of(re[0]);
+    out[1] = byte_of(re[static_cast<size_t>(n / 2)]);
+    for (int k = 1; k < n / 2; ++k) {
+        out[2 * k] = byte_of(re[static_cast<size_t>(k)]);
+        out[2 * k + 1] = byte_of(im[static_cast<size_t>(k)]);
+    }
+    return r;
+}
 
 // ---- AudioTrack streams ------------------------------------------------------------------
 class Stream final : public Source {
@@ -758,12 +1004,15 @@ public:
         if (!draining_ && !preroll_ready_) {
             const size_t queued_frames = buf_.size() / 2;
             const size_t target_frames = std::min(capacity_,
-                static_cast<size_t>(std::max(1, rate_ * (usb_direct_stream_ ? 500 : 30) / 1000)));
+                static_cast<size_t>(std::max(1, rate_ * preroll_target_ms() / 1000)));
             const int64_t waited_nanos = nano_time() - play_nanos_;
             const bool enough_audio = queued_frames >= target_frames;
-            const bool bounded_fallback = queued_frames > 0 && waited_nanos >= (usb_direct_stream_ ? 1500000000LL : 150000000LL);
+            const bool bounded_fallback = queued_frames > 0 && waited_nanos >= (usb_direct_stream_ ? 3000000000LL : 150000000LL);
             if (!enough_audio && !bounded_fallback) return true;
             preroll_ready_ = true;
+            // Phase20-B2.3.6.4.15: ramp in from silence instead of stepping
+            // straight to full amplitude at the preroll boundary.
+            fade_in_remaining_ = conceal_fade_frames(out_rate);
             if (!preroll_logged_) {
                 b2_log("Source preroll gate opened rate=%d queuedFrames=%llu targetFrames=%llu waitedMs=%.3f reason=%s",
                        rate_, static_cast<unsigned long long>(queued_frames),
@@ -774,19 +1023,120 @@ public:
             }
         }
         const double step = rate_ * speed_ / out_rate;
+        // Phase20-B2.3.6.4.15: adaptive drift compensation (USB Direct only).
+        //
+        // The producer clock (the app's nominal sample rate, paced in
+        // p20_submit by steady_clock) and the consumer clock (the WASAPI
+        // endpoint's hardware clock) are independent crystals. Both are
+        // nominally `rate_`, but they differ by tens to hundreds of ppm.
+        // With a fixed resampling step the source ring therefore walks
+        // monotonically: a faster producer eventually fills every ring in
+        // the chain until a whole PCM job is dropped, and a slower one
+        // eventually drains the ring into a zero-filled WASAPI buffer.
+        // Both events are a waveform discontinuity -- the occasional
+        // click/noise heard minutes into otherwise clean playback. Larger
+        // buffers and longer prerolls only postpone the walk; nothing in
+        // the chain corrected it. Close the loop here, at the final
+        // consumer: nudge the effective step by a smoothed, bounded PI
+        // correction driven by the ring's deviation from its preroll
+        // target (1 s for USB Direct). The proportional term reacts to
+        // level error now; the integral term learns the actual crystal
+        // error, so the ring settles at its target for any constant ppm
+        // offset instead of at an offset proportional to that error.
+        // +/-2500 ppm of authority is far above any real crystal error,
+        // the equilibrium pitch error equals the crystal error itself
+        // (inaudible, and exactly what a real USB DAC's feedback endpoint
+        // does), and the correction is smoothed over seconds so it cannot
+        // modulate the program.
+        double step_eff = step;
+        if (usb_direct_stream_ && preroll_ready_ && !draining_ && out_rate > 0) {
+            const double target_frames = static_cast<double>(
+                std::max(1, rate_ * preroll_target_ms() / 1000));  // the preroll target above
+            const double available_frames =
+                std::max(0.0, static_cast<double>(buf_.size() / 2) - cursor_);
+            const double deviation =
+                (available_frames - target_frames) / target_frames;
+            const double dt_seconds =
+                static_cast<double>(frames) / static_cast<double>(out_rate);
+            drift_int_ppm_ = std::clamp(
+                drift_int_ppm_ + 50.0 * deviation * dt_seconds, -2500.0, 2500.0);
+            const double desired_ppm =
+                std::clamp(deviation * 1000.0 + drift_int_ppm_, -2500.0, 2500.0);
+            const double alpha = 1.0 - std::exp(-dt_seconds / 2.0);
+            drift_ppm_ += alpha * (desired_ppm - drift_ppm_);
+            step_eff = step * (1.0 + drift_ppm_ * 1e-6);
+            const int64_t drift_now = nano_time();
+            if (std::fabs(drift_ppm_) >= 1.0 &&
+                drift_now - last_drift_log_nanos_ >= 30000000000LL) {
+                last_drift_log_nanos_ = drift_now;
+                b2_log("Phase20-B2.3.6.4.15 drift compensation ppm=%.1f desiredPpm=%.1f queuedFrames=%.0f targetFrames=%.0f",
+                       drift_ppm_, desired_ppm, available_frames, target_frames);
+            }
+        }
+        // Phase20-B2.3.6.4.15: clickless concealment. When this call will
+        // exhaust the input (underrun or end of drain), fade the rendered
+        // tail to zero over ~5 ms, and fade back in on the next call that
+        // has data again (armed below / at preroll). A hard step to or
+        // from zero-filled silence is a broadband click; a 5 ms ramp is a
+        // barely audible dip. The fade-out is latched per call from the
+        // frames actually renderable, so a producer that tops the ring up
+        // just in time never triggers gain modulation.
+        const size_t fade_len = conceal_fade_frames(out_rate);
+        const double renderable_frames =
+            step_eff > 0.0
+                ? std::max(0.0, static_cast<double>(buf_.size() / 2) - cursor_) / step_eff
+                : 0.0;
+        const bool will_exhaust =
+            renderable_frames < static_cast<double>(frames) - 0.5;
         size_t rendered = 0;
         for (; rendered < frames; ++rendered) {
             const size_t have = buf_.size() / 2;
             const size_t i = static_cast<size_t>(cursor_);
             if (i >= have) break;  // underrun: no complete input frame remains
-            if (i + 1 < have) {
+            double envelope = 1.0;
+            if (fade_in_remaining_ > 0) {
+                envelope = std::min(envelope,
+                    1.0 - static_cast<double>(fade_in_remaining_) /
+                              static_cast<double>(std::max<size_t>(fade_len, 1)));
+                --fade_in_remaining_;
+            }
+            if (will_exhaust && fade_len > 0) {
+                const double tail = renderable_frames - static_cast<double>(rendered);
+                if (tail < static_cast<double>(fade_len))
+                    envelope = std::min(envelope,
+                        std::max(0.0, tail / static_cast<double>(fade_len)));
+            }
+            const float env = static_cast<float>(envelope);
+            if (i + 1 < have && step_eff >= 2.0 && step_eff <= 64.0) {
+                // Phase20-B2.3.6.4.16: anti-aliased downsampling. The log of
+                // 2026-11-12 shows the real configuration is a 192 kHz
+                // virtual DAC feeding a 48 kHz exclusive endpoint: step is
+                // exactly 4, so the linear path below degenerates into
+                // taking every 4th sample (t is always 0) -- decimation
+                // with no anti-alias filter, folding everything above
+                // 24 kHz back into the audible band. Average the input
+                // span one output frame covers instead: a boxcar of length
+                // `step` has nulls at multiples of the output rate, which
+                // is the correct cheap filter for integer ratios. The
+                // sub-frame phase error versus true band-limited SRC is
+                // under one input frame (5 us at 192 kHz), inaudible here.
+                const size_t span = std::min(static_cast<size_t>(step_eff), have - i);
+                const float inv = 1.0f / static_cast<float>(std::max<size_t>(span, 1));
+                for (int c = 0; c < 2; ++c) {
+                    float sum = 0.0f;
+                    for (size_t k = 0; k < span; ++k) sum += buf_[(i + k) * 2 + c];
+                    out[rendered * 2 + c] += sum * inv *
+                                                   (c == 0 ? left_ : right_) * env;
+                }
+                cursor_ += step_eff;
+            } else if (i + 1 < have) {
                 const double t = cursor_ - static_cast<double>(i);
                 for (int c = 0; c < 2; ++c) {
                     const float a = buf_[i * 2 + c], b = buf_[(i + 1) * 2 + c];
                     out[rendered * 2 + c] += static_cast<float>(a + (b - a) * t) *
-                                                   (c == 0 ? left_ : right_);
+                                                   (c == 0 ? left_ : right_) * env;
                 }
-                cursor_ += step;
+                cursor_ += step_eff;
             } else {
                 // Linear interpolation normally needs a look-ahead frame. At
                 // end-of-stream there is no next frame, and the previous code
@@ -796,16 +1146,33 @@ public:
                 // their repeat/next-track transition. Render the final frame
                 // directly and consume it. The same rule is safe on a genuine
                 // streaming underrun: the frame is already due for playback.
-                out[rendered * 2] += buf_[i * 2] * left_;
-                out[rendered * 2 + 1] += buf_[i * 2 + 1] * right_;
+                out[rendered * 2] += buf_[i * 2] * left_ * env;
+                out[rendered * 2 + 1] += buf_[i * 2 + 1] * right_ * env;
                 cursor_ = static_cast<double>(have);
             }
         }
         if (rendered < frames && state_ == kPlaying && !draining_ && preroll_ready_) {
+            // Phase20-B2.3.6.4.15: the tail of this call was faded out;
+            // fade the next data back in instead of stepping to full level.
+            fade_in_remaining_ = fade_len;
             ++underrun_events_; underrun_frames_ += frames-rendered;
             const int64_t now=nano_time(); const int64_t gap=last_producer_nanos_?now-last_producer_nanos_:0;
             max_producer_gap_nanos_=(std::max)(max_producer_gap_nanos_,gap);
-            if(now-last_underrun_log_nanos_>=5000000000LL){b2_log("Phase20-B2.3.6.0 USB stall guard underrun events=%llu frames=%llu requestFrames=%llu renderedFrames=%llu queuedFrames=%llu producerGapMs=%.3f producerGapMaxMs=%.3f action=zero-fill",(unsigned long long)underrun_events_,(unsigned long long)underrun_frames_,(unsigned long long)frames,(unsigned long long)rendered,(unsigned long long)(buf_.size()/2),double(gap)/1000000.0,double(max_producer_gap_nanos_)/1000000.0);last_underrun_log_nanos_=now;}
+            if(now-last_underrun_log_nanos_>=5000000000LL){std::fprintf(stderr,"[I] Win.apk.WASAPI: Phase20-B2.3.6.4.16 underrun events=%llu frames=%llu requestFrames=%llu renderedFrames=%llu queuedFrames=%llu producerGapMs=%.3f producerGapMaxMs=%.3f action=fade+repreroll\n",(unsigned long long)underrun_events_,(unsigned long long)underrun_frames_,(unsigned long long)frames,(unsigned long long)rendered,(unsigned long long)(buf_.size()/2),double(gap)/1000000.0,double(max_producer_gap_nanos_)/1000000.0);std::fflush(stderr);last_underrun_log_nanos_=now;}
+            // Phase20-B2.3.6.4.16: re-arm the preroll gate after an underrun.
+            // Until now preroll_ready_ stayed true forever, so once the lead
+            // was spent the stream kept playing at ~zero lead and every
+            // subsequent producer jitter (10-50 ms gaps are routine when the
+            // app is backgrounded under load) became another audible skip --
+            // the scratched-CD pattern in the 2026-11-12 report. Re-arming
+            // with a shorter 250 ms target turns a cluster of micro-skips
+            // into one brief, faded pause while the producer's burst
+            // catch-up refills the ring. The gate timer restarts here,
+            // otherwise the bounded fallback (measured from play()) would
+            // reopen the gate instantly with an empty ring.
+            preroll_ready_ = false;
+            repreroll_ = true;
+            play_nanos_ = nano_time();
         }
         const size_t used = std::min(static_cast<size_t>(cursor_), buf_.size() / 2);
         if (used) {
@@ -899,10 +1266,13 @@ public:
             play_nanos_ = recovery_nanos_;
             preroll_ready_ = false;
             preroll_logged_ = false;
+            drift_ppm_ = 0;  // Phase20-B2.3.6.4.15: re-converge per playback
+            drift_int_ppm_ = 0;
+            repreroll_ = false;  // Phase20-B2.3.6.4.16: first gate uses the full target
             b2_log("Source preroll gate armed rate=%d queuedFrames=%llu targetFrames=%llu timeoutMs=%d",
                    rate_, static_cast<unsigned long long>(buf_.size() / 2),
                    static_cast<unsigned long long>(std::min(capacity_,
-                       static_cast<size_t>(std::max(1, rate_ * (usb_direct_stream_ ? 500 : 30) / 1000)))), usb_direct_stream_ ? 500 : 150);
+                       static_cast<size_t>(std::max(1, rate_ * preroll_target_ms() / 1000)))), usb_direct_stream_ ? 3000 : 150);
         }
         if (last_mix_nanos_ == 0) last_mix_nanos_ = recovery_nanos_;
         room_.notify_all();
@@ -982,6 +1352,30 @@ public:
         draining_ = false;
         room_.notify_all();
     }
+    // Phase20-B2.3.6.4.19: effective preroll target for this stream
+    // (USB Direct: WINAPK_USB_PREROLL_MS, re-preroll capped at 250 ms).
+    int preroll_target_ms() const {
+        if (!usb_direct_stream_) return 30;
+        const int full = usb_preroll_target_ms();
+        return repreroll_ ? std::min(250, full) : full;
+    }
+    // Phase20-B2.3.6.4.17: source-ring part of the output latency, in
+    // source-rate frames: the ring occupancy, floored at the preroll
+    // target while playing (which is where the drift controller holds
+    // it). The endpoint-buffer part is added by
+    // stream_output_latency_frames(), which knows the owning mixer.
+    long long ring_latency_frames() {
+        std::lock_guard<std::mutex> hold(lock_);
+        long long queued = static_cast<long long>(buf_.size() / 2);
+        if (state_ == kPlaying && usb_direct_stream_) {
+            const long long target = static_cast<long long>(
+                std::max(1, rate_ * preroll_target_ms() / 1000));
+            queued = std::max(queued, target);
+        }
+        return queued;
+    }
+    bool is_usb_direct() const { return usb_direct_stream_; }
+    int stream_rate() const { return rate_; }
 
 private:
     void has_timestamp_reset() { reset_nanos_ = last_nanos_; }
@@ -1005,6 +1399,16 @@ private:
     bool preroll_logged_ = false;
     uint64_t underrun_events_=0,underrun_frames_=0;
     int64_t last_producer_nanos_=0,max_producer_gap_nanos_=0,last_underrun_log_nanos_=0;
+    // Phase20-B2.3.6.4.15: drift compensation and clickless concealment.
+    static size_t conceal_fade_frames(int out_rate) {
+        const size_t rate = static_cast<size_t>(std::max(1, out_rate));
+        return std::clamp(rate / 200, size_t(64), size_t(1024));  // ~5 ms
+    }
+    double drift_ppm_ = 0;
+    double drift_int_ppm_ = 0;
+    int64_t last_drift_log_nanos_ = 0;
+    size_t fade_in_remaining_ = 0;
+    bool repreroll_ = false;  // Phase20-B2.3.6.4.16: an underrun has occurred
 };
 
 std::shared_ptr<Stream> stream_create(int rate, int channels, int, int buffer_frames) {
@@ -1039,6 +1443,20 @@ int64_t stream_position(Stream* s) { return s->position(); }
 bool stream_timestamp(Stream* s, int64_t* frames, int64_t* nanos) { return s->timestamp(frames, nanos); }
 bool stream_set_rate(Stream* s, int hz) { return s->set_rate(hz); }
 int stream_rate(Stream* s) { return s->rate(); }
+// Phase20-B2.3.6.4.17: total output latency of a stream in source-rate
+// frames (source ring + WASAPI endpoint buffer rescaled). The audio host
+// publishes this to the runtime, which delays URB completions by it.
+long long stream_output_latency_frames(Stream* s) {
+    if (!s) return 0;
+    long long total = s->ring_latency_frames();
+    Mixer& mixer = s->is_usb_direct() ? Mixer::usb_direct() : Mixer::get();
+    const int erate = mixer.endpoint_rate();
+    const uint32_t eframes = mixer.endpoint_buffer_frames();
+    const int rate = s->stream_rate();
+    if (erate > 0 && eframes > 0 && rate > 0)
+        total += static_cast<long long>(eframes) * rate / erate;
+    return total;
+}
 void stream_set_params(Stream* s, float speed, float pitch) { s->set_params(speed, pitch); }
 void stream_params(Stream* s, float* speed, float* pitch) { s->params(speed, pitch); }
 

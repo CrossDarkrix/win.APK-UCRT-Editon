@@ -279,6 +279,31 @@ jboolean JNICALL Audio_getTimestamp(JNIEnv* env, jclass, jlong h, jlongArray out
     env->SetLongArrayRegion(out, 0, 2, v);
     return JNI_TRUE;
 }
+// ---- Visualizer tap (Phase20-B2.3.6.4.21) ----------------------------------
+// android.media.audiofx.Visualizer (session 0 = output mix) reads these.
+// Return AOSP Visualizer status codes: SUCCESS 0, ERROR_BAD_VALUE -4.
+jint JNICALL Viz_getWaveForm(JNIEnv* env, jclass, jbyteArray out) {
+    if (!out) return -4;
+    const jsize n = env->GetArrayLength(out);
+    if (n <= 0) return -4;
+    std::vector<uint8_t> buf(static_cast<size_t>(n));
+    au::visualizer_waveform(buf.data(), static_cast<int>(n));
+    env->SetByteArrayRegion(out, 0, n, reinterpret_cast<const jbyte*>(buf.data()));
+    return 0;
+}
+jint JNICALL Viz_getFft(JNIEnv* env, jclass, jbyteArray out) {
+    if (!out) return -4;
+    const jsize n = env->GetArrayLength(out);
+    if (n < 128 || n > 2048 || (n & (n - 1)) != 0) return -4;
+    std::vector<int8_t> buf(static_cast<size_t>(n));
+    au::visualizer_fft(buf.data(), static_cast<int>(n));
+    env->SetByteArrayRegion(out, 0, n, reinterpret_cast<const jbyte*>(buf.data()));
+    return 0;
+}
+jint JNICALL Viz_getSamplingRateMilliHz(JNIEnv*, jclass) {
+    const int r = au::visualizer_rate();
+    return r > 0 ? r * 1000 : 44100000;
+}
 // AudioTrack's status codes: SUCCESS 0, ERROR_BAD_VALUE -2, ERROR_INVALID_OPERATION -3.
 jint JNICALL Audio_setPlaybackRate(JNIEnv*, jclass, jlong h, jint hz) {
     auto s = stream(h);
@@ -509,6 +534,9 @@ const HostMethod kMethods[] = {
     WINAPK_HOST_NATIVE(kCls, "nativeGetPlayState", "(J)I", Audio_getPlayState),
     WINAPK_HOST_NATIVE(kCls, "nativeGetPlaybackHeadPosition", "(J)J", Audio_getPosition),
     WINAPK_HOST_NATIVE(kCls, "nativeGetTimestamp", "(J[J)Z", Audio_getTimestamp),
+    WINAPK_HOST_NATIVE(kCls, "nativeVizGetWaveForm", "([B)I", Viz_getWaveForm),
+    WINAPK_HOST_NATIVE(kCls, "nativeVizGetFft", "([B)I", Viz_getFft),
+    WINAPK_HOST_NATIVE(kCls, "nativeVizGetSamplingRateMilliHz", "()I", Viz_getSamplingRateMilliHz),
     WINAPK_HOST_NATIVE(kCls, "nativeSetPlaybackRate", "(JI)I", Audio_setPlaybackRate),
     WINAPK_HOST_NATIVE(kCls, "nativeGetPlaybackRate", "(J)I", Audio_getPlaybackRate),
     WINAPK_HOST_NATIVE(kCls, "nativeSetPlaybackParams", "(JFF)I", Audio_setPlaybackParams),
