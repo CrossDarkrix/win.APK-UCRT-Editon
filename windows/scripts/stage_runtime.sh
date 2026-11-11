@@ -23,9 +23,10 @@ mkdir -p "$OUT"
 OUT="$(cd -- "$OUT" && pwd)"
 
 [[ -f "$BUILD/winapk-runtime.exe" ]] || { echo "[stage] no winapk-runtime.exe in $BUILD" >&2; exit 1; }
+[[ -f "$BUILD/winapk-audio-host.exe" ]] || { echo "[stage] no winapk-audio-host.exe in $BUILD" >&2; exit 1; }
 "$HERE/build_java.sh" "$OUT"
 "$HERE/build_framework_res.sh" "$OUT/bin/tools/framework-res.apk"
-cp -f "$BUILD/winapk-runtime.exe" "$BUILD/macapk-translator.exe" "$BUILD/winapk-guest-stub.dll" "$OUT/bin/"
+cp -f "$BUILD/winapk-runtime.exe" "$BUILD/winapk-audio-host.exe" "$BUILD/macapk-translator.exe" "$BUILD/winapk-guest-stub.dll" "$OUT/bin/"
 # The arm64 translator, and the clang it compiles with (clang\, beside bin\),
 # so no user has to install one.
 if [[ -f "$BUILD/winapk-aot.exe" ]]; then

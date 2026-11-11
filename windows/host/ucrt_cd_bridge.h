@@ -97,6 +97,8 @@ typedef struct ucrt_cd_toc {
     ucrt_cd_track tracks[UCRT_CD_MAX_TRACKS];
 } ucrt_cd_toc;
 
+UCRT_CD_API uint64_t UCRT_CD_CALL ucrt_cd_media_generation(void);
+UCRT_CD_API void UCRT_CD_CALL ucrt_cd_notify_media_change(void);
 UCRT_CD_API uint32_t UCRT_CD_CALL ucrt_cd_get_abi_version(void);
 UCRT_CD_API const char* UCRT_CD_CALL ucrt_cd_result_name(int32_t result);
 UCRT_CD_API int32_t UCRT_CD_CALL ucrt_cd_enumerate(ucrt_cd_device_info* devices, uint32_t capacity, uint32_t* count, ucrt_cd_error* error);

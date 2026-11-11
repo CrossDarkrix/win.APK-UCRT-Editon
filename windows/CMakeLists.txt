@@ -216,6 +216,11 @@ if(WINAPK_JNI_INCLUDE)
 
   # The host that runs an APK (milestone M1). Like winapk-jvm-run it loads
   # jvm.dll at runtime.
+  add_executable(winapk-audio-host host/audio_host_main.cpp host/audio_engine.cpp)
+  target_compile_definitions(winapk-audio-host PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+  target_include_directories(winapk-audio-host PRIVATE include host)
+  target_link_libraries(winapk-audio-host PRIVATE ole32 advapi32 uuid windowscodecs mf mfplat mfreadwrite mfuuid)
+  set_target_properties(winapk-audio-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:winapk-runtime>")
   add_executable(winapk-runtime host/runtime_main.cpp host/host_natives.cpp host/native_log.cpp
                               host/native_cocoa.cpp host/gstreamer_startup.cpp host/gstreamer_present.cpp host/gstreamer_mediaextractor_pcm.cpp host/win32_window.cpp host/guest_libs.cpp
                               host/native_os.cpp host/native_image.cpp
@@ -310,11 +315,12 @@ if(WINAPK_JNI_INCLUDE)
   set_target_properties(winapk-guest-stub PROPERTIES PREFIX "")
   target_include_directories(winapk-guest-stub PRIVATE "${WINAPK_JNI_INCLUDE}" "${WINAPK_JNI_INCLUDE}/win32")
   add_executable(macapk-translator host/translator_main.cpp host/runtime.rc)
-  add_dependencies(winapk-runtime winapk-guest-stub macapk-translator)
+  add_dependencies(winapk-runtime winapk-guest-stub macapk-translator winapk-audio-host)
 
   if(MINGW)
     target_link_options(winapk-guest-stub PRIVATE -static)
     target_link_options(macapk-translator PRIVATE -static -municode)
+    target_link_options(winapk-audio-host PRIVATE -static -municode)
     # MSYS2 GStreamer ships shared import libraries/plugins. Keep the old
     # fully-static runtime when GStreamer was not found, and use dynamic
     # linkage only for the GStreamer-enabled runtime.

@@ -1,6 +1,7 @@
 // win32_window.cpp -- see win32_window.h.
 
 #include "win32_window.h"
+#include "ucrt_cd_bridge.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <dbt.h>
 #include <wincodec.h>
 
 namespace winapk::host {
@@ -484,6 +486,12 @@ bool started_without_activation() {
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_DEVICECHANGE:
+            if ((wp==DBT_DEVICEARRIVAL||wp==DBT_DEVICEREMOVECOMPLETE)&&lp) {
+                const auto* h=reinterpret_cast<const DEV_BROADCAST_HDR*>(lp);
+                if(h->dbch_devicetype==DBT_DEVTYP_VOLUME){const auto* v=reinterpret_cast<const DEV_BROADCAST_VOLUME*>(lp);if((v->dbcv_flags&DBTF_MEDIA)!=0)ucrt_cd_notify_media_change();}
+            }
+            return TRUE;
         case WM_PAINT:
             paint(hwnd);
             return 0;

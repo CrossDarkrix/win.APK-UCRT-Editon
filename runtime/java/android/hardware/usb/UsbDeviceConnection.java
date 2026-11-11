@@ -23,7 +23,7 @@ public class UsbDeviceConnection{
    byte[] result;if(!dataIn&&expected!=0){android.util.Log.e("Phase20-B2.3.3.8","CD BOT data-out command unsupported opcode=0x"+Integer.toHexString(cdb[0]&255));result=null;}else result=HostUsbCdBridge.execute(handle,cdb,dataIn?(int)Math.min(expected,16L*1024L*1024L):0,Math.max(timeout,10000));
    boolean ok=result!=null;botData=ok&&dataIn?result:new byte[0];botDataOffset=0;long transferred=Math.min(expected,(long)botData.length);long residue=Math.max(0,expected-transferred);
    botCsw=new byte[13];putLe32(botCsw,0,0x53425355L);putLe32(botCsw,4,tag);putLe32(botCsw,8,residue);botCsw[12]=(byte)(ok?0:1);botCswOffset=0;
-   android.util.Log.i("Phase20-B2.3.3.8","CD BOT CBW opcode=0x"+Integer.toHexString(cdb[0]&255)+" tag="+tag+" expected="+expected+" returned="+botData.length+" status="+(ok?0:1));return len;
+   return len;
   }
   if(botDataOffset<botData.length){int count=Math.min(len,botData.length-botDataOffset);System.arraycopy(botData,botDataOffset,b,off,count);botDataOffset+=count;return count;}
   if(botCswOffset<botCsw.length){int count=Math.min(len,botCsw.length-botCswOffset);System.arraycopy(botCsw,botCswOffset,b,off,count);botCswOffset+=count;if(botCswOffset==botCsw.length){botData=new byte[0];botCsw=new byte[0];botDataOffset=botCswOffset=0;}return count;}

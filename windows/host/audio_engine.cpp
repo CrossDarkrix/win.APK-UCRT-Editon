@@ -59,18 +59,31 @@ const GUID kSubtypeFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa,
 const GUID kSubtypePcm = {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 static std::atomic<int> g_preferred_source_rate{48000};
 
+static bool b2_verbose_log_enabled() {
+    static const bool enabled = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("WINAPK_VERBOSE_AUDIO", value, static_cast<DWORD>(sizeof(value)));
+        return n != 0 && n < sizeof(value) && value[0] != '0';
+    }();
+    return enabled;
+}
+
 static void b2_log(const char* format, ...) {
-    std::fprintf(stderr, "[I] Win.apk.WASAPI: [Phase19-B3.4] ");
+    // Phase 20-B2.3.5.8-A: routine render-path logging is opt-in.
+    if (!b2_verbose_log_enabled()) return;
+    std::fprintf(stderr, "[I] Win.apk.WASAPI: [Phase20-B2.3.5.8] ");
     va_list args;
     va_start(args, format);
     std::vfprintf(stderr, format, args);
     va_end(args);
     std::fputc('\n', stderr);
-    std::fflush(stderr);
+    // No fflush here. Fatal/rare errors use b2_error below.
 }
 
 static void b2_error(const char* operation, HRESULT hr) {
-    b2_log("%s failed hr=0x%08lX", operation, static_cast<unsigned long>(hr));
+    std::fprintf(stderr, "[E] Win.apk.WASAPI: [Phase20-B2.3.5.8] %s failed hr=0x%08lX\n",
+                 operation, static_cast<unsigned long>(hr));
+    std::fflush(stderr);
 }
 
 class Mixer {
@@ -84,8 +97,11 @@ public:
         return *m;
     }
     void add(std::shared_ptr<Source> s) {
-        std::lock_guard<std::mutex> hold(lock_);
-        sources_.push_back(std::move(s));
+        {
+            std::lock_guard<std::mutex> hold(lock_);
+            sources_.push_back(std::move(s));
+        }
+        ensure_render_thread();
     }
     void remove(const Source* s) {
         std::lock_guard<std::mutex> hold(lock_);
@@ -123,9 +139,15 @@ public:
     }
 
 private:
+    void ensure_render_thread() {
+        bool expected = false;
+        if (!render_thread_started_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+        std::thread([this] { run(); }).detach();
+    }
+
     explicit Mixer(bool usb_direct) : usb_direct_(usb_direct) {
         HKEY key = nullptr;
-        if (!usb_direct_) { b2_log("Phase20-B2.3.2 normal mixer endpoint=default-console"); std::thread([this] { run(); }).detach(); return; }
+        if (!usb_direct_) { b2_log("Phase20-B2.3.5.8 normal mixer configured endpoint=default-console lazyThread=1"); return; }
         if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Win.apk", 0, KEY_READ, &key) == ERROR_SUCCESS) {
             DWORD type = 0, bytes = 0;
             if (RegQueryValueExW(key, L"UsbDirectOutputEndpointId", nullptr, &type, nullptr, &bytes) == ERROR_SUCCESS && type == REG_SZ && bytes >= sizeof(wchar_t)) {
@@ -138,8 +160,7 @@ private:
             RegCloseKey(key);
         }
         DWORD gain_step=0,gain_bytes=sizeof(gain_step);if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\Win.apk",L"UsbDirectGainStep",RRF_RT_REG_DWORD,nullptr,&gain_step,&gain_bytes)!=ERROR_SUCCESS)gain_step=0;gain_step=(std::min)(gain_step,6ul);usb_gain_db_=float(gain_step*3);usb_gain_target_=std::pow(10.0f,usb_gain_db_/20.0f);usb_gain_current_=1.0f;DWORD punch=3,punch_bytes=sizeof(punch);if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\Win.apk",L"UsbDirectPunchLevel",RRF_RT_REG_DWORD,nullptr,&punch,&punch_bytes)!=ERROR_SUCCESS)punch=3;usb_punch_level_=(std::min)(punch,3ul);
-        b2_log("Phase20-B2.3.3 USB Direct configured endpoint=%s gainDb=%.1f linearTarget=%.6f", endpoint_id_.empty() ? "MISSING" : endpoint_id_.c_str(),double(usb_gain_db_),double(usb_gain_target_)); b2_log("Audio Punch configured level=%lu", static_cast<unsigned long>(usb_punch_level_));
-        std::thread([this] { run(); }).detach();
+        b2_log("Phase20-B2.3.5.8 USB Direct configured endpoint=%s gainDb=%.1f linearTarget=%.6f lazyThread=1", endpoint_id_.empty() ? "MISSING" : endpoint_id_.c_str(),double(usb_gain_db_),double(usb_gain_target_)); b2_log("Audio Punch configured level=%lu", static_cast<unsigned long>(usb_punch_level_));
     }
 
     void mix(float* out, size_t frames) {
@@ -679,6 +700,7 @@ private:
     }
 
     const bool usb_direct_;
+    std::atomic<bool> render_thread_started_{false};
     float usb_gain_db_=0.0f,usb_gain_target_=1.0f,usb_gain_current_=1.0f;
     DWORD usb_punch_level_=3;
     float usb_bass_l_=0.0f,usb_bass_r_=0.0f;
@@ -720,8 +742,8 @@ bool session_mute() { return Mixer::get().session_mute(); }
 // ---- AudioTrack streams ------------------------------------------------------------------
 class Stream final : public Source {
 public:
-    Stream(int rate, int channels, int buffer_frames)
-        : base_rate_(rate), rate_(rate), channels_(channels),
+    Stream(int rate, int channels, int buffer_frames, bool usb_direct_stream=false)
+        : base_rate_(rate), rate_(rate), channels_(channels), usb_direct_stream_(usb_direct_stream),
           capacity_(static_cast<size_t>(std::max(buffer_frames, (rate * 2) / 5))) {
         if (rate > 0) g_preferred_source_rate.store(rate, std::memory_order_release);
     }
@@ -736,10 +758,10 @@ public:
         if (!draining_ && !preroll_ready_) {
             const size_t queued_frames = buf_.size() / 2;
             const size_t target_frames = std::min(capacity_,
-                static_cast<size_t>(std::max(1, rate_ * 30 / 1000)));
+                static_cast<size_t>(std::max(1, rate_ * (usb_direct_stream_ ? 500 : 30) / 1000)));
             const int64_t waited_nanos = nano_time() - play_nanos_;
             const bool enough_audio = queued_frames >= target_frames;
-            const bool bounded_fallback = queued_frames > 0 && waited_nanos >= 150000000LL;
+            const bool bounded_fallback = queued_frames > 0 && waited_nanos >= (usb_direct_stream_ ? 1500000000LL : 150000000LL);
             if (!enough_audio && !bounded_fallback) return true;
             preroll_ready_ = true;
             if (!preroll_logged_) {
@@ -779,6 +801,12 @@ public:
                 cursor_ = static_cast<double>(have);
             }
         }
+        if (rendered < frames && state_ == kPlaying && !draining_ && preroll_ready_) {
+            ++underrun_events_; underrun_frames_ += frames-rendered;
+            const int64_t now=nano_time(); const int64_t gap=last_producer_nanos_?now-last_producer_nanos_:0;
+            max_producer_gap_nanos_=(std::max)(max_producer_gap_nanos_,gap);
+            if(now-last_underrun_log_nanos_>=5000000000LL){b2_log("Phase20-B2.3.6.0 USB stall guard underrun events=%llu frames=%llu requestFrames=%llu renderedFrames=%llu queuedFrames=%llu producerGapMs=%.3f producerGapMaxMs=%.3f action=zero-fill",(unsigned long long)underrun_events_,(unsigned long long)underrun_frames_,(unsigned long long)frames,(unsigned long long)rendered,(unsigned long long)(buf_.size()/2),double(gap)/1000000.0,double(max_producer_gap_nanos_)/1000000.0);last_underrun_log_nanos_=now;}
+        }
         const size_t used = std::min(static_cast<size_t>(cursor_), buf_.size() / 2);
         if (used) {
             buf_.erase(buf_.begin(), buf_.begin() + static_cast<ptrdiff_t>(used * 2));
@@ -797,6 +825,7 @@ public:
     }
 
     size_t write(const void* p, size_t count, int encoding, bool blocking) {
+        {std::lock_guard<std::mutex> hold(lock_);last_producer_nanos_=nano_time();}
         if (!first_pcm_logged_.exchange(true, std::memory_order_acq_rel)) {
             b2_log("First PCM frames received rate=%d channels=%d encoding=%d samples=%llu blocking=%d",
                    rate_, channels_, encoding, static_cast<unsigned long long>(count), blocking ? 1 : 0);
@@ -870,10 +899,10 @@ public:
             play_nanos_ = recovery_nanos_;
             preroll_ready_ = false;
             preroll_logged_ = false;
-            b2_log("Source preroll gate armed rate=%d queuedFrames=%llu targetFrames=%llu timeoutMs=150",
+            b2_log("Source preroll gate armed rate=%d queuedFrames=%llu targetFrames=%llu timeoutMs=%d",
                    rate_, static_cast<unsigned long long>(buf_.size() / 2),
                    static_cast<unsigned long long>(std::min(capacity_,
-                       static_cast<size_t>(std::max(1, rate_ * 30 / 1000)))));
+                       static_cast<size_t>(std::max(1, rate_ * (usb_direct_stream_ ? 500 : 30) / 1000)))), usb_direct_stream_ ? 500 : 150);
         }
         if (last_mix_nanos_ == 0) last_mix_nanos_ = recovery_nanos_;
         room_.notify_all();
@@ -965,6 +994,7 @@ private:
     const int base_rate_;
     int rate_;
     const int channels_;
+    const bool usb_direct_stream_;
     const size_t capacity_;  // frames
     int state_ = kStopped;
     bool draining_ = false;
@@ -973,6 +1003,8 @@ private:
     int64_t last_mix_nanos_ = 0, recovery_nanos_ = 0, play_nanos_ = 0;
     bool preroll_ready_ = false;
     bool preroll_logged_ = false;
+    uint64_t underrun_events_=0,underrun_frames_=0;
+    int64_t last_producer_nanos_=0,max_producer_gap_nanos_=0,last_underrun_log_nanos_=0;
 };
 
 std::shared_ptr<Stream> stream_create(int rate, int channels, int, int buffer_frames) {
@@ -983,7 +1015,7 @@ std::shared_ptr<Stream> stream_create(int rate, int channels, int, int buffer_fr
 }
 std::shared_ptr<Stream> usb_direct_stream_create(int rate, int channels, int, int buffer_frames) {
     if (rate <= 0 || channels <= 0) return nullptr;
-    auto s = std::make_shared<Stream>(rate, channels, buffer_frames);
+    auto s = std::make_shared<Stream>(rate, channels, buffer_frames, true);
     Mixer::usb_direct().add(s);
     b2_log("Phase20-B2.3.2 dedicated USB Direct stream created rate=%d channels=%d bufferFrames=%d",rate,channels,buffer_frames);
     return s;

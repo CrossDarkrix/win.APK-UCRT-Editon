@@ -86,11 +86,13 @@ esac
 
 LAUNCHER_EXE="$BUILD/Win.apk.exe"
 RUNTIME_EXE="$BUILD/winapk-runtime.exe"
+AUDIO_HOST_EXE="$BUILD/winapk-audio-host.exe"
 [[ -f "$LAUNCHER_EXE" ]] || {
   echo "[ERROR] Launcher was not produced: $LAUNCHER_EXE" >&2
   exit 8
 }
 [[ -f "$RUNTIME_EXE" ]] || {
+[[ -f "$AUDIO_HOST_EXE" ]] || { echo "[ERROR] Audio host was not produced." >&2; exit 8; }
   echo "[ERROR] Runtime was not produced: $RUNTIME_EXE" >&2
   exit 9
 }
@@ -115,7 +117,7 @@ SCANNER_DIR="$DIST/libexec/gstreamer-1.0"
 rm -rf "$DIST"
 mkdir -p "$BIN" "$PLUGINS" "$SCANNER_DIR"
 cp -f "$LAUNCHER_EXE" "$BIN/"
-cp -f "$RUNTIME_EXE" "$BIN/"
+cp -f "$RUNTIME_EXE" "$AUDIO_HOST_EXE" "$BIN/"
 cp -f "$GST_INSPECT" "$BIN/"
 cp -f "$PREFIX/bin"/*.dll "$BIN/"
 cp -f "$PREFIX/lib/gstreamer-1.0"/*.dll "$PLUGINS/"

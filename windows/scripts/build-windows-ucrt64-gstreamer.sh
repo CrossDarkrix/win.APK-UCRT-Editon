@@ -80,6 +80,7 @@ esac
 
 "$CMAKE" --build "$BUILD" --parallel
 [[ -f "$BUILD/winapk-runtime.exe" ]] || { echo "[ERROR] Runtime was not produced." >&2; exit 8; }
+[[ -f "$BUILD/winapk-audio-host.exe" ]] || { echo "[ERROR] Audio host was not produced." >&2; exit 8; }
 
 DIST="$BUILD/winapk-runtime-dist"
 BIN="$DIST/bin"
@@ -87,7 +88,7 @@ PLUGINS="$DIST/lib/gstreamer-1.0"
 SCANNER_DIR="$DIST/libexec/gstreamer-1.0"
 rm -rf "$DIST"
 mkdir -p "$BIN" "$PLUGINS" "$SCANNER_DIR"
-cp -f "$BUILD/winapk-runtime.exe" "$BIN/"
+cp -f "$BUILD/winapk-runtime.exe" "$BUILD/winapk-audio-host.exe" "$BIN/"
 cp -f "$PREFIX/bin"/*.dll "$BIN/"
 cp -f "$PREFIX/lib/gstreamer-1.0"/*.dll "$PLUGINS/"
 SCANNER="$PREFIX/libexec/gstreamer-1.0/gst-plugin-scanner.exe"

@@ -70,6 +70,90 @@ namespace fs = std::filesystem;
 
 namespace {
 
+struct RuntimePerformanceApplyResult {
+    bool power_throttling_off = false;
+    DWORD power_throttling_error = ERROR_SUCCESS;
+    bool high_priority = false;
+    DWORD priority_error = ERROR_SUCCESS;
+};
+
+RuntimePerformanceApplyResult apply_runtime_performance_policy() {
+    RuntimePerformanceApplyResult result;
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    using SetProcessInformationFn = BOOL (WINAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+    auto set_process_info = kernel32 ? reinterpret_cast<SetProcessInformationFn>(
+        GetProcAddress(kernel32, "SetProcessInformation")) : nullptr;
+    if (set_process_info) {
+        PROCESS_POWER_THROTTLING_STATE state{};
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        state.StateMask = 0;
+        SetLastError(ERROR_SUCCESS);
+        result.power_throttling_off = set_process_info(GetCurrentProcess(), ProcessPowerThrottling,
+                                                        &state, sizeof(state)) != FALSE;
+        result.power_throttling_error = result.power_throttling_off ? ERROR_SUCCESS : GetLastError();
+    } else {
+        result.power_throttling_error = ERROR_CALL_NOT_IMPLEMENTED;
+    }
+    SetLastError(ERROR_SUCCESS);
+    result.high_priority = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != FALSE;
+    result.priority_error = result.high_priority ? ERROR_SUCCESS : GetLastError();
+    return result;
+}
+
+DWORD WINAPI runtime_performance_guard(void*) {
+    bool last_power_ok = true;
+    bool last_priority_ok = true;
+    DWORD last_power_error = ERROR_SUCCESS;
+    DWORD last_priority_error = ERROR_SUCCESS;
+    for (;;) {
+        Sleep(2000);
+        const DWORD before_priority = GetPriorityClass(GetCurrentProcess());
+        const bool priority_was_high = before_priority == HIGH_PRIORITY_CLASS ||
+                                       before_priority == REALTIME_PRIORITY_CLASS;
+        const RuntimePerformanceApplyResult applied = apply_runtime_performance_policy();
+        const bool changed = !priority_was_high || !last_power_ok || !last_priority_ok ||
+                             applied.power_throttling_error != last_power_error ||
+                             applied.priority_error != last_priority_error;
+        if (changed) {
+            std::fprintf(stderr,
+                "[win.apk] UCRT performance guard reapplied efficiencyModeOff=%d powerThrottleError=%lu highPriority=%d priorityError=%lu previousPriority=0x%08lX\\n",
+                applied.power_throttling_off ? 1 : 0,
+                static_cast<unsigned long>(applied.power_throttling_error),
+                applied.high_priority ? 1 : 0,
+                static_cast<unsigned long>(applied.priority_error),
+                static_cast<unsigned long>(before_priority));
+            std::fflush(stderr);
+        }
+        last_power_ok = applied.power_throttling_off;
+        last_priority_ok = applied.high_priority;
+        last_power_error = applied.power_throttling_error;
+        last_priority_error = applied.priority_error;
+    }
+}
+
+void start_runtime_performance_guard() {
+    const RuntimePerformanceApplyResult initial = apply_runtime_performance_policy();
+    const DWORD priority = GetPriorityClass(GetCurrentProcess());
+    std::fprintf(stderr,
+        "[win.apk] UCRT self policy efficiencyModeOff=%d powerThrottleError=%lu highPriority=%d priorityError=%lu priorityClass=0x%08lX\\n",
+        initial.power_throttling_off ? 1 : 0,
+        static_cast<unsigned long>(initial.power_throttling_error),
+        initial.high_priority ? 1 : 0,
+        static_cast<unsigned long>(initial.priority_error),
+        static_cast<unsigned long>(priority));
+    std::fflush(stderr);
+    HANDLE guard = CreateThread(nullptr, 0, runtime_performance_guard, nullptr, 0, nullptr);
+    if (guard) {
+        SetThreadPriority(guard, THREAD_PRIORITY_ABOVE_NORMAL);
+        CloseHandle(guard);
+    } else {
+        std::fprintf(stderr, "[win.apk] UCRT performance guard start failed error=%lu\\n",
+                     static_cast<unsigned long>(GetLastError()));
+        std::fflush(stderr);
+    }
+}
+
 struct Options {
     fs::path apk, data, jdk, lib;
     bool install_only = false;
@@ -1409,17 +1493,12 @@ void buffer_stderr() {
 
 int wmain(int argc, wchar_t** argv) {
     buffer_stderr();
+    // Apply inside winapk-runtime itself before any helper, AOT, JVM or APK path
+    // can run. The guard also repairs later external/heuristic priority changes.
+    start_runtime_performance_guard();
     if (argc > 1 && std::wstring(argv[1]) == L"--java-main") return java_main(argc, argv);
     if ((argc == 3 || (argc == 5 && std::wstring(argv[3]) == L"--cache")) && std::wstring(argv[1]) == L"--aot-translate")
         return aot_translate_main(argv[2], argc == 5 ? fs::path(argv[4]) : fs::path());
-
-    // Give the interactive Win.apk runtime a modest process-wide scheduling
-    // preference. Helper/AOT modes return above and keep their existing lower
-    // priorities. Real-time audio scheduling remains thread-scoped via MMCSS.
-    const BOOL process_priority_ok = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-    std::fprintf(stderr, "[win.apk] process priority: ABOVE_NORMAL success=%d error=%lu\n",
-                 process_priority_ok ? 1 : 0,
-                 process_priority_ok ? 0UL : static_cast<unsigned long>(GetLastError()));
 
     BootArgs b;
     if (!parse_args(argc, argv, &b.options)) {

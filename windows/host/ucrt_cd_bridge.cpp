@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
@@ -23,6 +24,7 @@
 #include <vector>
 
 namespace {
+std::atomic<uint64_t> g_cd_media_generation{1};
 struct BridgeHandle { HANDLE value = INVALID_HANDLE_VALUE; };
 
 struct SptdPacket {
@@ -151,6 +153,8 @@ std::string trim_ascii(const uint8_t* p,size_t n) {
 }
 
 extern "C" {
+uint64_t UCRT_CD_CALL ucrt_cd_media_generation(void){return g_cd_media_generation.load(std::memory_order_acquire);}
+void UCRT_CD_CALL ucrt_cd_notify_media_change(void){g_cd_media_generation.fetch_add(1,std::memory_order_acq_rel);}
 uint32_t UCRT_CD_CALL ucrt_cd_get_abi_version(void) { return UCRT_CD_ABI_VERSION; }
 const char* UCRT_CD_CALL ucrt_cd_result_name(int32_t r) {
     switch(r){case 0:return "OK";case 1:return "INVALID_ARGUMENT";case 2:return "NOT_FOUND";case 3:return "ACCESS_DENIED";case 4:return "OPEN_FAILED";case 5:return "IO_FAILED";case 6:return "SCSI_FAILED";case 7:return "BUFFER_TOO_SMALL";case 8:return "PARSE_FAILED";case 9:return "UNSUPPORTED";default:return "INTERNAL_ERROR";}
